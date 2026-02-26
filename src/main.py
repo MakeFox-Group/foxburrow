@@ -661,6 +661,15 @@ def main() -> None:
     from api.server import create_app
 
     async def on_startup():
+        # Override uvicorn's SIGINT handler — first Ctrl+C kills immediately.
+        # All background threads are daemon threads and die with the process.
+        import signal
+        def _force_exit(signum, frame):
+            log.info("  SIGINT — exiting")
+            os._exit(0)
+        signal.signal(signal.SIGINT, _force_exit)
+        signal.signal(signal.SIGTERM, _force_exit)
+
         # Store the event loop so background threads can fire WebSocket events
         from api.websocket import streamer
         streamer.set_loop(asyncio.get_running_loop())
