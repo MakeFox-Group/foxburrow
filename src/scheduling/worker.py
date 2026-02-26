@@ -34,21 +34,95 @@ _SESSION_MAX_CONCURRENCY: dict[str, int] = {
 
 MAX_CONCURRENCY = 4
 
-# Minimum free VRAM before inference (bytes).
-# These are the minimum NVML-reported free bytes required before starting a stage.
-# Keep values modest — the model weights are already loaded/cached, so this is
-# just working memory for intermediate tensors (activations, attention, etc.).
-# PyTorch's caching allocator is cleared before each check (empty_cache), so
-# these thresholds see real free VRAM, not inflated reserved values.
-_MIN_FREE_VRAM: dict[StageType, int] = {
-    StageType.GPU_TEXT_ENCODE: 256 * 1024**2,        # ~256 MB for text encoding
-    StageType.GPU_DENOISE: 3 * 1024**3,              # ~3 GB working memory for UNet activations
-    StageType.GPU_VAE_DECODE: 1 * 1024**3,           # ~1 GB for VAE decode
-    StageType.GPU_VAE_ENCODE: 1 * 1024**3,           # ~1 GB for VAE encode (tiled)
-    StageType.GPU_HIRES_TRANSFORM: 3 * 1024**3,      # ~3 GB for hires (VAE+upscale+VAE)
-    StageType.GPU_UPSCALE: 512 * 1024**2,            # ~512 MB for RealESRGAN upscale
-    StageType.GPU_BGREMOVE: 512 * 1024**2,           # ~512 MB for background removal
+# ---- Working-memory VRAM thresholds (resolution-aware) ----
+#
+# Working memory (activations, cuDNN workspace, attention matrices) scales with
+# resolution.  Rather than guessing, we measure the actual peak during each
+# stage execution and track the worst-case bytes-per-pixel ratio.  For future
+# jobs, we multiply ratio × pixels × headroom to get the VRAM threshold.
+#
+# Until the first successful measurement, we use conservative fallbacks.
+# Text-encode is resolution-independent (fixed 77-token sequence) so it uses
+# an absolute byte fallback instead of a per-pixel ratio.
+
+_VRAM_FALLBACK_BYTES: dict[StageType, int] = {
+    # Absolute byte fallbacks — used before first measurement only.
+    # Deliberately generous to survive the first run without OOM.
+    StageType.GPU_TEXT_ENCODE: 512 * 1024**2,        # ~512 MB (not resolution-dependent)
+    StageType.GPU_DENOISE: 4 * 1024**3,              # ~4 GB
+    StageType.GPU_VAE_DECODE: 2500 * 1024**2,        # ~2.5 GB (1 GB was too low — cuDNN workspace)
+    StageType.GPU_VAE_ENCODE: 1500 * 1024**2,        # ~1.5 GB
+    StageType.GPU_HIRES_TRANSFORM: 4 * 1024**3,      # ~4 GB
+    StageType.GPU_UPSCALE: 1 * 1024**3,              # ~1 GB
+    StageType.GPU_BGREMOVE: 512 * 1024**2,           # ~512 MB
 }
+
+# Max observed bytes-per-pixel ratio per stage type (populated at runtime).
+_measured_bpp: dict[StageType, float] = {}
+_bpp_lock = threading.Lock()
+
+# Headroom multiplier applied on top of measured peaks.
+_VRAM_HEADROOM = 1.20
+
+
+def _get_stage_pixels(stage_type: StageType, job: InferenceJob) -> int:
+    """Return the pixel count that drives working-memory scaling for a stage.
+
+    - Text encode: constant (77 tokens, resolution-independent) → returns 1
+    - Denoise: scales with latent area = (W/8)×(H/8)
+    - VAE decode/encode, bgremove: scales with output pixel area = W×H
+    - Hires transform: scales with hires output area
+    - Upscale: scales with input pixel area (model processes input)
+    """
+    if stage_type == StageType.GPU_TEXT_ENCODE:
+        return 1  # absolute measurement, not per-pixel
+
+    w, h = 768, 768  # safe default
+    if job.sdxl_input:
+        w, h = job.sdxl_input.width, job.sdxl_input.height
+
+    if stage_type == StageType.GPU_DENOISE:
+        return (w // 8) * (h // 8)  # latent dimensions
+
+    if stage_type == StageType.GPU_HIRES_TRANSFORM:
+        if job.hires_input and job.hires_input.hires_width > 0:
+            return job.hires_input.hires_width * job.hires_input.hires_height
+        return w * h
+
+    # VAE decode/encode, upscale, bgremove: pixel area
+    if job.input_image is not None and stage_type in (
+            StageType.GPU_UPSCALE, StageType.GPU_BGREMOVE):
+        return job.input_image.width * job.input_image.height
+    return w * h
+
+
+def _update_working_memory(stage_type: StageType, working_bytes: int,
+                           pixels: int) -> None:
+    """Record a working-memory measurement as a bytes-per-pixel ratio."""
+    if working_bytes <= 0 or pixels <= 0:
+        return
+    ratio = working_bytes / pixels
+    with _bpp_lock:
+        prev_ratio = _measured_bpp.get(stage_type, 0.0)
+        if ratio > prev_ratio:
+            _measured_bpp[stage_type] = ratio
+            log.info(f"  Working memory: new peak for {stage_type.value}: "
+                     f"{working_bytes // (1024**2)}MB @ {pixels} px "
+                     f"({ratio:.1f} B/px, prev {prev_ratio:.1f} B/px)")
+
+
+def _get_min_free_vram(stage_type: StageType, job: InferenceJob) -> int:
+    """Return the minimum free VRAM for a stage, scaled to the job's resolution.
+
+    Uses (measured bytes-per-pixel × current pixels × headroom) if we have a
+    measurement, otherwise falls back to the conservative hardcoded value.
+    """
+    pixels = _get_stage_pixels(stage_type, job)
+    with _bpp_lock:
+        ratio = _measured_bpp.get(stage_type, 0.0)
+    if ratio > 0.0:
+        return int(ratio * pixels * _VRAM_HEADROOM)
+    return _VRAM_FALLBACK_BYTES.get(stage_type, 0)
 
 
 _CUDA_FATAL_PATTERNS = [
@@ -208,7 +282,7 @@ class GpuWorker:
                 await self._loop.run_in_executor(
                     None, self._ensure_models_for_stage, stage, job)
 
-                min_free = _MIN_FREE_VRAM.get(stage.type, 0)
+                min_free = _get_min_free_vram(stage.type, job)
                 if min_free > 0:
                     protect = self._gpu.get_active_fingerprints()
                     self._gpu.ensure_free_vram(min_free, protect)
@@ -231,10 +305,20 @@ class GpuWorker:
                 import time as _time
                 stage_start = _time.monotonic()
 
+                # Snapshot baseline memory and reset peak tracking so we can
+                # measure the actual working memory this stage consumes.
+                with torch.cuda.device(self._gpu.device):
+                    torch.cuda.reset_peak_memory_stats()
+                mem_baseline = torch.cuda.memory_allocated(self._gpu.device)
+
                 try:
                     output_image = await self._loop.run_in_executor(
                         None, self._execute_stage, job, stage)
                 finally:
+                    # Capture peak before empty_cache clears it
+                    mem_peak = torch.cuda.max_memory_allocated(self._gpu.device)
+                    working_mem = mem_peak - mem_baseline
+
                     # Release working memory (UNet activations, attention matrices, etc.)
                     # back to the OS immediately. This MUST run even on OOM — otherwise
                     # PyTorch's caching allocator keeps the failed allocation's blocks
@@ -245,6 +329,14 @@ class GpuWorker:
 
                 stage_duration = _time.monotonic() - stage_start
                 job.gpu_time_s += stage_duration
+
+                # Feed the measurement back so future VRAM checks are accurate
+                stage_pixels = _get_stage_pixels(stage.type, job)
+                _update_working_memory(stage.type, working_mem, stage_pixels)
+                log.info(f"  Stage {stage.type.value}: working memory "
+                         f"{working_mem // (1024**2)}MB "
+                         f"(baseline {mem_baseline // (1024**2)}MB, "
+                         f"peak {mem_peak // (1024**2)}MB)")
 
                 # Get model name for this stage
                 model_name = None
