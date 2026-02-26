@@ -82,7 +82,7 @@ def generate_default_config() -> str:
 
     for dev in devices:
         vram_gb = dev.total_memory / (1024 ** 3)
-        caps = "upscale,bgremove,tag"
+        caps = "sdxl,upscale,bgremove,tag"
 
         # Always onload tagger; only mark unevictable for GPUs with >8GB VRAM
         if vram_gb > 8:
