@@ -37,8 +37,8 @@ old_hash=""
 
 if [ "$req_hash" != "$old_hash" ]; then
     echo "Installing/updating packages..."
-    if "$VENV_DIR/bin/pip" install --upgrade pip -q && \
-       "$VENV_DIR/bin/pip" install -r "$REQ_FILE" -q; then
+    if "$VENV_DIR/bin/pip" install --upgrade pip && \
+       "$VENV_DIR/bin/pip" install -r "$REQ_FILE"; then
         echo "$req_hash" > "$STAMP_FILE"
         echo "Packages up to date."
     else
