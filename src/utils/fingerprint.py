@@ -111,7 +111,7 @@ def compute(path: str) -> str:
     sha = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(1 << 20)  # 1MB chunks
+            chunk = f.read(8 * 1024 * 1024)  # 8MB chunks
             if not chunk:
                 break
             sha.update(chunk)

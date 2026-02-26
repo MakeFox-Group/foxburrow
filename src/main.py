@@ -233,12 +233,17 @@ def _background_model_init(
     # 1. Pre-fetch HF configs (network I/O, cached after first run)
     _prefetch_sdxl_configs()
 
+    # ONE shared fingerprint pool — SDXL base models go first (priority),
+    # then LoRA hashing reuses the same threads.
+    from concurrent.futures import ThreadPoolExecutor
+    fp_threads = _auto_threads(config.threads.fingerprint, 8)
+    fp_pool = ThreadPoolExecutor(max_workers=fp_threads)
+
     # 2. Register SDXL models (fingerprinting — heavy I/O)
     if all_sdxl:
         from utils.model_scanner import ModelScanner
-        fp_threads = _auto_threads(config.threads.fingerprint, 8)
         scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
-        scanner.start(all_sdxl)
+        scanner.start(all_sdxl, pool=fp_pool)
         app_state.model_scanner = scanner
 
     # 3. Register utility models (upscale, bgremove — fingerprinting)
@@ -257,23 +262,26 @@ def _background_model_init(
         if bgremove_path:
             app_state.registry.register_bgremove_model(bgremove_path)
 
-    # 4. LoRA background hashing
-    if app_state.lora_index:
-        from utils.lora_index import start_background_hashing
-        lora_workers = _auto_threads(config.threads.fingerprint, 8)
-        start_background_hashing(app_state.lora_index, max_workers=lora_workers)
-
-    # 5. GPU onload and unevictable (needs registered models)
-    # Wait for scanner to finish so all models are available for onload
+    # 4. Wait for SDXL model scanning to finish before anything else.
+    # Base models are the priority — LoRA hashing must not compete for I/O.
     scanner = app_state.model_scanner
     if scanner is not None and scanner._thread is not None:
         scanner._thread.join()
 
+    # 5. GPU onload and unevictable (needs registered models)
     for gpu in app_state.gpu_pool.gpus:
         _process_gpu_onload(gpu, app_state)
 
     for gpu in app_state.gpu_pool.gpus:
         _process_gpu_unevictable(gpu, app_state)
+
+    # 6. LoRA hashing — same pool, starts AFTER SDXL models are done.
+    # Last consumer shuts down the shared pool when complete.
+    if app_state.lora_index:
+        from utils.lora_index import start_background_hashing
+        start_background_hashing(app_state.lora_index, pool=fp_pool, shutdown_pool=True)
+    else:
+        fp_pool.shutdown(wait=False)
 
     elapsed = time.monotonic() - start_time
     log.info(f"  Background init: complete ({elapsed:.1f}s)")

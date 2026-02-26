@@ -161,25 +161,32 @@ def rescan_loras(
 def start_background_hashing(
     index: dict[str, LoraEntry],
     max_workers: int | None = None,
+    pool: ThreadPoolExecutor | None = None,
+    shutdown_pool: bool = False,
 ) -> threading.Thread:
     """Launch a background daemon thread that hashes all LoRAs with missing fingerprints.
 
-    Uses a ThreadPoolExecutor for parallel SHA256 computation.
-    The new per-directory fingerprint cache auto-appends on each compute(),
-    so no periodic save_cache() calls are needed.
+    If *pool* is provided, uses that executor instead of creating one.
+    Set *shutdown_pool* to ``True`` if this is the last consumer and should
+    shut down the pool when done.
 
     Returns the daemon thread (for optional join).
     """
     unhashed = [e for e in index.values() if e.fingerprint is None]
     if not unhashed:
         log.info(f"  LoRA hashing: all {len(index)} entries already cached")
+        if shutdown_pool and pool is not None:
+            pool.shutdown(wait=False)
         return _make_noop_thread()
 
     workers = min(max_workers or min(os.cpu_count() or 4, 16), len(unhashed))
 
     def _manager():
-        log.info(f"  LoRA hashing: {len(unhashed)} files to hash "
-                 f"({workers} workers)")
+        if pool is not None:
+            log.info(f"  LoRA hashing: {len(unhashed)} files to hash (shared pool)")
+        else:
+            log.info(f"  LoRA hashing: {len(unhashed)} files to hash "
+                     f"({workers} workers)")
         completed = 0
         last_log = time.monotonic()
         last_completed = 0
@@ -191,8 +198,15 @@ def start_background_hashing(
             except Exception:
                 return entry, None
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for entry, fp in pool.map(_hash_one, unhashed):
+        # Use caller's pool if provided; otherwise create a local one.
+        own_pool: ThreadPoolExecutor | None = None
+        use_pool = pool
+        if use_pool is None:
+            use_pool = ThreadPoolExecutor(max_workers=workers)
+            own_pool = use_pool
+
+        try:
+            for entry, fp in use_pool.map(_hash_one, unhashed):
                 if fp is not None:
                     entry.fingerprint = fp
                     # Re-announce with the computed fingerprint
@@ -212,6 +226,11 @@ def start_background_hashing(
                              f"({rate:.0f}/sec)")
                     last_log = now
                     last_completed = completed
+        finally:
+            if own_pool is not None:
+                own_pool.shutdown(wait=True)
+            elif shutdown_pool:
+                use_pool.shutdown(wait=True)
 
         log.info(f"  LoRA hashing: complete ({completed}/{len(unhashed)} hashed)")
 

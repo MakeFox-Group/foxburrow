@@ -42,12 +42,15 @@ class ModelScanner:
         self._total = 0
         self._lock = threading.Lock()
 
-    def start(self, discovered_models: dict[str, str]) -> threading.Thread:
+    def start(self, discovered_models: dict[str, str], pool: ThreadPoolExecutor | None = None) -> threading.Thread:
         """Register all models using a background thread pool.
 
-        All models (single-file and diffusers) are fingerprinted in parallel
-        using ``max_workers`` threads.  On first run (no .fpcache), even
-        single-file models need a full SHA256 hash, so parallelism matters.
+        All models (single-file and diffusers) are fingerprinted in parallel.
+        On first run (no .fpcache), even single-file models need a full
+        SHA256 hash, so parallelism matters.
+
+        If *pool* is provided, uses that executor (caller manages lifetime).
+        Otherwise creates an internal pool with ``max_workers`` threads.
 
         Fires ``model_discovered`` and ``model_scan_progress`` WebSocket
         events for every model as it completes.
@@ -91,9 +94,16 @@ class ModelScanner:
                     log.log_exception(ex, f"Failed to register model: {name}")
                     return name, path, fmt, False
 
-            workers = min(self._max_workers, grand_total)
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for name, path, fmt, success in pool.map(_register_one, discovered_models.items()):
+            # Use caller's pool if provided; otherwise create a local one.
+            own_pool: ThreadPoolExecutor | None = None
+            use_pool = pool
+            if use_pool is None:
+                workers = min(self._max_workers, grand_total)
+                use_pool = ThreadPoolExecutor(max_workers=workers)
+                own_pool = use_pool
+
+            try:
+                for name, path, fmt, success in use_pool.map(_register_one, discovered_models.items()):
                     with self._lock:
                         self._completed += 1
                         done = self._completed
@@ -110,6 +120,9 @@ class ModelScanner:
                     streamer.fire_event("model_scan_progress", {
                         "completed": done, "total": total,
                         "scanning": done < total})
+            finally:
+                if own_pool is not None:
+                    own_pool.shutdown(wait=True)
 
             elapsed = time.monotonic() - start_time
             with self._lock:
