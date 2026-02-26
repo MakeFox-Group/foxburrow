@@ -1,5 +1,6 @@
-"""Thread-safe timestamped logging."""
+"""Thread-safe timestamped logging to stdout + file."""
 
+import os
 import sys
 import threading
 import traceback
@@ -15,6 +16,21 @@ class LogLevel(Enum):
 
 
 _lock = threading.Lock()
+_log_file = None
+_log_path: str | None = None
+
+
+def init_file(path: str) -> None:
+    """Open the log file for appending. Creates parent directories if needed."""
+    global _log_file, _log_path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _log_file = open(path, "a", encoding="utf-8")
+    _log_path = path
+
+
+def get_log_path() -> str | None:
+    """Return the active log file path, or None if file logging is not enabled."""
+    return _log_path
 
 
 def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
@@ -22,6 +38,9 @@ def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
     line = f"[{timestamp}] [{level.value}] {message}"
     with _lock:
         print(line, flush=True)
+        if _log_file is not None:
+            _log_file.write(line + "\n")
+            _log_file.flush()
 
 
 def write(message: str, level: LogLevel = LogLevel.INFO) -> None:
@@ -29,6 +48,9 @@ def write(message: str, level: LogLevel = LogLevel.INFO) -> None:
     line = f"[{timestamp}] [{level.value}] {message}"
     with _lock:
         print(line, end="", flush=True)
+        if _log_file is not None:
+            _log_file.write(line)
+            _log_file.flush()
 
 
 def log_exception(ex: BaseException, context: str | None = None) -> None:

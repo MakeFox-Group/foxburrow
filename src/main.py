@@ -539,6 +539,8 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
 
 
 def main() -> None:
+    # Start file logging before anything else so the full startup is captured.
+    log.init_file(os.path.abspath("logs/foxburrow.log"))
     log.info("foxburrow starting (Python/PyTorch)")
 
     # Write PID file

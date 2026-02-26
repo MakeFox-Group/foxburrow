@@ -1723,3 +1723,106 @@ async def job_result(job_id: str):
         return Response(content=buf.getvalue(), media_type="application/x-fox-latent")
 
     return _error(500, "Result not available")
+
+
+# ====================================================================
+# Log Viewer
+# ====================================================================
+
+@router.get("/logs")
+async def get_logs(
+    lines: int = 100,
+    offset: int = 0,
+    level: str | None = None,
+    search: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
+):
+    """Return recent log lines with optional filtering.
+
+    Query params:
+        lines:   Number of lines to return (default 100, max 10000)
+        offset:  Skip this many lines from the tail before returning
+        level:   Filter by log level: DEBUG, INFO, WARNING, ERROR
+        search:  Case-insensitive substring search across log lines
+        before:  Only lines before this timestamp (ISO 8601 or HH:MM:SS)
+        after:   Only lines after this timestamp (ISO 8601 or HH:MM:SS)
+    """
+    log_path = log.get_log_path()
+    if log_path is None or not os.path.isfile(log_path):
+        return _error(404, "Log file not available")
+
+    lines = max(1, min(lines, 10000))
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError as ex:
+        return _error(500, f"Failed to read log file: {ex}")
+
+    # Apply filters
+    filtered = all_lines
+
+    if level:
+        level_tag = f"[{level.upper()}]"
+        filtered = [ln for ln in filtered if level_tag in ln]
+
+    if search:
+        search_lower = search.lower()
+        filtered = [ln for ln in filtered if search_lower in ln.lower()]
+
+    if after or before:
+        filtered = _filter_by_time(filtered, after=after, before=before)
+
+    # Apply offset + limit from the tail
+    total = len(filtered)
+    if offset > 0:
+        filtered = filtered[:max(0, total - offset)]
+    filtered = filtered[-lines:]
+
+    return Response(
+        content="".join(filtered),
+        media_type="text/plain; charset=utf-8",
+        headers={"X-Total-Lines": str(total), "X-Returned-Lines": str(len(filtered))},
+    )
+
+
+def _filter_by_time(lines: list[str], after: str | None, before: str | None) -> list[str]:
+    """Filter log lines by timestamp range."""
+    from datetime import datetime as _dt
+
+    def _parse_ts(s: str) -> _dt | None:
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                     "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                     "%H:%M:%S.%f", "%H:%M:%S"):
+            try:
+                t = _dt.strptime(s, fmt)
+                # Time-only formats: use today's date
+                if t.year == 1900:
+                    now = _dt.now()
+                    t = t.replace(year=now.year, month=now.month, day=now.day)
+                return t
+            except ValueError:
+                continue
+        return None
+
+    after_dt = _parse_ts(after) if after else None
+    before_dt = _parse_ts(before) if before else None
+    if after_dt is None and before_dt is None:
+        return lines
+
+    result = []
+    for ln in lines:
+        # Extract timestamp: [2026-02-26 10:14:24.918]
+        if len(ln) > 25 and ln[0] == "[":
+            ts_str = ln[1:24]
+            ts = _parse_ts(ts_str)
+            if ts is None:
+                result.append(ln)
+                continue
+            if after_dt and ts < after_dt:
+                continue
+            if before_dt and ts > before_dt:
+                continue
+        result.append(ln)
+    return result
