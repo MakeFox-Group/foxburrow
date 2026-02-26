@@ -10,6 +10,7 @@ from scheduling.queue import JobQueue
 
 if TYPE_CHECKING:
     from scheduling.job import InferenceJob
+    from utils.model_scanner import ModelScanner
 
 
 class AppState:
@@ -23,7 +24,7 @@ class AppState:
         self.queue: JobQueue = JobQueue()
         self.scheduler = None
         self.sdxl_models: dict[str, str] = {}
-        self.default_sdxl_model_dir: str | None = None
+        self.model_scanner: ModelScanner | None = None
         self.lora_index: dict = {}  # name -> LoraEntry (from utils.lora_index)
         self.loras_dir: str | None = None  # path to loras directory for rescans
 

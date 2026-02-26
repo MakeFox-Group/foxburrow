@@ -21,15 +21,28 @@ class ServerConfig:
     port: int = 8800
     models_dir: str = "models/"
     tensorrt_cache: str = "data/tensorrt_cache/"
-    default_sdxl_model: str = ""
     enabled: bool = False
     secret: str = ""
+
+
+@dataclass
+class ThreadsConfig:
+    fingerprint: int = 0  # 0 = auto: min(8, cpu_count - 1)
+
+
+def _auto_threads(configured: int, default_max: int) -> int:
+    """Resolve thread count: 0 means auto-detect."""
+    if configured > 0:
+        return configured
+    cpus = os.cpu_count() or 4
+    return min(default_max, max(cpus - 1, 1))
 
 
 @dataclass
 class FoxBurrowConfig:
     server: ServerConfig
     gpus: list[GpuConfig]
+    threads: ThreadsConfig = field(default_factory=ThreadsConfig)
 
     @staticmethod
     def load_from_file(path: str) -> "FoxBurrowConfig":
@@ -48,9 +61,14 @@ class FoxBurrowConfig:
             server.port = s.getint("port", server.port)
             server.models_dir = s.get("models_dir", server.models_dir)
             server.tensorrt_cache = s.get("tensorrt_cache", server.tensorrt_cache)
-            server.default_sdxl_model = s.get("default_sdxl_model", server.default_sdxl_model)
             server.enabled = s.getboolean("enabled", server.enabled)
             server.secret = s.get("secret", server.secret)
+
+        # Parse [threads] section
+        threads = ThreadsConfig()
+        if parser.has_section("threads"):
+            t = parser["threads"]
+            threads.fingerprint = t.getint("fingerprint", threads.fingerprint)
 
         # Parse [GPU-<uuid>] sections
         gpus: list[GpuConfig] = []
@@ -80,4 +98,4 @@ class FoxBurrowConfig:
                 }
                 gpus.append(gpu)
 
-        return FoxBurrowConfig(server=server, gpus=gpus)
+        return FoxBurrowConfig(server=server, gpus=gpus, threads=threads)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import log
 from scheduling.job import ModelComponentId
@@ -53,6 +54,7 @@ class ModelRegistry:
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
         # fingerprint -> ModelComponentId
         self._components: dict[str, ModelComponentId] = {}
         # model_dir -> list of component IDs [te1, te2, unet, vae_dec, vae_enc]
@@ -61,10 +63,14 @@ class ModelRegistry:
         self._bgremove_component: ModelComponentId | None = None
 
     def register_sdxl_checkpoint(self, model_path: str) -> None:
-        """Register an SDXL checkpoint (directory or single-file safetensors)."""
+        """Register an SDXL checkpoint (directory or single-file safetensors).
+
+        Thread-safe: can be called concurrently from background scanning threads.
+        """
         model_path = os.path.realpath(model_path)
-        if model_path in self._sdxl_checkpoints:
-            return
+        with self._lock:
+            if model_path in self._sdxl_checkpoints:
+                return
 
         if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
             self._register_single_file(model_path)
@@ -74,11 +80,11 @@ class ModelRegistry:
     def _register_single_file(self, checkpoint_path: str) -> None:
         """Register a single-file SDXL safetensors checkpoint.
 
-        Uses path+mtime+size as fingerprint for speed (avoids hashing 7GB+ files).
-        Cross-checkpoint component dedup is not possible with single files.
+        Computes SHA256 fingerprint via the standard fingerprint module,
+        which stores results in a per-directory .fpcache file. First run
+        hashes the file; subsequent runs hit the cache instantly.
         """
-        stat = os.stat(checkpoint_path)
-        base_fp = f"sf:{checkpoint_path}:{stat.st_mtime_ns}:{stat.st_size}"
+        base_fp = fp_util.compute(checkpoint_path)
 
         components = []
         for suffix, category, vram in [
@@ -88,20 +94,24 @@ class ModelRegistry:
             ("vae", "sdxl_vae", VramEstimates.SDXL_VAE_DECODER),
         ]:
             fp = f"{base_fp}:{suffix}"
-            if fp in self._components:
-                comp = self._components[fp]
-            else:
-                comp = ModelComponentId(
-                    fingerprint=fp, category=category,
-                    estimated_vram_bytes=vram,
-                )
-                self._components[fp] = comp
+            with self._lock:
+                if fp in self._components:
+                    comp = self._components[fp]
+                else:
+                    comp = ModelComponentId(
+                        fingerprint=fp, category=category,
+                        estimated_vram_bytes=vram,
+                    )
+                    self._components[fp] = comp
             components.append(comp)
 
         # VAE encoder = same model as VAE decoder
         components.append(components[3])
 
-        self._sdxl_checkpoints[checkpoint_path] = components
+        with self._lock:
+            if checkpoint_path in self._sdxl_checkpoints:
+                return  # another thread registered it while we were hashing
+            self._sdxl_checkpoints[checkpoint_path] = components
         log.info(f"  ModelRegistry: Registered single-file SDXL checkpoint "
                  f"{os.path.basename(checkpoint_path)} ({len(components)} components)")
 
@@ -134,17 +144,20 @@ class ModelRegistry:
             vae_enc = components[3]
         components.append(vae_enc)
 
-        self._sdxl_checkpoints[model_dir] = components
+        with self._lock:
+            if model_dir in self._sdxl_checkpoints:
+                return  # another thread registered it while we were hashing
+            self._sdxl_checkpoints[model_dir] = components
 
-        # Count shared components
-        shared_count = 0
-        for comp in components:
-            for other_dir, other_comps in self._sdxl_checkpoints.items():
-                if other_dir == model_dir:
-                    continue
-                if any(c.fingerprint == comp.fingerprint for c in other_comps):
-                    shared_count += 1
-                    break
+            # Count shared components (snapshot under lock)
+            shared_count = 0
+            for comp in components:
+                for other_dir, other_comps in self._sdxl_checkpoints.items():
+                    if other_dir == model_dir:
+                        continue
+                    if any(c.fingerprint == comp.fingerprint for c in other_comps):
+                        shared_count += 1
+                        break
 
         log.info(f"  ModelRegistry: Registered SDXL checkpoint {os.path.basename(model_dir)} "
                  f"({len(components)} components, {shared_count} shared)")
@@ -159,11 +172,18 @@ class ModelRegistry:
             model_path, "bgremove", VramEstimates.BGREMOVE)
         log.info(f"  ModelRegistry: Registered BGRemove model {model_path}")
 
+    def is_sdxl_registered(self, model_path: str) -> bool:
+        """Check if an SDXL checkpoint is already registered."""
+        model_path = os.path.realpath(model_path)
+        with self._lock:
+            return model_path in self._sdxl_checkpoints
+
     def get_sdxl_components(self, model_dir: str) -> list[ModelComponentId]:
         model_dir = os.path.realpath(model_dir)
-        if model_dir not in self._sdxl_checkpoints:
-            raise KeyError(f"SDXL checkpoint not registered: {model_dir}")
-        return self._sdxl_checkpoints[model_dir]
+        with self._lock:
+            if model_dir not in self._sdxl_checkpoints:
+                raise KeyError(f"SDXL checkpoint not registered: {model_dir}")
+            return list(self._sdxl_checkpoints[model_dir])
 
     def get_sdxl_te_components(self, model_dir: str) -> list[ModelComponentId]:
         comps = self.get_sdxl_components(model_dir)
@@ -190,22 +210,24 @@ class ModelRegistry:
 
     @property
     def sdxl_checkpoints(self) -> dict[str, list[ModelComponentId]]:
-        return self._sdxl_checkpoints
+        with self._lock:
+            return dict(self._sdxl_checkpoints)
 
     def _get_or_create(self, model_path: str, category: str, estimated_vram: int) -> ModelComponentId:
-        fingerprint = fp_util.compute(model_path)
-        if fingerprint in self._components:
-            existing = self._components[fingerprint]
-            log.info(f"    ModelRegistry: {category} shares content with "
-                     f"existing {existing.category} (fingerprint match)")
-            return existing
-        comp = ModelComponentId(
-            fingerprint=fingerprint,
-            category=category,
-            estimated_vram_bytes=estimated_vram,
-        )
-        self._components[fingerprint] = comp
-        return comp
+        fingerprint = fp_util.compute(model_path)  # I/O — no lock held
+        with self._lock:
+            if fingerprint in self._components:
+                existing = self._components[fingerprint]
+                log.info(f"    ModelRegistry: {category} shares content with "
+                         f"existing {existing.category} (fingerprint match)")
+                return existing
+            comp = ModelComponentId(
+                fingerprint=fingerprint,
+                category=category,
+                estimated_vram_bytes=estimated_vram,
+            )
+            self._components[fingerprint] = comp
+            return comp
 
 
 def _find_model_file(directory: str) -> str | None:

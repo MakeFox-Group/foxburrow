@@ -16,7 +16,7 @@ import torch
 import uvicorn
 
 import log
-from config import FoxBurrowConfig
+from config import FoxBurrowConfig, _auto_threads
 from gpu.pool import GpuPool
 from scheduling.model_registry import ModelRegistry
 from scheduling.pipeline import PipelineFactory
@@ -115,33 +115,58 @@ def generate_default_config() -> str:
 
 
 def discover_sdxl_models(models_dir: str) -> dict[str, str]:
-    """Discover SDXL checkpoints under models_dir/sdxl/.
+    """Discover SDXL checkpoints under models_dir/sdxl/ recursively.
 
-    Supports both diffusers-format directories (with unet/, text_encoder/, etc.)
-    and single-file .safetensors checkpoints.
+    Walks the directory tree to find:
+    - Diffusers-format directories (with unet/, text_encoder/, text_encoder_2/, vae/)
+    - Single-file .safetensors checkpoints (at any nesting depth)
+
+    Model names:
+    - Top-level: filename without extension (e.g. "mymodel")
+    - Nested: "subfolder/filename" relative path (e.g. "anime/mymodel")
     """
     sdxl_dir = os.path.join(models_dir, "sdxl")
     if not os.path.isdir(sdxl_dir):
         log.warning(f"  SDXL models directory not found: {sdxl_dir}")
         return {}
 
+    _DIFFUSERS_REQUIRED = {"unet", "text_encoder", "text_encoder_2", "vae"}
     models: dict[str, str] = {}
-    for name in sorted(os.listdir(sdxl_dir)):
-        path = os.path.join(sdxl_dir, name)
-        if os.path.isdir(path):
-            # Diffusers format: directory with required subdirectories
-            required = ["unet", "text_encoder", "text_encoder_2", "vae"]
-            if all(os.path.isdir(os.path.join(path, d)) for d in required):
-                models[name] = path
-                log.info(f"  Discovered SDXL model (diffusers): {name}")
+
+    for dirpath, dirnames, filenames in os.walk(sdxl_dir):
+        # Check if current directory is a diffusers model
+        subdirs_here = set(dirnames)
+        if _DIFFUSERS_REQUIRED.issubset(subdirs_here):
+            rel = os.path.relpath(dirpath, sdxl_dir)
+            model_name = rel if rel != "." else os.path.basename(dirpath)
+            if model_name in models:
+                log.warning(f"  SDXL name collision: '{model_name}' already registered "
+                            f"({models[model_name]}), skipping {dirpath}")
             else:
-                log.warning(f"  Skipping {name}: missing subdirectories "
-                            f"(need {', '.join(required)})")
-        elif name.endswith(".safetensors"):
-            # Single-file SDXL checkpoint
-            model_name = name.rsplit(".", 1)[0]
-            models[model_name] = path
-            log.info(f"  Discovered SDXL model (single-file): {model_name}")
+                models[model_name] = dirpath
+                log.info(f"  Discovered SDXL model (diffusers): {model_name}")
+            # Don't descend into diffusers model subdirectories
+            dirnames.clear()
+            continue
+
+        # Check for single-file .safetensors in this directory
+        for fname in sorted(filenames):
+            if not fname.endswith(".safetensors"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            base_name = fname.rsplit(".", 1)[0]
+            rel_dir = os.path.relpath(dirpath, sdxl_dir)
+            if rel_dir == ".":
+                model_name = base_name
+            else:
+                model_name = f"{rel_dir}/{base_name}"
+            if model_name in models:
+                log.warning(f"  SDXL name collision: '{model_name}' already registered "
+                            f"({models[model_name]}), skipping {fpath}")
+            else:
+                models[model_name] = fpath
+                log.info(f"  Discovered SDXL model (single-file): {model_name}")
+
     return models
 
 
@@ -414,32 +439,31 @@ def main() -> None:
     # there's nothing to serve.
     available_capabilities: set[str] = set()
 
-    # Discover SDXL models
-    sdxl_models = discover_sdxl_models(models_dir)
-    app_state.sdxl_models = sdxl_models
+    # Discover SDXL models (recursive walk — fast, no I/O beyond stat)
+    all_sdxl = discover_sdxl_models(models_dir)
 
-    if sdxl_models:
+    if all_sdxl:
         available_capabilities.add("sdxl")
 
-        # Set default model
-        if config.server.default_sdxl_model and config.server.default_sdxl_model in sdxl_models:
-            app_state.default_sdxl_model_dir = sdxl_models[config.server.default_sdxl_model]
-        else:
-            first_name = next(iter(sdxl_models))
-            app_state.default_sdxl_model_dir = sdxl_models[first_name]
-            if config.server.default_sdxl_model:
-                log.warning(f"  Default model '{config.server.default_sdxl_model}' not found, "
-                            f"using {first_name}")
+        # Initialize tokenizers from first available model (only needs path, not fingerprint).
+        # Prefer a diffusers model directory since it loads fastest for tokenizer init.
+        first_model_path = None
+        for _name, _path in all_sdxl.items():
+            if os.path.isdir(_path):
+                first_model_path = _path
+                break
+        if first_model_path is None:
+            first_model_path = next(iter(all_sdxl.values()))
 
-        log.info(f"  Default SDXL model: {os.path.basename(app_state.default_sdxl_model_dir)}")
-
-        # Initialize tokenizers from first model
         from handlers.sdxl import init_tokenizers
-        init_tokenizers(app_state.default_sdxl_model_dir)
+        init_tokenizers(first_model_path)
 
-        # Register SDXL checkpoints
-        for name, path in sdxl_models.items():
-            app_state.registry.register_sdxl_checkpoint(path)
+        # Start model scanner — registers single-file instantly, queues diffusers for background
+        from utils.model_scanner import ModelScanner
+        fp_threads = _auto_threads(config.threads.fingerprint, 8)
+        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
+        scanner.start(all_sdxl)
+        app_state.model_scanner = scanner
 
     # Discover LoRA files
     loras_dir = os.path.join(models_dir, "loras")
@@ -448,7 +472,8 @@ def main() -> None:
         from utils.lora_index import discover_loras, start_background_hashing
         app_state.lora_index = discover_loras(loras_dir)
         log.info(f"  Discovered {len(app_state.lora_index)} LoRA files")
-        _lora_hash_thread = start_background_hashing(app_state.lora_index)
+        lora_workers = _auto_threads(config.threads.fingerprint, 8)
+        _lora_hash_thread = start_background_hashing(app_state.lora_index, max_workers=lora_workers)
     else:
         log.info(f"  LoRA directory not found: {loras_dir} (skipping)")
 

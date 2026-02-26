@@ -80,11 +80,12 @@ def _error(status: int, message: str) -> JSONResponse:
 def _resolve_model(model_name: str | None) -> tuple[str | None, str | None]:
     """Resolve model name to model dir. Returns (model_dir, error_message)."""
     state = _get_state()
-    if model_name:
-        if model_name not in state.sdxl_models:
-            return None, f'Unknown model "{model_name}".'
-        return state.sdxl_models[model_name], None
-    return state.default_sdxl_model_dir, None
+    if not model_name:
+        return None, "Model name is required."
+    models = state.sdxl_models
+    if model_name not in models:
+        return None, f'Unknown model "{model_name}".'
+    return models[model_name], None
 
 
 def _find_gpu_with_tagger(state) -> "GpuInstance | None":
@@ -229,23 +230,34 @@ async def status():
                 })
 
     # Compute readiness scores for C# dispatch
+    sdxl_models_snapshot = dict(state.sdxl_models)
     readiness = {}
     if scheduler and scheduler.workers:
         from scheduling.readiness import compute_readiness
         try:
             readiness = compute_readiness(
-                pool, scheduler.workers, state.registry, state.sdxl_models)
+                pool, scheduler.workers, state.registry, sdxl_models_snapshot)
         except Exception as ex:
             log.log_exception(ex, "Failed to compute readiness scores")
+
+    # Model scan progress
+    model_scan = None
+    scanner = state.model_scanner
+    if scanner is not None:
+        completed, total = scanner.progress
+        model_scan = {
+            "scanning": scanner.is_scanning,
+            "completed": completed,
+            "total": total,
+        }
 
     return {
         "gpus": gpus,
         "available": available,
         "total": len(pool.gpus),
         "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
-        "sdxl_models": sorted(state.sdxl_models.keys()),
-        "default_sdxl_model": os.path.splitext(os.path.basename(state.default_sdxl_model_dir))[0]
-            if state.default_sdxl_model_dir else None,
+        "sdxl_models": sorted(sdxl_models_snapshot.keys()),
+        "model_scan": model_scan,
         "readiness": readiness,
         "available_loras": sorted(state.lora_index.keys()),
     }
@@ -272,7 +284,7 @@ async def rescan_loras():
     from utils.lora_index import rescan_loras as do_rescan
 
     # Run the blocking rescan in a thread to avoid blocking the event loop
-    summary = await asyncio.get_event_loop().run_in_executor(
+    summary = await asyncio.get_running_loop().run_in_executor(
         None, do_rescan, loras_dir, state.lora_index)
 
     return summary
@@ -281,11 +293,12 @@ async def rescan_loras():
 @router.get("/model-list")
 async def model_list():
     state = _get_state()
+    models = dict(state.sdxl_models)
     return [{
         "name": name,
         "path": path,
         "type": "single_file" if path.endswith(".safetensors") else "diffusers",
-    } for name, path in sorted(state.sdxl_models.items())]
+    } for name, path in sorted(models.items())]
 
 
 @router.post("/generate")
