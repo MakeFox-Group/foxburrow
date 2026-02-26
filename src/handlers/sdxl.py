@@ -27,8 +27,9 @@ if TYPE_CHECKING:
 
 # Constants
 VAE_SCALE_FACTOR = 0.13025
-VAE_TILE_MAX = 1024           # default max VAE tile size (pixels) when auto-calculating
-LATENT_TILE_OVERLAP = 16      # latent overlap for VAE decode tiles
+VAE_TILE_THRESHOLD = 1024    # force tiled mode when any image dimension >= this (pixels)
+VAE_TILE_MAX = 768           # max tile size per axis when tiling (pixels)
+LATENT_TILE_OVERLAP = 16     # latent overlap for VAE encode/decode tiles
 
 # MultiDiffusion (tiled UNet) constants
 UNET_TILE_MAX = 1024          # default max UNet tile size (pixels) when auto-calculating
@@ -37,10 +38,12 @@ UNET_TILE_THRESHOLD = 256     # auto-enable tiling when latent dim > this (> 204
 
 
 def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
-    """Return (tile_w, tile_h) in pixels that evenly distribute the image into tiles <= max_tile."""
+    """Return (tile_w, tile_h) in pixels that evenly distribute the image
+    into tiles <= max_tile. Each axis is computed independently, so tiles
+    may be non-square for optimal coverage."""
     def _axis(dim: int) -> int:
         if dim <= max_tile:
-            return max_tile        # single tile — no actual tiling
+            return dim             # fits in one tile — no splitting needed
         n = math.ceil(dim / max_tile)
         return math.ceil(math.ceil(dim / n) / 8) * 8  # round up to multiple of 8
     return _axis(img_w), _axis(img_h)
@@ -1084,18 +1087,22 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 
     lat_h = scaled_latents.shape[2]
     lat_w = scaled_latents.shape[3]
+    img_w = lat_w * 8
+    img_h = lat_h * 8
 
-    # Resolve tile dimensions — explicit overrides or auto-calculate (≤ VAE_TILE_MAX)
+    # Resolve tile dimensions — explicit overrides, auto-calculate, or full-image
     if job.vae_tile_width > 0 and job.vae_tile_height > 0:
         tile_w = (job.vae_tile_width  // 8) * 8
         tile_h = (job.vae_tile_height // 8) * 8
+    elif img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
+        tile_w, tile_h = _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
     else:
-        tile_w, tile_h = _auto_vae_tile(lat_w * 8, lat_h * 8, VAE_TILE_MAX)
+        tile_w, tile_h = img_w, img_h
 
     lat_tile_w = tile_w // 8
     lat_tile_h = tile_h // 8
 
-    # Use tiled decode if latent exceeds tile size
+    # Use tiled decode if image needs splitting
     if lat_w > lat_tile_w or lat_h > lat_tile_h:
         image = _vae_decode_tiled(scaled_latents, vae, lat_tile_w, lat_tile_h)
     else:
@@ -1116,7 +1123,8 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     device = gpu.device
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
-    latents = _vae_encode(job.input_image, vae, device, tile_px=tile_w)
+    tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
+    latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h)
     job.latents = latents
     log.info(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
 
@@ -1160,9 +1168,18 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
     vae = _get_cached_model(gpu, "sdxl_vae")
 
     scaled = latents.to(device=device, dtype=vae.dtype) / VAE_SCALE_FACTOR
-    with torch.no_grad():
-        decoded = vae.decode(scaled).sample
-    intermediate = _tensor_to_pil(decoded)
+    hires_lat_h = scaled.shape[2]
+    hires_lat_w = scaled.shape[3]
+    hires_img_w = hires_lat_w * 8
+    hires_img_h = hires_lat_h * 8
+
+    if hires_img_w >= VAE_TILE_THRESHOLD or hires_img_h >= VAE_TILE_THRESHOLD:
+        dtw, dth = _auto_vae_tile(hires_img_w, hires_img_h, VAE_TILE_MAX)
+        intermediate = _vae_decode_tiled(scaled, vae, dtw // 8, dth // 8)
+    else:
+        with torch.no_grad():
+            decoded = vae.decode(scaled).sample
+        intermediate = _tensor_to_pil(decoded)
     log.info(f"  HiresTransform: VAE decode → {intermediate.width}x{intermediate.height} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
@@ -1178,7 +1195,8 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
                  f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
-    encoded = _vae_encode(upscaled, vae, device, tile_px=tile_w)
+    tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
+    encoded = _vae_encode(upscaled, vae, device, tile_w=tile_w, tile_h=tile_h)
     log.info(f"  HiresTransform: VAE encode → {list(encoded.shape)} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
     upscaled.close()
@@ -1372,13 +1390,22 @@ def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 
 def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
-                tile_px: int = 0) -> torch.Tensor:
+                tile_w: int = 0, tile_h: int = 0) -> torch.Tensor:
     """VAE-encode a PIL image to latent space. Returns [1,4,H/8,W/8].
-    If tile_px > 0 (or image exceeds VAE_TILE_MAX), uses tiled encoding."""
+    Forces tiled encoding when any dimension >= VAE_TILE_THRESHOLD, with
+    non-square tiles auto-computed per axis for optimal coverage."""
     img_w, img_h = image.size
-    effective_tile = tile_px if tile_px > 0 else VAE_TILE_MAX
-    if img_w > effective_tile or img_h > effective_tile:
-        return _vae_encode_tiled(image, vae, device, effective_tile)
+
+    if tile_w > 0 and tile_h > 0:
+        eff_w = (tile_w // 8) * 8
+        eff_h = (tile_h // 8) * 8
+    elif img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
+        eff_w, eff_h = _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
+    else:
+        eff_w, eff_h = img_w, img_h
+
+    if img_w > eff_w or img_h > eff_h:
+        return _vae_encode_tiled(image, vae, device, eff_w, eff_h)
 
     arr = np.array(image.convert("RGB"), dtype=np.float32)
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
@@ -1392,24 +1419,32 @@ def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
 
 
 def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
-                      device: torch.device, tile_px: int) -> torch.Tensor:
-    """Tiled VAE encode for large images. Tiles in pixel space, blends in latent space."""
+                      device: torch.device,
+                      tile_w_px: int, tile_h_px: int) -> torch.Tensor:
+    """Tiled VAE encode for large images. Supports non-square tiles.
+    Tiles in pixel space, blends in latent space with linear feathering."""
+    min_tile_px = LATENT_TILE_OVERLAP * 8 + 8  # 136px minimum
+    if tile_w_px < min_tile_px or tile_h_px < min_tile_px:
+        raise ValueError(
+            f"VAE encode tile {tile_w_px}x{tile_h_px}px is smaller than minimum "
+            f"{min_tile_px}px (overlap={LATENT_TILE_OVERLAP * 8}px). Increase tile size.")
+
     img_w, img_h = image.size
     lat_h = img_h // 8
     lat_w = img_w // 8
 
-    tile_lat = tile_px // 8
     overlap_px = LATENT_TILE_OVERLAP * 8   # same overlap as decode
     overlap_lat = LATENT_TILE_OVERLAP
 
-    stride_px = tile_px - overlap_px
-    stride_lat = tile_lat - overlap_lat
+    stride_w_px = tile_w_px - overlap_px
+    stride_h_px = tile_h_px - overlap_px
 
-    tiles_y = max(1, (img_h - overlap_px + stride_px - 1) // stride_px)
-    tiles_x = max(1, (img_w - overlap_px + stride_px - 1) // stride_px)
+    tiles_y = max(1, (img_h - overlap_px + stride_h_px - 1) // stride_h_px)
+    tiles_x = max(1, (img_w - overlap_px + stride_w_px - 1) // stride_w_px)
 
     log.info(f"  SDXL: Tiled VAE encode {img_w}x{img_h} — "
-             f"{tiles_x}x{tiles_y} grid ({tiles_x * tiles_y} tiles, tile={tile_px}x{tile_px})")
+             f"{tiles_x}x{tiles_y} grid ({tiles_x * tiles_y} tiles, "
+             f"tile={tile_w_px}x{tile_h_px})")
 
     lat_sum = np.zeros((1, 4, lat_h, lat_w), dtype=np.float32)
     weights  = np.zeros((1, 1, lat_h, lat_w), dtype=np.float32)
@@ -1418,11 +1453,11 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
 
     for ty in range(tiles_y):
         for tx in range(tiles_x):
-            py = min(ty * stride_px, img_h - tile_px)
-            px = min(tx * stride_px, img_w - tile_px)
+            py = min(ty * stride_h_px, img_h - tile_h_px)
+            px = min(tx * stride_w_px, img_w - tile_w_px)
             py, px = max(0, py), max(0, px)
-            py2 = min(py + tile_px, img_h)
-            px2 = min(px + tile_px, img_w)
+            py2 = min(py + tile_h_px, img_h)
+            px2 = min(px + tile_w_px, img_w)
 
             tile_np = arr[py:py2, px:px2]
             t = torch.from_numpy(tile_np).permute(2, 0, 1).unsqueeze(0)
@@ -1468,7 +1503,14 @@ def _vae_decode_tiled(
     latents: torch.Tensor, vae: AutoencoderKL,
     lat_tile_w: int, lat_tile_h: int,
 ) -> Image.Image:
-    """Tiled VAE decode for large images with Gaussian blending."""
+    """Tiled VAE decode for large images with linear feathering blend.
+    Uses numpy broadcasting for weight accumulation (no Python pixel loops)."""
+    min_lat = LATENT_TILE_OVERLAP + 1
+    if lat_tile_w < min_lat or lat_tile_h < min_lat:
+        raise ValueError(
+            f"VAE decode tile {lat_tile_w*8}x{lat_tile_h*8}px is smaller than minimum "
+            f"{min_lat*8}px (overlap={LATENT_TILE_OVERLAP*8}px). Increase tile size.")
+
     lat_h = latents.shape[2]
     lat_w = latents.shape[3]
     img_h = lat_h * 8
@@ -1484,10 +1526,8 @@ def _vae_decode_tiled(
              f"{tiles_x}x{tiles_y} grid ({tiles_x * tiles_y} tiles, "
              f"tile={lat_tile_w*8}x{lat_tile_h*8})")
 
-    # Weight accumulation buffers
-    pixel_r = np.zeros((img_h, img_w), dtype=np.float32)
-    pixel_g = np.zeros((img_h, img_w), dtype=np.float32)
-    pixel_b = np.zeros((img_h, img_w), dtype=np.float32)
+    # Accumulation buffers: [3, H, W] for RGB + [H, W] for weights
+    rgb_sum = np.zeros((3, img_h, img_w), dtype=np.float32)
     weights = np.zeros((img_h, img_w), dtype=np.float32)
 
     overlap_px = LATENT_TILE_OVERLAP * 8
@@ -1507,50 +1547,34 @@ def _vae_decode_tiled(
             with torch.no_grad():
                 decoded = vae.decode(tile).sample
 
-            decoded_np = decoded.squeeze(0).cpu().float().numpy()
+            decoded_np = decoded.squeeze(0).cpu().float().numpy()  # [3, H, W]
             tile_img_h = tile_h * 8
             tile_img_w = tile_w * 8
             img_x = lat_x * 8
             img_y = lat_y * 8
 
-            # Build weight mask with linear feathering
-            for y in range(tile_img_h):
-                wy = 1.0
-                if y < overlap_px:
-                    wy = (y + 0.5) / overlap_px
-                elif y >= tile_img_h - overlap_px:
-                    wy = (tile_img_h - y - 0.5) / overlap_px
+            # Build feathering weights via numpy broadcasting (not pixel loops)
+            wy = np.ones(tile_img_h, dtype=np.float32)
+            wy[:overlap_px] = (np.arange(overlap_px, dtype=np.float32) + 0.5) / overlap_px
+            wy[tile_img_h - overlap_px:] = (np.arange(overlap_px, 0, -1, dtype=np.float32) - 0.5) / overlap_px
 
-                for x in range(tile_img_w):
-                    wx = 1.0
-                    if x < overlap_px:
-                        wx = (x + 0.5) / overlap_px
-                    elif x >= tile_img_w - overlap_px:
-                        wx = (tile_img_w - x - 0.5) / overlap_px
+            wx = np.ones(tile_img_w, dtype=np.float32)
+            wx[:overlap_px] = (np.arange(overlap_px, dtype=np.float32) + 0.5) / overlap_px
+            wx[tile_img_w - overlap_px:] = (np.arange(overlap_px, 0, -1, dtype=np.float32) - 0.5) / overlap_px
 
-                    w = wx * wy
-                    dy = img_y + y
-                    dx = img_x + x
+            w_mask = wy[:, np.newaxis] * wx[np.newaxis, :]  # [H, W]
 
-                    r = decoded_np[0, y, x] / 2.0 + 0.5
-                    g = decoded_np[1, y, x] / 2.0 + 0.5
-                    b = decoded_np[2, y, x] / 2.0 + 0.5
-
-                    pixel_r[dy, dx] += r * w
-                    pixel_g[dy, dx] += g * w
-                    pixel_b[dy, dx] += b * w
-                    weights[dy, dx] += w
+            # Convert [-1, 1] → [0, 1] and accumulate
+            rgb = decoded_np / 2.0 + 0.5  # [3, H, W]
+            rgb_sum[:, img_y:img_y+tile_img_h, img_x:img_x+tile_img_w] += rgb * w_mask[np.newaxis]
+            weights[img_y:img_y+tile_img_h, img_x:img_x+tile_img_w] += w_mask
 
             tile_count += 1
 
     # Build final image
     w_safe = np.maximum(weights, 1e-8)
-    r = np.clip((pixel_r / w_safe * 255), 0, 255).astype(np.uint8)
-    g = np.clip((pixel_g / w_safe * 255), 0, 255).astype(np.uint8)
-    b = np.clip((pixel_b / w_safe * 255), 0, 255).astype(np.uint8)
-
-    rgb = np.stack([r, g, b], axis=2)
-    image = Image.fromarray(rgb, "RGB")
+    rgb_out = np.clip(rgb_sum / w_safe[np.newaxis] * 255, 0, 255).astype(np.uint8)  # [3, H, W]
+    image = Image.fromarray(rgb_out.transpose(1, 2, 0), "RGB")
 
     log.info(f"  SDXL: Tiled VAE decode complete. Image={img_w}x{img_h} ({tile_count} tiles)")
     return image

@@ -368,6 +368,16 @@ class GpuPool:
 
             gpu = GpuInstance(cfg, nvml_dev, cuda_idx)
             self.gpus.append(gpu)
+
+            # Cap VRAM allocation at 98% — turns fatal Xid 31 MMU faults into
+            # recoverable torch.cuda.OutOfMemoryError when cuDNN overcommits.
+            try:
+                torch.cuda.set_per_process_memory_fraction(0.98, gpu.device)
+                cap_mb = int(nvml_dev.total_memory * 0.98 / (1024 * 1024))
+                log.info(f"  GpuPool: VRAM cap set to 98% ({cap_mb}MB) on CUDA:{cuda_idx}")
+            except Exception as e:
+                log.warning(f"  GpuPool: Could not set VRAM cap on CUDA:{cuda_idx}: {e}")
+
             log.info(f"  GpuPool: Registered GPU [{cfg.uuid}] = {nvml_dev.name} "
                      f"(CUDA:{cuda_idx}, PCI={nvml_dev.pci_bus_id}, "
                      f"{nvml_dev.total_memory // (1024*1024)}MB, "
