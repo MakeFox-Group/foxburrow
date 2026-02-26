@@ -10,6 +10,7 @@ from scheduling.queue import JobQueue
 
 if TYPE_CHECKING:
     from scheduling.job import InferenceJob
+    from utils.fs_watcher import FileSystemWatcher
     from utils.model_scanner import ModelScanner
 
 
@@ -27,6 +28,7 @@ class AppState:
         self.model_scanner: ModelScanner | None = None
         self.lora_index: dict = {}  # name -> LoraEntry (from utils.lora_index)
         self.loras_dir: str | None = None  # path to loras directory for rescans
+        self.fs_watcher: FileSystemWatcher | None = None
 
         # Job registry for queue-based API
         self.jobs: dict[str, "InferenceJob"] = {}          # job_id → job

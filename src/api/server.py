@@ -46,9 +46,11 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
         if on_startup:
             await on_startup()
         yield
-        # Graceful shutdown: cancel scheduler and workers before exiting
+        # Graceful shutdown
         log.info("  Shutting down...")
         cleanup_task.cancel()
+        if app_state.fs_watcher:
+            await app_state.fs_watcher.stop()
         scheduler = app_state.scheduler
         if scheduler and scheduler._task:
             scheduler._task.cancel()

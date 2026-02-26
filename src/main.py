@@ -688,6 +688,13 @@ def main() -> None:
         scheduler.start()
         log.info(f"  Scheduler started with {len(workers)} worker(s)")
 
+        # Start filesystem watcher — auto-detect model additions/removals.
+        # Runs async tasks in the event loop, zero CPU when idle (inotify).
+        from utils.fs_watcher import FileSystemWatcher
+        watcher = FileSystemWatcher(app_state)
+        watcher.start()
+        app_state.fs_watcher = watcher
+
         # Kick off ALL heavy initialization in a background thread:
         # HF config prefetch, model fingerprinting, LoRA hashing, GPU onload.
         # The server is already listening and /api/status reports scan progress.
