@@ -104,55 +104,61 @@ def set_model_path(path: str) -> None:
 
 
 def init_tagger(device: torch.device) -> None:
-    """Load tagger model and tags for a specific GPU device."""
+    """Load tagger model and tags for a specific GPU device.
+
+    Thread-safe: multiple GPUs can load in parallel since the heavy work
+    (file I/O, model construction, CUDA transfer) runs outside the lock.
+    """
     global _transform
 
+    # Fast check — already loaded?
+    if device in _tagger_instances:
+        return
+
+    if _model_path is None:
+        raise RuntimeError("Tagger model path not configured.")
+
+    model_dir = _model_path
+
+    # Load tags
+    tags_file = os.path.join(model_dir, "tags.json")
+    if not os.path.isfile(tags_file):
+        raise RuntimeError(f"Tags file not found: {tags_file}")
+
+    with open(tags_file) as f:
+        tag_dict: dict[str, int] = json.load(f)
+
+    # Build ordered tag list (index -> tag name) matching reference
+    allowed_tags = [""] * len(tag_dict)
+    for tag_name, idx in tag_dict.items():
+        allowed_tags[idx] = tag_name.replace("_", " ")
+
+    # Load model via timm (exact same architecture as reference)
+    import timm
+    import safetensors.torch
+
+    safetensors_path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.isfile(safetensors_path):
+        raise RuntimeError(f"Model file not found: {safetensors_path}")
+
+    num_tags = len(tag_dict)
+    model = timm.create_model(
+        "vit_so400m_patch14_siglip_384.webli",
+        pretrained=False,
+        num_classes=num_tags,
+    )
+    model.head = _GatedHead(min(model.head.weight.shape), num_tags)
+    safetensors.torch.load_model(model, safetensors_path)
+    model.to(device=device, dtype=torch.float16).eval()
+
+    # Only hold the lock for the dict write — never during heavy loading.
     with _tagger_lock:
-        if device in _tagger_instances:
-            return
-
-        if _model_path is None:
-            raise RuntimeError("Tagger model path not configured.")
-
-        model_dir = _model_path
-
-        # Load tags
-        tags_file = os.path.join(model_dir, "tags.json")
-        if not os.path.isfile(tags_file):
-            raise RuntimeError(f"Tags file not found: {tags_file}")
-
-        with open(tags_file) as f:
-            tag_dict: dict[str, int] = json.load(f)
-
-        # Build ordered tag list (index -> tag name) matching reference
-        allowed_tags = [""] * len(tag_dict)
-        for tag_name, idx in tag_dict.items():
-            allowed_tags[idx] = tag_name.replace("_", " ")
-
-        # Load model via timm (exact same architecture as reference)
-        import timm
-        import safetensors.torch
-
-        safetensors_path = os.path.join(model_dir, "model.safetensors")
-        if not os.path.isfile(safetensors_path):
-            raise RuntimeError(f"Model file not found: {safetensors_path}")
-
-        num_tags = len(tag_dict)
-        model = timm.create_model(
-            "vit_so400m_patch14_siglip_384.webli",
-            pretrained=False,
-            num_classes=num_tags,
-        )
-        model.head = _GatedHead(min(model.head.weight.shape), num_tags)
-        safetensors.torch.load_model(model, safetensors_path)
-        model.to(device=device, dtype=torch.float16).eval()
-
-        _tagger_instances[device] = (model, allowed_tags)
-
+        if device not in _tagger_instances:
+            _tagger_instances[device] = (model, allowed_tags)
         if _transform is None:
             _transform = _build_transform()
 
-        log.info(f"  Tagger: Loaded JTP PILOT2 SigLIP ({num_tags} tags) to {device}")
+    log.info(f"  Tagger: Loaded JTP PILOT2 SigLIP ({num_tags} tags) to {device}")
 
 
 def is_loaded_on(device: torch.device) -> bool:
