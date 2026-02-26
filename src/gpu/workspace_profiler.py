@@ -86,7 +86,7 @@ _lock = threading.Lock()
 _working_mem_caches: dict[tuple[str, str], dict[str, int]] = {}
 
 # Guard against concurrent profiling of the same (component, gpu_model)
-_profiling_in_progress: set[tuple[str, str]] = {}
+_profiling_in_progress: set[tuple[str, str]] = set()
 _profiling_events: dict[tuple[str, str], threading.Event] = {}
 
 
