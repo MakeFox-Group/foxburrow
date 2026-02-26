@@ -1,0 +1,35 @@
+[server]
+address=127.0.0.1
+port=15888
+models_dir=../models/
+tensorrt_cache=../data/tensorrt_cache/
+
+# API secret — all requests must include this token.
+# Header:  Authorization: Bearer <secret>
+# URL:     ?apikey=<secret>
+# Remove this line to disable authentication (NOT recommended).
+# Generate one with:  python3 -c "import secrets; print(secrets.token_hex(16))"
+#secret=
+
+# Set to true after reviewing this configuration.
+# FoxBurrow will not start until this is set.
+enabled=false
+
+# Each GPU section is named [GPU-<uuid>] where the UUID comes from nvidia-smi -L.
+# Only GPUs listed here will be used. Others are ignored.
+# Capabilities: upscale, bgremove, tag
+# Not all GPUs can run all models (VRAM constraints).
+#
+# onload: models to pre-load at startup (tag, upscale, bgremove, or model_name:component)
+# unevictable: models that should never be evicted from VRAM
+
+#[GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx]
+#name=RTX 4090 #1
+#capabilities=upscale,bgremove,tag
+#onload=tag
+#unevictable=tag
+
+#[GPU-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy]
+#name=RTX 3080
+#capabilities=bgremove,tag
+#onload=tag

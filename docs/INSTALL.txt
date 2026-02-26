@@ -1,0 +1,75 @@
+FoxBurrow — Installation & Usage
+==================================
+
+Prerequisites
+-------------
+- Python 3.11+ (tested on 3.14)
+- NVIDIA GPU with CUDA support
+- NVIDIA drivers installed (nvidia-smi should work)
+
+Quick Start
+-----------
+From the project root:
+
+    bin/foxburrow.sh
+
+That's it. The script creates a .venv, installs/updates packages, and starts
+the server. Run it again after pulling new code — it handles everything.
+
+Manual Setup (if you prefer)
+----------------------------
+1. Create venv:
+       python3 -m venv .venv
+
+2. Install packages:
+       .venv/bin/pip install -r requirements.txt
+
+3. Run (from src/):
+       cd src && ../.venv/bin/python main.py
+
+Configuration
+-------------
+The server looks for foxburrow.ini in these locations (first match wins):
+
+    ./foxburrow.ini                           (current working directory)
+    ../conf/foxburrow.ini                     (relative to cwd)
+
+See conf/foxburrow.ini.example for the format. At minimum you need:
+
+    [server]
+    address=0.0.0.0
+    port=8800
+    models_dir=../models/
+
+    [GPU-<uuid>]
+    name=My GPU
+    capabilities=upscale,bgremove,tag
+
+Get your GPU UUID with: nvidia-smi -L
+
+Models Directory
+----------------
+The models_dir path (relative to the .ini file) should contain:
+
+    models/
+      sdxl/                    SDXL checkpoints (.safetensors or diffusers dirs)
+      loras/                   LoRA files (.safetensors)
+      other/
+        upscale/               RealESRGAN x2plus model (.pth)
+        bgremove/              RMBG-2.0 model directory (config.json + model.safetensors)
+        tagger/                JTP PILOT2 SigLIP (model.safetensors + tags.json)
+
+Not all model directories are required — the server runs with whatever it
+finds and logs what it discovered at startup.
+
+Stopping
+--------
+Foreground (default):  Ctrl+C
+Background (--bg):     kill $(cat data/foxburrow.pid)    (from project root)
+
+Or just run bin/foxburrow.sh again — it kills the old instance automatically.
+
+Logs
+----
+Foreground: logs print to stdout directly.
+Background (--bg): stdout/stderr go to logs/foxburrow.log (in project root).

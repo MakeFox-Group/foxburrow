@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data — keep README.md so git tracks directory
+data/*
+!data/README.md
+logs/*
+!logs/README.md
+
+# Config — keep example, ignore actual
+conf/foxburrow.ini
+
+# Model weights — keep README.md so git tracks directory
+models/**/*.safetensors
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+models/**/*.bin
+models/**/*.ckpt
+models/**/*.data
+models/**/*.json
+models/**/tokenizer*
+models/**/.fpcache
