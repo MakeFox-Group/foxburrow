@@ -146,17 +146,18 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
             "tokenizer_2": pipe.tokenizer_2,
         }
 
-        # Ensure neural-net components are on CPU and in eval mode
-        for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
-            components[key].to("cpu")
-            components[key].eval()
-
-        # Enable xformers on UNet if available
+        # Enable xformers on UNet if available (must be done before moving to CPU —
+        # some diffusers versions require the model on a CUDA device for this call)
         try:
             components["sdxl_unet"].enable_xformers_memory_efficient_attention()
             log.info("  SDXL: xformers enabled on UNet")
-        except Exception:
-            log.info("  SDXL: xformers not available, using default attention")
+        except Exception as ex:
+            log.info(f"  SDXL: xformers not available, using default attention ({ex})")
+
+        # Move neural-net components to CPU and set eval mode
+        for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
+            components[key].to("cpu")
+            components[key].eval()
 
         del pipe
         torch.cuda.empty_cache()
