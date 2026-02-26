@@ -296,6 +296,10 @@ class GpuPool:
             device_by_uuid[dev.uuid.lower()] = dev
 
         for cfg in gpu_configs:
+            if not cfg.enabled:
+                log.info(f"  GpuPool: GPU [{cfg.uuid}] ({cfg.name}) is disabled — skipping")
+                continue
+
             # Config UUID is like "GPU-caaaa9d0-..." — match against NVML UUID
             config_uuid = cfg.uuid.lower()
             nvml_dev = device_by_uuid.get(config_uuid)

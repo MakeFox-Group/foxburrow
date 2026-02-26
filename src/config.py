@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 class GpuConfig:
     uuid: str = ""
     name: str = ""
+    enabled: bool = True
     capabilities: set[str] = field(default_factory=set)
     onload: set[str] = field(default_factory=set)        # pre-load at startup
     unevictable: set[str] = field(default_factory=set)    # never evict from VRAM
@@ -57,6 +58,7 @@ class FoxBurrowConfig:
             if section.upper().startswith("GPU-") and len(section) > 4:
                 uuid = section  # Preserve full section name as UUID key
                 gpu = GpuConfig(uuid=uuid)
+                gpu.enabled = parser.getboolean(section, "enabled", fallback=True)
                 gpu.name = parser.get(section, "name", fallback="")
                 caps_str = parser.get(section, "capabilities", fallback="")
                 gpu.capabilities = {
