@@ -530,6 +530,10 @@ def main() -> None:
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
 
+    if not available_capabilities:
+        log.error("No models found — nothing to do. Install at least one model and try again.")
+        sys.exit(1)
+
     # Pre-load models specified in per-GPU onload config
     for gpu in app_state.gpu_pool.gpus:
         _process_gpu_onload(gpu, app_state)
