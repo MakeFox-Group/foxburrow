@@ -16,18 +16,61 @@ STAMP_FILE="$VENV_DIR/.requirements.stamp"
 LOG_DIR="$PROJECT_ROOT/logs"
 LOG_FILE="$LOG_DIR/foxburrow.log"
 
+MIN_PYTHON=(3 13)
+
 cd "$PROJECT_ROOT"
 
-# ── Check Python version ────────────────────────────────────────────
-if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
-    echo "ERROR: Python 3.11+ required." >&2
+# ── Find best Python ──────────────────────────────────────────────
+# Prefer python3.13 (best SageAttention 2 / ecosystem support),
+# fall back to system python3 if it meets the minimum version.
+find_python() {
+    local candidate version_ok
+    for candidate in python3.13 python3; do
+        if ! command -v "$candidate" &>/dev/null; then
+            continue
+        fi
+        version_ok="$("$candidate" -c \
+            "import sys; sys.exit(0 if sys.version_info >= (${MIN_PYTHON[0]}, ${MIN_PYTHON[1]}) else 1)" \
+            2>/dev/null && echo yes || echo no)"
+        if [ "$version_ok" = "yes" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYTHON="$(find_python)" || {
+    echo "ERROR: Python ${MIN_PYTHON[0]}.${MIN_PYTHON[1]}+ required." >&2
+    echo "  Searched for: python3.13, python3" >&2
     exit 1
+}
+PYTHON_VERSION="$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")"
+echo "Using $PYTHON (Python $PYTHON_VERSION)"
+
+# ── Create or recreate venv ───────────────────────────────────────
+# Recreate if the venv's Python version doesn't match the selected one.
+recreate_venv=false
+if [ -d "$VENV_DIR" ]; then
+    if [ -x "$VENV_DIR/bin/python" ]; then
+        venv_version="$("$VENV_DIR/bin/python" -c \
+            "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "")"
+        if [ "$venv_version" != "$PYTHON_VERSION" ]; then
+            echo "Python version changed ($venv_version -> $PYTHON_VERSION), recreating venv..."
+            recreate_venv=true
+        fi
+    else
+        recreate_venv=true
+    fi
 fi
 
-# ── Create venv if missing ──────────────────────────────────────────
+if [ "$recreate_venv" = true ]; then
+    rm -rf "$VENV_DIR"
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating Python venv..."
-    python3 -m venv "$VENV_DIR"
+    echo "Creating Python $PYTHON_VERSION venv..."
+    "$PYTHON" -m venv "$VENV_DIR"
 fi
 
 # ── Install/update packages if requirements.txt changed ─────────────
