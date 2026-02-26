@@ -47,14 +47,18 @@ MAX_CONCURRENCY = 4
 
 _VRAM_FALLBACK_BYTES: dict[StageType, int] = {
     # Absolute byte fallbacks — used before first measurement only.
-    # Deliberately generous to survive the first run without OOM.
+    # Aggressively high on purpose: on 12GB cards with a 5.2GB UNet loaded,
+    # these force ensure_free_vram() to evict non-essential cached models
+    # (upscale, TEs from previous stages) BEFORE starting.  Once the first
+    # successful execution produces a real measurement, these are never used
+    # again.  It's better to evict+reload than to OOM and crash the CUDA context.
     StageType.GPU_TEXT_ENCODE: 512 * 1024**2,        # ~512 MB (not resolution-dependent)
-    StageType.GPU_DENOISE: 4 * 1024**3,              # ~4 GB
-    StageType.GPU_VAE_DECODE: 2500 * 1024**2,        # ~2.5 GB (1 GB was too low — cuDNN workspace)
-    StageType.GPU_VAE_ENCODE: 1500 * 1024**2,        # ~1.5 GB
-    StageType.GPU_HIRES_TRANSFORM: 4 * 1024**3,      # ~4 GB
-    StageType.GPU_UPSCALE: 1 * 1024**3,              # ~1 GB
-    StageType.GPU_BGREMOVE: 512 * 1024**2,           # ~512 MB
+    StageType.GPU_DENOISE: 5 * 1024**3,              # ~5 GB (UNet activations + attention)
+    StageType.GPU_VAE_DECODE: 4 * 1024**3,           # ~4 GB (cuDNN conv workspace for upsampling)
+    StageType.GPU_VAE_ENCODE: 4 * 1024**3,           # ~4 GB (cuDNN conv workspace for downsampling)
+    StageType.GPU_HIRES_TRANSFORM: 5 * 1024**3,      # ~5 GB (VAE+upscale+VAE pipeline)
+    StageType.GPU_UPSCALE: 2 * 1024**3,              # ~2 GB
+    StageType.GPU_BGREMOVE: 1 * 1024**3,             # ~1 GB
 }
 
 # Max observed bytes-per-pixel ratio per stage type (populated at runtime).
@@ -130,6 +134,7 @@ _CUDA_FATAL_PATTERNS = [
     "unspecified launch failure",       # cudaErrorLaunchFailure
     "cuda error: an illegal instruction was encountered",  # cudaErrorIllegalInstruction
     "device-side assert",              # cudaErrorAssert (kernel assertion failure)
+    "unable to find an engine",        # cuDNN workspace allocation failed → MMU fault
 ]
 
 
