@@ -24,6 +24,8 @@ _transform = None
 # Per-GPU tagger state: maps torch.device → (model, tags)
 _tagger_instances: dict[torch.device, tuple[nn.Module, list[str]]] = {}
 _tagger_lock = threading.Lock()
+# Separate lock for timm.create_model() which is NOT thread-safe
+_model_create_lock = threading.Lock()
 
 
 # ====================================================================
@@ -142,12 +144,16 @@ def init_tagger(device: torch.device) -> None:
         raise RuntimeError(f"Model file not found: {safetensors_path}")
 
     num_tags = len(tag_dict)
-    model = timm.create_model(
-        "vit_so400m_patch14_siglip_384.webli",
-        pretrained=False,
-        num_classes=num_tags,
-    )
-    model.head = _GatedHead(min(model.head.weight.shape), num_tags)
+    # timm.create_model() is NOT thread-safe — concurrent calls for the same
+    # architecture race on internal model factory state, producing meta-device
+    # tensors that crash on .to(). Serialize creation; CUDA transfer stays parallel.
+    with _model_create_lock:
+        model = timm.create_model(
+            "vit_so400m_patch14_siglip_384.webli",
+            pretrained=False,
+            num_classes=num_tags,
+        )
+        model.head = _GatedHead(min(model.head.weight.shape), num_tags)
     safetensors.torch.load_model(model, safetensors_path)
     model.to(device=device, dtype=torch.float16).eval()
 
