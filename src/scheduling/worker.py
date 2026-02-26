@@ -162,20 +162,29 @@ def _get_min_free_vram(stage_type: StageType, job: InferenceJob,
 
     # --- Tier 1: workspace profiler ---
     if gpu_model is not None:
+        from gpu.workspace_profiler import get_working_memory
+
         comp = _STAGE_TO_PROFILER_COMPONENT.get(stage_type)
         if comp is not None:
-            from gpu.workspace_profiler import get_working_memory
             profiled = get_working_memory(comp, gpu_model, w, h)
+            # VAE encoder shares the same model file as VAE decoder, so the
+            # model registry may store it under "sdxl_vae" instead of "sdxl_vae_enc".
+            if profiled is None and comp == "sdxl_vae_enc":
+                profiled = get_working_memory("sdxl_vae", gpu_model, w, h)
+            # Text encode runs TE1 + TE2 sequentially — sum both
+            if comp == "sdxl_te1":
+                te2 = get_working_memory("sdxl_te2", gpu_model, w, h)
+                if profiled is not None and te2 is not None:
+                    profiled = profiled + te2
+                elif te2 is not None:
+                    profiled = te2
             if profiled is not None:
-                # Add 10% headroom on top of the profiled value to account
-                # for minor variance (different scheduler state, LoRA overhead)
                 return int(profiled * 1.10)
 
         # Hires transform: max of VAE decode + upscale + VAE encode + UNet
         if stage_type == StageType.GPU_HIRES_TRANSFORM:
-            from gpu.workspace_profiler import get_working_memory
             sub_vals = []
-            for sub_comp in ("sdxl_unet", "sdxl_vae", "sdxl_vae_enc", "upscale"):
+            for sub_comp in ("sdxl_unet", "sdxl_vae", "upscale"):
                 v = get_working_memory(sub_comp, gpu_model, w, h)
                 if v is not None:
                     sub_vals.append(v)
@@ -227,6 +236,11 @@ class GpuWorker:
         self._work_queue: asyncio.Queue[tuple[WorkStage, InferenceJob]] = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None  # set in start()
+
+        # Cached GPU model name — stable for process lifetime, avoids
+        # repeated CUDA driver calls on the scheduling hot path.
+        from gpu.workspace_profiler import get_gpu_model_name
+        self._gpu_model_name: str = get_gpu_model_name(gpu.device)
 
         # Concurrency tracking
         self._state_lock = threading.Lock()
@@ -365,9 +379,7 @@ class GpuWorker:
             if not gpu.is_component_loaded(c.fingerprint)
         )
         # Working memory (activations, cuDNN workspace)
-        from gpu.workspace_profiler import get_gpu_model_name
-        gpu_model = get_gpu_model_name(gpu.device)
-        working_cost = _get_min_free_vram(stage.type, job, gpu_model)
+        working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
         total_needed = model_cost + working_cost
 
         # ── Available side ─────────────────────────────────────────
@@ -469,9 +481,7 @@ class GpuWorker:
                 await self._loop.run_in_executor(
                     None, self._ensure_models_for_stage, stage, job)
 
-                from gpu.workspace_profiler import get_gpu_model_name
-                gpu_model_name = get_gpu_model_name(self._gpu.device)
-                min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
+                min_free = _get_min_free_vram(stage.type, job, self._gpu_model_name)
                 if min_free > 0:
                     protect = self._gpu.get_active_fingerprints()
                     self._gpu.ensure_free_vram(min_free, protect)
@@ -771,9 +781,9 @@ class GpuWorker:
             # Profile workspace for this component type (one-time per GPU model).
             # Uses cached JSON after the first load — near-zero cost on subsequent loads.
             try:
-                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                from gpu.workspace_profiler import ensure_profiled
                 ensure_profiled(component.category, model,
-                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+                                self._gpu.device, self._gpu_model_name)
             except Exception as ex:
                 log.warning(f"  WorkspaceProfiler: Failed to profile {component.category}: {ex}")
 
@@ -804,9 +814,9 @@ class GpuWorker:
             self._gpu.cache_model(comp.fingerprint, "upscale", model, comp.estimated_vram_bytes,
                                   source="realesrgan")
             try:
-                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                from gpu.workspace_profiler import ensure_profiled
                 ensure_profiled("upscale", model,
-                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+                                self._gpu.device, self._gpu_model_name)
             except Exception as ex:
                 log.warning(f"  WorkspaceProfiler: Failed to profile upscale: {ex}")
 
@@ -837,9 +847,9 @@ class GpuWorker:
             self._gpu.cache_model(comp.fingerprint, "bgremove", model, comp.estimated_vram_bytes,
                                   source="rmbg")
             try:
-                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                from gpu.workspace_profiler import ensure_profiled
                 ensure_profiled("bgremove", model,
-                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+                                self._gpu.device, self._gpu_model_name)
             except Exception as ex:
                 log.warning(f"  WorkspaceProfiler: Failed to profile bgremove: {ex}")
 
@@ -1011,9 +1021,8 @@ def estimate_gpu_slots(worker: GpuWorker) -> dict[str, int]:
     if gpu.is_failed:
         return {}
 
-    # Get GPU model name for workspace profiler lookups
-    from gpu.workspace_profiler import get_gpu_model_name
-    gpu_model = get_gpu_model_name(gpu.device)
+    # Use cached GPU model name (avoids CUDA driver call on every scheduling cycle)
+    gpu_model = worker._gpu_model_name
 
     slots: dict[str, int] = {}
 

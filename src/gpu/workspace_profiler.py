@@ -28,6 +28,28 @@ import torch.nn as nn
 
 import log
 
+# ── CUDA fatal detection ─────────────────────────────────────────
+# Mirrors _CUDA_FATAL_PATTERNS from worker.py — these errors mean
+# the CUDA context is permanently corrupted and must be re-raised
+# so the worker's error handling can properly mark GPUs as failed.
+
+_CUDA_FATAL_PATTERNS = [
+    "illegal memory access",
+    "unspecified launch failure",
+    "cuda error: an illegal instruction was encountered",
+    "device-side assert",
+    "unable to find an engine",
+]
+
+
+def _is_cuda_fatal(ex: Exception) -> bool:
+    """Check if a CUDA error indicates permanent context corruption."""
+    if isinstance(ex, torch.cuda.OutOfMemoryError):
+        return False
+    msg = str(ex).lower()
+    return any(p in msg for p in _CUDA_FATAL_PATTERNS)
+
+
 # ── Resolution grid ───────────────────────────────────────────────
 #
 # Covers 512 through 2048 in common SDXL aspect ratios.
@@ -62,6 +84,10 @@ _lock = threading.Lock()
 
 # In-memory caches: {(component_type, gpu_model): {resolution_key: bytes}}
 _working_mem_caches: dict[tuple[str, str], dict[str, int]] = {}
+
+# Guard against concurrent profiling of the same (component, gpu_model)
+_profiling_in_progress: set[tuple[str, str]] = {}
+_profiling_events: dict[tuple[str, str], threading.Event] = {}
 
 
 # ── GPU model name ────────────────────────────────────────────────
@@ -116,8 +142,12 @@ def _save_cache(
     if conv_workspaces:
         data["conv_workspaces"] = conv_workspaces
 
-    with open(path, "w") as f:
+    # Atomic write: write to .tmp then rename to prevent corruption
+    # if two threads or a crash interrupts the write.
+    tmp_path = path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
     log.info(f"  WorkspaceProfiler: Saved cache → {path}")
 
 
@@ -365,6 +395,9 @@ def profile_component(
                 torch.cuda.empty_cache()
             break
         except Exception as ex:
+            if _is_cuda_fatal(ex):
+                log.warning(f"    {key}: FATAL CUDA error — aborting profiling")
+                raise  # Let worker's error handler mark GPUs as failed
             log.warning(f"    {key}: FAILED — {ex}")
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -387,6 +420,10 @@ def ensure_profiled(
 
     Call this after loading a model component to GPU.
     Returns {resolution_key: working_memory_bytes}.
+
+    Thread-safe: if two workers call this simultaneously for the same
+    (component_type, gpu_model), only one actually profiles — the other
+    waits for the result.
     """
     if gpu_model is None:
         gpu_model = get_gpu_model_name(device)
@@ -397,6 +434,20 @@ def ensure_profiled(
         if cache_key in _working_mem_caches:
             return _working_mem_caches[cache_key]
 
+        # Another thread is already profiling this — wait for it
+        if cache_key in _profiling_in_progress:
+            event = _profiling_events.get(cache_key)
+            if event is not None:
+                _lock.release()
+                try:
+                    event.wait(timeout=120)
+                finally:
+                    _lock.acquire()
+                # Check cache again after waiting
+                if cache_key in _working_mem_caches:
+                    return _working_mem_caches[cache_key]
+                # If still not cached, fall through to disk check / re-profile
+
     # Try disk cache
     cached = _load_cache(component_type, gpu_model)
     if cached is not None:
@@ -406,11 +457,25 @@ def ensure_profiled(
                  f"({len(cached)} resolutions from disk)")
         return cached
 
-    # Profile
-    result = profile_component(component_type, model, device, gpu_model)
+    # Mark as profiling-in-progress
+    event = threading.Event()
     with _lock:
-        _working_mem_caches[cache_key] = result
-    return result
+        # Double-check: another thread may have finished between our checks
+        if cache_key in _working_mem_caches:
+            return _working_mem_caches[cache_key]
+        _profiling_in_progress.add(cache_key)
+        _profiling_events[cache_key] = event
+
+    try:
+        result = profile_component(component_type, model, device, gpu_model)
+        with _lock:
+            _working_mem_caches[cache_key] = result
+        return result
+    finally:
+        with _lock:
+            _profiling_in_progress.discard(cache_key)
+            _profiling_events.pop(cache_key, None)
+        event.set()  # Wake any waiting threads
 
 
 def get_working_memory(
