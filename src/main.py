@@ -203,6 +203,69 @@ def _prefetch_sdxl_configs() -> None:
             log.warning("  Single-file checkpoint extraction may fail without network access.")
 
 
+def _background_model_init(
+    config: FoxBurrowConfig,
+    models_dir: str,
+    all_sdxl: dict[str, str],
+) -> None:
+    """Heavy initialization that runs in a background thread after server starts.
+
+    Handles: HF config prefetch, SDXL fingerprinting, utility model registration,
+    LoRA hashing, and GPU onload/unevictable processing.
+    """
+    import time
+    start_time = time.monotonic()
+    log.info("  Background init: starting...")
+
+    # 1. Pre-fetch HF configs (network I/O, cached after first run)
+    _prefetch_sdxl_configs()
+
+    # 2. Register SDXL models (fingerprinting — heavy I/O)
+    if all_sdxl:
+        from utils.model_scanner import ModelScanner
+        fp_threads = _auto_threads(config.threads.fingerprint, 8)
+        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
+        scanner.start(all_sdxl)
+        app_state.model_scanner = scanner
+
+    # 3. Register utility models (upscale, bgremove — fingerprinting)
+    upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
+                                       [".pth", ".safetensors", ".onnx"])
+    if upscale_path:
+        app_state.registry.register_upscale_model(upscale_path)
+
+    bgremove_dir = os.path.join(models_dir, "other", "bgremove")
+    bgremove_model = os.path.join(bgremove_dir, "model.safetensors")
+    if os.path.isfile(bgremove_model):
+        app_state.registry.register_bgremove_model(bgremove_model)
+    else:
+        bgremove_path = discover_model_file(models_dir, os.path.join("other", "bgremove"),
+                                            [".safetensors", ".pth", ".onnx"])
+        if bgremove_path:
+            app_state.registry.register_bgremove_model(bgremove_path)
+
+    # 4. LoRA background hashing
+    if app_state.lora_index:
+        from utils.lora_index import start_background_hashing
+        lora_workers = _auto_threads(config.threads.fingerprint, 8)
+        start_background_hashing(app_state.lora_index, max_workers=lora_workers)
+
+    # 5. GPU onload and unevictable (needs registered models)
+    # Wait for scanner to finish so all models are available for onload
+    scanner = app_state.model_scanner
+    if scanner is not None and scanner._thread is not None:
+        scanner._thread.join()
+
+    for gpu in app_state.gpu_pool.gpus:
+        _process_gpu_onload(gpu, app_state)
+
+    for gpu in app_state.gpu_pool.gpus:
+        _process_gpu_unevictable(gpu, app_state)
+
+    elapsed = time.monotonic() - start_time
+    log.info(f"  Background init: complete ({elapsed:.1f}s)")
+
+
 def discover_model_file(models_dir: str, subdir: str, extensions: list[str]) -> str | None:
     """Find a model file in models_dir/subdir/ with one of the given extensions."""
     search_dir = os.path.join(models_dir, subdir)
@@ -467,39 +530,21 @@ def main() -> None:
     models_dir = os.path.normpath(os.path.abspath(config.server.models_dir))
     log.info(f"  Models dir: {models_dir}")
 
-    # ── Model discovery ─────────────────────────────────────────────
-    # Scan for models BEFORE GPU init — no point initializing GPUs if
-    # there's nothing to serve.
+    # ── Model discovery (fast — stat only, no hashing) ──────────────
     available_capabilities: set[str] = set()
 
-    # Discover SDXL models (recursive walk — fast, no I/O beyond stat)
+    # Discover SDXL models (recursive walk)
     all_sdxl = discover_sdxl_models(models_dir)
-
     if all_sdxl:
         available_capabilities.add("sdxl")
 
-        # Pre-fetch SDXL config/tokenizer files from HuggingFace if not already cached.
-        # These are needed by diffusers to decompose single-file checkpoints.
-        # Downloads only configs (~10-15MB), NOT model weights.
-        _prefetch_sdxl_configs()
-
-        # Start model scanner — registers single-file instantly, queues diffusers for background
-        # Tokenizers are initialized lazily on first generation request.
-        from utils.model_scanner import ModelScanner
-        fp_threads = _auto_threads(config.threads.fingerprint, 8)
-        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
-        scanner.start(all_sdxl)
-        app_state.model_scanner = scanner
-
-    # Discover LoRA files
+    # Discover LoRA files (filename scan only, no hashing yet)
     loras_dir = os.path.join(models_dir, "loras")
     app_state.loras_dir = loras_dir
     if os.path.isdir(loras_dir):
-        from utils.lora_index import discover_loras, start_background_hashing
+        from utils.lora_index import discover_loras
         app_state.lora_index = discover_loras(loras_dir)
         log.info(f"  Discovered {len(app_state.lora_index)} LoRA files")
-        lora_workers = _auto_threads(config.threads.fingerprint, 8)
-        _lora_hash_thread = start_background_hashing(app_state.lora_index, max_workers=lora_workers)
     else:
         log.info(f"  LoRA directory not found: {loras_dir} (skipping)")
 
@@ -510,7 +555,6 @@ def main() -> None:
         available_capabilities.add("upscale")
         from handlers.upscale import set_model_path
         set_model_path(upscale_path)
-        app_state.registry.register_upscale_model(upscale_path)
         log.info(f"  Upscale model: {upscale_path}")
 
     # Discover bgremove model (in models/other/)
@@ -520,9 +564,6 @@ def main() -> None:
         bgremove_found = True
         from handlers.bgremove import set_model_path
         set_model_path(bgremove_dir)
-        model_file = os.path.join(bgremove_dir, "model.safetensors")
-        if os.path.isfile(model_file):
-            app_state.registry.register_bgremove_model(model_file)
         log.info(f"  BGRemove model: {bgremove_dir}")
     else:
         bgremove_path = discover_model_file(models_dir, os.path.join("other", "bgremove"),
@@ -531,7 +572,6 @@ def main() -> None:
             bgremove_found = True
             from handlers.bgremove import set_model_path
             set_model_path(bgremove_path)
-            app_state.registry.register_bgremove_model(bgremove_path)
             log.info(f"  BGRemove model: {bgremove_path}")
     if bgremove_found:
         available_capabilities.add("bgremove")
@@ -545,7 +585,6 @@ def main() -> None:
         from handlers.tagger import set_model_path
         set_model_path(os.path.dirname(tagger_path))
     elif os.path.isdir(tagger_dir):
-        # Check for safetensors + tags.json (JTP PILOT2 SigLIP format)
         has_model = any(f.endswith(".safetensors") for f in os.listdir(tagger_dir))
         has_tags = os.path.isfile(os.path.join(tagger_dir, "tags.json"))
         if has_model and has_tags:
@@ -555,7 +594,7 @@ def main() -> None:
     if tagger_found:
         available_capabilities.add("tag")
 
-    # ── Report missing models ──────────────────────────────────────
+    # Report missing models
     missing = {
         "sdxl":     "No SDXL checkpoints found. Place .safetensors files in models/sdxl/",
         "upscale":  "No upscale model found. Place a RealESRGAN model in models/other/upscale/",
@@ -586,14 +625,6 @@ def main() -> None:
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
 
-    # Pre-load models specified in per-GPU onload config
-    for gpu in app_state.gpu_pool.gpus:
-        _process_gpu_onload(gpu, app_state)
-
-    # Mark unevictable fingerprints for each GPU
-    for gpu in app_state.gpu_pool.gpus:
-        _process_gpu_unevictable(gpu, app_state)
-
     # Create pipeline factory
     app_state.pipeline_factory = PipelineFactory(app_state.registry)
 
@@ -610,10 +641,22 @@ def main() -> None:
     from api.server import create_app
 
     async def on_startup():
+        # Start workers and scheduler immediately so the server can accept jobs
         for w in workers:
             w.start()
         scheduler.start()
         log.info(f"  Scheduler started with {len(workers)} worker(s)")
+
+        # Kick off ALL heavy initialization in a background thread:
+        # HF config prefetch, model fingerprinting, LoRA hashing, GPU onload.
+        # The server is already listening and /api/status reports scan progress.
+        import threading
+        t = threading.Thread(
+            target=_background_model_init,
+            args=(config, models_dir, all_sdxl),
+            name="bg-init", daemon=True,
+        )
+        t.start()
 
     app = create_app(on_startup=on_startup)
 
