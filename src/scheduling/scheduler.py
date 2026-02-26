@@ -70,17 +70,20 @@ class GpuScheduler:
 
     async def _run_loop(self) -> None:
         log.info("  GpuScheduler: Started")
-        while True:
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while True:
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
 
-            try:
-                self._run_scheduling_round()
-            except Exception as ex:
-                log.log_exception(ex, "GpuScheduler: Error in scheduling round")
+                try:
+                    self._run_scheduling_round()
+                except Exception as ex:
+                    log.log_exception(ex, "GpuScheduler: Error in scheduling round")
+        except asyncio.CancelledError:
+            log.info("  GpuScheduler: Stopped")
 
     def _run_scheduling_round(self) -> None:
         groups = self._queue.get_work_groups()

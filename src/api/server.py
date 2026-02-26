@@ -46,7 +46,17 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
         if on_startup:
             await on_startup()
         yield
+        # Graceful shutdown: cancel scheduler and workers before exiting
+        log.info("  Shutting down...")
         cleanup_task.cancel()
+        scheduler = app_state.scheduler
+        if scheduler and scheduler._task:
+            scheduler._task.cancel()
+        if scheduler:
+            for w in scheduler.workers:
+                if w._task:
+                    w._task.cancel()
+        log.info("  Shutdown complete.")
 
     app = FastAPI(title="foxburrow", version="2.0.0", lifespan=lifespan)
 
@@ -71,7 +81,9 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
         try:
             while True:
                 await ws.receive_text()  # keep-alive
-        except WebSocketDisconnect:
+        except Exception:
+            pass
+        finally:
             await streamer.disconnect(ws)
 
     return app

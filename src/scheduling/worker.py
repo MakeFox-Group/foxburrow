@@ -150,10 +150,13 @@ class GpuWorker:
 
     async def _run_loop(self) -> None:
         log.info(f"  GpuWorker[{self._gpu.uuid}]: Started")
-        while True:
-            stage, job = await self._work_queue.get()
-            # Spawn concurrent — don't await
-            self._loop.create_task(self._process_work_item(stage, job))
+        try:
+            while True:
+                stage, job = await self._work_queue.get()
+                # Spawn concurrent — don't await
+                self._loop.create_task(self._process_work_item(stage, job))
+        except asyncio.CancelledError:
+            log.info(f"  GpuWorker[{self._gpu.uuid}]: Stopped")
 
     async def _process_work_item(self, stage: WorkStage, job: InferenceJob) -> None:
         try:
