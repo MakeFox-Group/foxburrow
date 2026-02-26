@@ -24,15 +24,15 @@ Manual Setup (if you prefer)
 2. Install packages:
        .venv/bin/pip install -r requirements.txt
 
-3. Run (from src/):
-       cd src && ../.venv/bin/python main.py
+3. Run (from project root):
+       .venv/bin/python src/main.py
 
 Configuration
 -------------
 The server looks for foxburrow.ini in these locations (first match wins):
 
-    ./foxburrow.ini                           (current working directory)
-    ../conf/foxburrow.ini                     (relative to cwd)
+    ./foxburrow.ini                           (project root)
+    ./conf/foxburrow.ini                      (standard location)
 
 See conf/foxburrow.ini.example for the format. At minimum you need:
 

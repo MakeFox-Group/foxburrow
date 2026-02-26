@@ -28,10 +28,10 @@ from state import app_state
 
 _CONFIG_CANDIDATES = [
     "foxburrow.ini",
-    "../conf/foxburrow.ini",
+    "conf/foxburrow.ini",
 ]
 
-_DEFAULT_CONFIG_PATH = "../conf/foxburrow.ini"
+_DEFAULT_CONFIG_PATH = "conf/foxburrow.ini"
 
 
 def find_config() -> str:
@@ -69,8 +69,8 @@ def generate_default_config() -> str:
         "[server]",
         "address=127.0.0.1",
         "port=15888",
-        "models_dir=../models/",
-        "tensorrt_cache=../data/tensorrt_cache/",
+        "models_dir=models/",
+        "tensorrt_cache=data/tensorrt_cache/",
         f"secret={secret}",
         "",
         "# IMPORTANT: You must review this configuration and set enabled=true",
@@ -346,7 +346,7 @@ def main() -> None:
     log.info("foxburrow starting (Python/PyTorch)")
 
     # Write PID file
-    pid_path = os.path.abspath("../data/foxburrow.pid")
+    pid_path = os.path.abspath("data/foxburrow.pid")
     write_pid(pid_path)
     log.info(f"  PID {os.getpid()} written to {pid_path}")
 
@@ -394,9 +394,8 @@ def main() -> None:
         log.warning("  Anyone who can reach this server can use it.")
         log.warning("  Add 'secret=<your_token>' to [server] in foxburrow.ini")
         log.info("")
-    # Resolve models directory relative to config file
-    config_dir = os.path.dirname(config_path)
-    models_dir = os.path.normpath(os.path.join(config_dir, config.server.models_dir))
+    # Resolve models directory relative to working directory (project root)
+    models_dir = os.path.normpath(os.path.abspath(config.server.models_dir))
     log.info(f"  Models dir: {models_dir}")
 
     # Initialize GPU pool

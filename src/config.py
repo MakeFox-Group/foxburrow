@@ -18,8 +18,8 @@ class GpuConfig:
 class ServerConfig:
     address: str = "0.0.0.0"
     port: int = 8800
-    models_dir: str = "../models/"
-    tensorrt_cache: str = "../data/tensorrt_cache/"
+    models_dir: str = "models/"
+    tensorrt_cache: str = "data/tensorrt_cache/"
     default_sdxl_model: str = ""
     enabled: bool = False
     secret: str = ""

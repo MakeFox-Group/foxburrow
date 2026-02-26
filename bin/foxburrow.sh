@@ -16,7 +16,7 @@ STAMP_FILE="$VENV_DIR/.requirements.stamp"
 LOG_DIR="$PROJECT_ROOT/logs"
 LOG_FILE="$LOG_DIR/foxburrow.log"
 
-cd "$SRC_DIR"
+cd "$PROJECT_ROOT"
 
 # ── Check Python version ────────────────────────────────────────────
 if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
@@ -73,10 +73,10 @@ fi
 if [ "${1:-}" = "--bg" ]; then
     mkdir -p "$LOG_DIR"
     echo "Starting foxburrow in background (log: $LOG_FILE)..."
-    nohup "$VENV_DIR/bin/python" main.py > "$LOG_FILE" 2>&1 &
+    nohup "$VENV_DIR/bin/python" src/main.py > "$LOG_FILE" 2>&1 &
     disown
     echo "PID: $!"
 else
     echo "Starting foxburrow..."
-    exec "$VENV_DIR/bin/python" main.py
+    exec "$VENV_DIR/bin/python" src/main.py
 fi

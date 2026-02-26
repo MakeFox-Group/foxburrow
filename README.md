@@ -36,8 +36,8 @@ layout.
 FoxBurrow looks for `foxburrow.ini` in these locations (first match wins):
 
 ```
-./foxburrow.ini          (current working directory, which is src/)
-../conf/foxburrow.ini    (standard location)
+./foxburrow.ini          (project root)
+./conf/foxburrow.ini     (standard location)
 ```
 
 Each GPU gets its own `[GPU-<uuid>]` section with capabilities, onload, and

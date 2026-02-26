@@ -1,8 +1,8 @@
 [server]
 address=127.0.0.1
 port=15888
-models_dir=../models/
-tensorrt_cache=../data/tensorrt_cache/
+models_dir=models/
+tensorrt_cache=data/tensorrt_cache/
 
 # API secret — all requests must include this token.
 # Header:  Authorization: Bearer <secret>
