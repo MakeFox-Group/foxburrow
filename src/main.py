@@ -239,14 +239,8 @@ def _background_model_init(
     fp_threads = _auto_threads(config.threads.fingerprint, 8)
     fp_pool = ThreadPoolExecutor(max_workers=fp_threads)
 
-    # 2. Register SDXL models (fingerprinting — heavy I/O)
-    if all_sdxl:
-        from utils.model_scanner import ModelScanner
-        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
-        scanner.start(all_sdxl, pool=fp_pool)
-        app_state.model_scanner = scanner
-
-    # 3. Register utility models (upscale, bgremove — fingerprinting)
+    # 2. Register utility models (upscale, bgremove) — fast, single files.
+    # Must happen BEFORE GPU onload so upscale/bgremove components exist.
     upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
                                        [".pth", ".safetensors", ".onnx"])
     if upscale_path:
@@ -262,24 +256,48 @@ def _background_model_init(
         if bgremove_path:
             app_state.registry.register_bgremove_model(bgremove_path)
 
-    # 4. Wait for SDXL model scanning to finish before anything else.
-    # Base models are the priority — LoRA hashing must not compete for I/O.
+    # 3. Start SDXL model scanning AND GPU onload concurrently.
+    # Model scanning: fingerprints SDXL checkpoints — models become available
+    # progressively as each one completes (ready for inference immediately).
+    # GPU onload (tag/upscale/bgremove): loads tagger etc. onto GPUs.
+    # These are INDEPENDENT — taggers don't need SDXL models.
+    import threading
+    gpus = app_state.gpu_pool.gpus
+
+    # Start model scanning (non-blocking background thread)
+    if all_sdxl:
+        from utils.model_scanner import ModelScanner
+        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
+        scanner.start(all_sdxl, pool=fp_pool)
+        app_state.model_scanner = scanner
+
+    # Load non-SDXL items onto GPUs in parallel (tag, upscale, bgremove).
+    # Runs concurrently with model scanning — GPUs are usable ASAP.
+    if gpus:
+        with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
+            list(gpu_pool.map(
+                lambda g: _process_gpu_onload(
+                    g, app_state, types={"tag", "upscale", "bgremove"}),
+                gpus))
+
+    # 4. Wait for model scanning to finish.
+    # Base models get priority I/O — LoRA hashing starts after.
     scanner = app_state.model_scanner
     if scanner is not None and scanner._thread is not None:
         scanner._thread.join()
 
-    # 5. GPU onload and unevictable (needs registered models)
-    # Parallelize across GPUs — each targets a different CUDA device.
-    gpus = app_state.gpu_pool.gpus
+    # 5. Now load SDXL-specific onloads (model pre-loads into GPU VRAM)
+    # and mark unevictable entries. Requires models to be registered.
     if gpus:
         with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
             list(gpu_pool.map(
-                lambda g: _process_gpu_onload(g, app_state), gpus))
+                lambda g: _process_gpu_onload(g, app_state, types={"sdxl"}),
+                gpus))
 
         for gpu in gpus:
             _process_gpu_unevictable(gpu, app_state)
 
-    # 6. LoRA hashing — same pool, starts AFTER SDXL models are done.
+    # 6. LoRA hashing — same fingerprint pool, starts AFTER SDXL models.
     # Last consumer shuts down the shared pool when complete.
     if app_state.lora_index:
         from utils.lora_index import start_background_hashing
@@ -366,11 +384,27 @@ def _resolve_onload_entry(entry: str, app_state) -> list[dict] | str:
     return [{"type": "sdxl", "model": model_name, "categories": categories}]
 
 
-def _process_gpu_onload(gpu, app_state) -> None:
-    """Pre-load models specified in GPU's onload config."""
+def _process_gpu_onload(gpu, app_state, types: set[str] | None = None) -> None:
+    """Pre-load models specified in GPU's onload config.
+
+    If *types* is provided, only process onload entries of those types
+    (e.g. ``{"tag", "upscale", "bgremove"}``). Others are silently skipped.
+    Pass ``None`` to process all types.
+    """
     from gpu.pool import GpuInstance
 
     for entry in gpu.onload:
+        # Quick pre-filter: skip entries whose type doesn't match this phase.
+        # Avoids resolving SDXL model names before they're registered.
+        if types is not None:
+            entry_lower = entry.strip().lower()
+            if entry_lower in ("tag", "upscale", "bgremove"):
+                if entry_lower not in types:
+                    continue
+            else:
+                # Everything else is an SDXL entry (model name or model:component)
+                if "sdxl" not in types:
+                    continue
         actions = _resolve_onload_entry(entry, app_state)
         if isinstance(actions, str):
             log.warning(f"  GPU [{gpu.uuid}]: onload={entry}: {actions}")
