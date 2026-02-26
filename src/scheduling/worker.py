@@ -37,14 +37,30 @@ MAX_CONCURRENCY = 4
 
 # ---- Working-memory VRAM thresholds (resolution-aware) ----
 #
-# Working memory (activations, cuDNN workspace, attention matrices) scales with
-# resolution.  Rather than guessing, we measure the actual peak during each
-# stage execution and track the worst-case bytes-per-pixel ratio.  For future
-# jobs, we multiply ratio × pixels × headroom to get the VRAM threshold.
+# Three-tier prediction system (checked in priority order):
 #
-# Until the first successful measurement, we use conservative fallbacks.
-# Text-encode is resolution-independent (fixed 77-token sequence) so it uses
-# an absolute byte fallback instead of a per-pixel ratio.
+# 1. Workspace profiler (gpu/workspace_profiler.py):
+#    Pre-computed at first model load via instrumented forward passes at
+#    a grid of resolutions.  Cached to data/profiling/{GPU_MODEL}/*.json.
+#    Most accurate — measures actual peak VRAM at each resolution.
+#
+# 2. Runtime BPP (bytes-per-pixel):
+#    Measured during real job execution.  Useful as a cross-check and for
+#    stages not yet profiled.  Corrupted by concurrent executions.
+#
+# 3. Hardcoded fallbacks:
+#    Conservative last resort.  Used only before profiling or measurement.
+
+# Map StageType → workspace profiler component_type
+_STAGE_TO_PROFILER_COMPONENT: dict[StageType, str] = {
+    StageType.GPU_TEXT_ENCODE: "sdxl_te1",
+    StageType.GPU_DENOISE: "sdxl_unet",
+    StageType.GPU_VAE_DECODE: "sdxl_vae",
+    StageType.GPU_VAE_ENCODE: "sdxl_vae_enc",
+    StageType.GPU_UPSCALE: "upscale",
+    StageType.GPU_BGREMOVE: "bgremove",
+    # GPU_HIRES_TRANSFORM is composite — handled specially
+}
 
 _VRAM_FALLBACK_BYTES: dict[StageType, int] = {
     # Absolute byte fallbacks — used before first measurement only.
@@ -68,6 +84,23 @@ _bpp_lock = threading.Lock()
 
 # Headroom multiplier applied on top of measured peaks.
 _VRAM_HEADROOM = 1.20
+
+
+def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, int]:
+    """Return (width, height) for the profiler lookup."""
+    w, h = 768, 768  # safe default
+    if job.sdxl_input:
+        w, h = job.sdxl_input.width, job.sdxl_input.height
+
+    if stage_type == StageType.GPU_HIRES_TRANSFORM:
+        if job.hires_input and job.hires_input.hires_width > 0:
+            return job.hires_input.hires_width, job.hires_input.hires_height
+
+    if job.input_image is not None and stage_type in (
+            StageType.GPU_UPSCALE, StageType.GPU_BGREMOVE):
+        return job.input_image.width, job.input_image.height
+
+    return w, h
 
 
 def _get_stage_pixels(stage_type: StageType, job: InferenceJob) -> int:
@@ -116,17 +149,47 @@ def _update_working_memory(stage_type: StageType, working_bytes: int,
                      f"({ratio:.1f} B/px, prev {prev_ratio:.1f} B/px)")
 
 
-def _get_min_free_vram(stage_type: StageType, job: InferenceJob) -> int:
+def _get_min_free_vram(stage_type: StageType, job: InferenceJob,
+                       gpu_model: str | None = None) -> int:
     """Return the minimum free VRAM for a stage, scaled to the job's resolution.
 
-    Uses (measured bytes-per-pixel × current pixels × headroom) if we have a
-    measurement, otherwise falls back to the conservative hardcoded value.
+    Priority chain:
+    1. Workspace profiler cache (exact measurement at this resolution)
+    2. Runtime BPP measurement (measured during execution, scaled by pixels)
+    3. Hardcoded fallback (conservative last resort)
     """
+    w, h = _get_job_resolution(stage_type, job)
+
+    # --- Tier 1: workspace profiler ---
+    if gpu_model is not None:
+        comp = _STAGE_TO_PROFILER_COMPONENT.get(stage_type)
+        if comp is not None:
+            from gpu.workspace_profiler import get_working_memory
+            profiled = get_working_memory(comp, gpu_model, w, h)
+            if profiled is not None:
+                # Add 10% headroom on top of the profiled value to account
+                # for minor variance (different scheduler state, LoRA overhead)
+                return int(profiled * 1.10)
+
+        # Hires transform: max of VAE decode + upscale + VAE encode + UNet
+        if stage_type == StageType.GPU_HIRES_TRANSFORM:
+            from gpu.workspace_profiler import get_working_memory
+            sub_vals = []
+            for sub_comp in ("sdxl_unet", "sdxl_vae", "sdxl_vae_enc", "upscale"):
+                v = get_working_memory(sub_comp, gpu_model, w, h)
+                if v is not None:
+                    sub_vals.append(v)
+            if sub_vals:
+                return int(max(sub_vals) * 1.10)
+
+    # --- Tier 2: runtime BPP ---
     pixels = _get_stage_pixels(stage_type, job)
     with _bpp_lock:
         ratio = _measured_bpp.get(stage_type, 0.0)
     if ratio > 0.0:
         return int(ratio * pixels * _VRAM_HEADROOM)
+
+    # --- Tier 3: hardcoded fallback ---
     return _VRAM_FALLBACK_BYTES.get(stage_type, 0)
 
 
@@ -302,7 +365,9 @@ class GpuWorker:
             if not gpu.is_component_loaded(c.fingerprint)
         )
         # Working memory (activations, cuDNN workspace)
-        working_cost = _get_min_free_vram(stage.type, job)
+        from gpu.workspace_profiler import get_gpu_model_name
+        gpu_model = get_gpu_model_name(gpu.device)
+        working_cost = _get_min_free_vram(stage.type, job, gpu_model)
         total_needed = model_cost + working_cost
 
         # ── Available side ─────────────────────────────────────────
@@ -404,7 +469,9 @@ class GpuWorker:
                 await self._loop.run_in_executor(
                     None, self._ensure_models_for_stage, stage, job)
 
-                min_free = _get_min_free_vram(stage.type, job)
+                from gpu.workspace_profiler import get_gpu_model_name
+                gpu_model_name = get_gpu_model_name(self._gpu.device)
+                min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
                 if min_free > 0:
                     protect = self._gpu.get_active_fingerprints()
                     self._gpu.ensure_free_vram(min_free, protect)
@@ -701,6 +768,15 @@ class GpuWorker:
                 evict_callback=evict_cb,
             )
 
+            # Profile workspace for this component type (one-time per GPU model).
+            # Uses cached JSON after the first load — near-zero cost on subsequent loads.
+            try:
+                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                ensure_profiled(component.category, model,
+                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+            except Exception as ex:
+                log.warning(f"  WorkspaceProfiler: Failed to profile {component.category}: {ex}")
+
     def _load_upscale_model(self) -> None:
         """Load the upscale model if not already cached."""
         from handlers.upscale import load_model
@@ -727,6 +803,12 @@ class GpuWorker:
                 app_state.registry.update_actual_vram(comp.fingerprint, actual_vram)
             self._gpu.cache_model(comp.fingerprint, "upscale", model, comp.estimated_vram_bytes,
                                   source="realesrgan")
+            try:
+                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                ensure_profiled("upscale", model,
+                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+            except Exception as ex:
+                log.warning(f"  WorkspaceProfiler: Failed to profile upscale: {ex}")
 
     def _load_bgremove_model(self) -> None:
         """Load the bgremove model if not already cached."""
@@ -754,6 +836,12 @@ class GpuWorker:
                 app_state.registry.update_actual_vram(comp.fingerprint, actual_vram)
             self._gpu.cache_model(comp.fingerprint, "bgremove", model, comp.estimated_vram_bytes,
                                   source="rmbg")
+            try:
+                from gpu.workspace_profiler import ensure_profiled, get_gpu_model_name
+                ensure_profiled("bgremove", model,
+                                self._gpu.device, get_gpu_model_name(self._gpu.device))
+            except Exception as ex:
+                log.warning(f"  WorkspaceProfiler: Failed to profile bgremove: {ex}")
 
     def _migrate_tensors_to_device(self, job: InferenceJob) -> None:
         """Move intermediate tensors to this worker's GPU device.
@@ -881,12 +969,31 @@ def _unloaded_model_cost(gpu: GpuInstance, categories: list[str]) -> int:
     )
 
 
-def _working_memory_cost(stage_type: StageType, ref_pixels: int) -> int:
-    """Estimate working memory using measured BPP or fallback."""
+def _working_memory_cost(stage_type: StageType, ref_pixels: int,
+                         gpu_model: str | None = None) -> int:
+    """Estimate working memory for slot estimation.
+
+    Uses workspace profiler → BPP → hardcoded fallback.
+    The reference resolution (ref_pixels) is used for BPP scaling.
+    For the workspace profiler, we use a reference resolution of 1536x1024.
+    """
+    # Tier 1: workspace profiler
+    if gpu_model is not None:
+        comp = _STAGE_TO_PROFILER_COMPONENT.get(stage_type)
+        if comp is not None:
+            from gpu.workspace_profiler import get_working_memory
+            # Use reference resolution for slot estimation
+            profiled = get_working_memory(comp, gpu_model, 1536, 1024)
+            if profiled is not None:
+                return int(profiled * 1.10)
+
+    # Tier 2: BPP
     with _bpp_lock:
         bpp = _measured_bpp.get(stage_type, 0.0)
     if bpp > 0:
         return int(bpp * ref_pixels * _VRAM_HEADROOM)
+
+    # Tier 3: hardcoded
     return _VRAM_FALLBACK_BYTES.get(stage_type, 1 * 1024**3)
 
 
@@ -903,6 +1010,10 @@ def estimate_gpu_slots(worker: GpuWorker) -> dict[str, int]:
     gpu = worker.gpu
     if gpu.is_failed:
         return {}
+
+    # Get GPU model name for workspace profiler lookups
+    from gpu.workspace_profiler import get_gpu_model_name
+    gpu_model = get_gpu_model_name(gpu.device)
 
     slots: dict[str, int] = {}
 
@@ -921,7 +1032,7 @@ def estimate_gpu_slots(worker: GpuWorker) -> dict[str, int]:
             model_cost = _unloaded_model_cost(
                 gpu, ["sdxl_unet", "sdxl_te1", "sdxl_te2", "sdxl_vae"])
             working_cost = _working_memory_cost(
-                StageType.GPU_DENOISE, _REF_DENOISE_LATENT_PX)
+                StageType.GPU_DENOISE, _REF_DENOISE_LATENT_PX, gpu_model)
             slots["sdxl"] = 1 if available >= (model_cost + working_cost) else 0
 
     # ── Simple-task slots ──
@@ -939,7 +1050,7 @@ def estimate_gpu_slots(worker: GpuWorker) -> dict[str, int]:
         else:
             available = _vram_available(gpu)
             model_cost = _unloaded_model_cost(gpu, [session_key])
-            working_cost = _working_memory_cost(stage_type, _REF_IMAGE_PX)
+            working_cost = _working_memory_cost(stage_type, _REF_IMAGE_PX, gpu_model)
             slots[cap] = 1 if available >= (model_cost + working_cost) else 0
 
     return slots

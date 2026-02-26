@@ -21,6 +21,9 @@ pydantic>=2.0
 # GPU monitoring (provides pynvml)
 nvidia-ml-py>=12.535
 
+# cuDNN workspace profiling (predicts VRAM usage before execution)
+nvidia-cudnn-frontend>=1.0
+
 # Background removal (RMBG-2.0 dependency)
 kornia>=0.7
 
