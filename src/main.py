@@ -187,19 +187,32 @@ def _prefetch_sdxl_configs() -> None:
 
     Downloads only config JSONs and tokenizer vocab files (~10-15MB),
     NOT model weights. Cached in data/hf_cache/ (via HF_HOME env var).
-    Subsequent runs are instant cache hits with no network access.
+    Subsequent runs use local_files_only=True — no network access at all.
     """
     from huggingface_hub import snapshot_download
 
     for repo_id in _SDXL_HF_CONFIGS:
+        # Try local cache first (no network, no progress bars)
+        try:
+            snapshot_download(
+                repo_id,
+                allow_patterns=_HF_CONFIG_PATTERNS,
+                local_files_only=True,
+            )
+            log.info(f"  HF configs cached: {repo_id}")
+            continue
+        except Exception:
+            pass  # Not cached yet — download below
+
+        # First run: download from HuggingFace
         try:
             snapshot_download(
                 repo_id,
                 allow_patterns=_HF_CONFIG_PATTERNS,
             )
-            log.info(f"  HF configs cached: {repo_id}")
+            log.info(f"  HF configs downloaded: {repo_id}")
         except Exception as ex:
-            log.warning(f"  Failed to pre-fetch HF configs for {repo_id}: {ex}")
+            log.warning(f"  Failed to download HF configs for {repo_id}: {ex}")
             log.warning("  Single-file checkpoint extraction may fail without network access.")
 
 
@@ -482,6 +495,10 @@ def main() -> None:
     log.info(f"  Config: {config_path}")
     config = FoxBurrowConfig.load_from_file(config_path)
     app_state.config = config
+
+    # Set HF token if configured (enables faster downloads and private repos)
+    if config.server.hf_token:
+        os.environ.setdefault("HF_TOKEN", config.server.hf_token)
 
     # Safety gate: server won't start unless enabled=true
     if not config.server.enabled:

@@ -23,6 +23,7 @@ class ServerConfig:
     tensorrt_cache: str = "data/tensorrt_cache/"
     enabled: bool = False
     secret: str = ""
+    hf_token: str = ""  # HuggingFace API token for faster downloads
 
 
 @dataclass
@@ -63,6 +64,7 @@ class FoxBurrowConfig:
             server.tensorrt_cache = s.get("tensorrt_cache", server.tensorrt_cache)
             server.enabled = s.getboolean("enabled", server.enabled)
             server.secret = s.get("secret", server.secret)
+            server.hf_token = s.get("hf_token", server.hf_token)
 
         # Parse [threads] section
         threads = ThreadsConfig()
