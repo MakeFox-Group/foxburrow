@@ -212,6 +212,10 @@ class FoxburrowApp(App):
 
     # ── Shutdown ───────────────────────────────────────────────────
 
+    def action_request_quit(self) -> None:
+        """Ctrl+C quits immediately — no confirmation dialog."""
+        self.exit()
+
     def on_unmount(self) -> None:
         """Clean up on exit — restore stdout logging."""
         log.clear_tui_callback()
