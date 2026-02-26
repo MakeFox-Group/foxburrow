@@ -7,6 +7,7 @@ import os
 import secrets
 import signal
 import sys
+import threading
 
 # Force CUDA to enumerate GPUs by PCI bus ID (matching NVML ordering).
 # Must be set BEFORE importing torch or any CUDA library.
@@ -283,15 +284,32 @@ def _background_model_init(
         if bgremove_path:
             app_state.registry.register_bgremove_model(bgremove_path)
 
-    # 4. Parallel GPU onload — everything is warm (imports done, CUDA hot).
-    # Tagger/upscale/bgremove load truly in parallel across all GPUs.
-    # Runs concurrently with model scanning — GPUs are usable ASAP.
+    # 4a. Quick GPU onloads (upscale, bgremove) — fast, <1s each.
+    # These must finish before SDXL onloads so components exist in the cache.
     if gpus:
         with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
             list(gpu_pool.map(
                 lambda g: _process_gpu_onload(
-                    g, app_state, types={"tag", "upscale", "bgremove"}),
+                    g, app_state, types={"upscale", "bgremove"}),
                 gpus))
+
+    # 4b. Fire-and-forget tagger loading — slow (~30s) but independent.
+    # Runs concurrently with model scanning, SDXL onloads, and LoRA hashing.
+    # The tagger finishes whenever it finishes; /api/tag returns 404 until ready.
+    tagger_threads: list[threading.Thread] = []
+    for gpu in gpus:
+        if "tag" in gpu.onload:
+            t = threading.Thread(
+                target=_process_gpu_onload,
+                args=(gpu, app_state),
+                kwargs={"types": {"tag"}},
+                name=f"tagger-{gpu.uuid[:8]}",
+                daemon=True,
+            )
+            t.start()
+            tagger_threads.append(t)
+    if tagger_threads:
+        log.info(f"  Tagger loading on {len(tagger_threads)} GPU(s) (background)")
 
     # 5. Wait for model scanning to finish.
     # Base models get priority I/O — LoRA hashing starts after.
@@ -768,7 +786,6 @@ def main() -> None:
         # Kick off ALL heavy initialization in a background thread:
         # HF config prefetch, model fingerprinting, LoRA hashing, GPU onload.
         # The server is already listening and /api/status reports scan progress.
-        import threading
         t = threading.Thread(
             target=_background_model_init,
             args=(config, models_dir, all_sdxl),
