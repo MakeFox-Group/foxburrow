@@ -147,6 +147,11 @@ class GpuScheduler:
         if not worker.can_accept_work(stage):
             return -2**31
 
+        # VRAM budget gate: reject if this GPU can't fit the new stage's
+        # model loading cost + working memory alongside active jobs.
+        if group.jobs and not worker.check_vram_budget(stage, group.jobs[0]):
+            return -2**31
+
         score = 0
         loaded_cats = worker.get_loaded_categories()
         required_group = get_session_group(stage.type)
@@ -182,6 +187,21 @@ class GpuScheduler:
             score += 100
 
         return score
+
+    def estimate_available_slots(self) -> dict[str, int]:
+        """Estimate available job slots per capability based on real-time VRAM.
+
+        For SDXL, estimates how many more UNet denoise stages (the bottleneck)
+        can run across all GPUs.  For simple tasks, checks per-model capacity.
+        Sums across all workers.
+        """
+        from scheduling.worker import estimate_gpu_slots
+
+        totals: dict[str, int] = {}
+        for w in self._workers:
+            for cap, count in estimate_gpu_slots(w).items():
+                totals[cap] = totals.get(cap, 0) + count
+        return totals
 
     def _execute_cpu_stage(self, job: InferenceJob) -> None:
         """Execute a CPU-only stage on the thread pool."""

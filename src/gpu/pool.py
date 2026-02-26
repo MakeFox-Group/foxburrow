@@ -214,6 +214,36 @@ class GpuInstance:
                 for m in self._cache.values()
             ]
 
+    def get_evictable_vram(self, protect: set[str] | None = None) -> int:
+        """Return total VRAM of cached models that could be evicted.
+
+        Models protected by active fingerprints, the unevictable set, or the
+        explicit *protect* set are excluded.
+
+        NOTE: ``active_fps`` is snapshot separately from the cache iteration.
+        If a fingerprint is removed from active between the snapshot and scan,
+        we may undercount evictable VRAM (conservative/safe).  The actual
+        eviction logic in ``ensure_free_vram`` re-checks under lock.
+        """
+        active_fps = self.get_active_fingerprints()
+        with self._cache_lock:
+            total = 0
+            for fp, m in self._cache.items():
+                if not self._is_evictable(fp, protect):
+                    continue
+                if fp in active_fps:
+                    continue
+                total += m.actual_vram if m.actual_vram > 0 else m.estimated_vram
+            return total
+
+    def get_loaded_models_vram(self) -> int:
+        """Return total VRAM consumed by all cached models."""
+        with self._cache_lock:
+            return sum(
+                m.actual_vram if m.actual_vram > 0 else m.estimated_vram
+                for m in self._cache.values()
+            )
+
     def add_active_fingerprints(self, fingerprints: set[str]) -> None:
         """Increment ref counts for fingerprints actively in use by a job."""
         with self._active_fp_lock:

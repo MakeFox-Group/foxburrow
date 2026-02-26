@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import log
+from gpu import nvml
 from gpu.pool import GpuInstance
 from scheduling.job import (
     InferenceJob, JobResult, JobType, StageType, WorkStage,
@@ -176,17 +177,50 @@ class GpuWorker:
         # Cross-GPU failure propagation — set by scheduler via set_workers()
         self._all_workers: list[GpuWorker] = []
 
+    def has_session_capacity(self, session_key: str) -> bool:
+        """Check if this worker can accept one more job of the given session type."""
+        with self._state_lock:
+            if self._active_count >= MAX_CONCURRENCY:
+                return False
+            max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
+            return self._active_session_counts.get(session_key, 0) < max_for_session
+
+    def check_slot_availability(self, session_key: str, group: str) -> tuple[bool, int]:
+        """Atomically check capacity + group conflict and return active_count.
+
+        Returns (can_accept, active_count) under a single lock acquisition.
+        This prevents TOCTOU races between separate has_session_capacity()
+        and active_count reads in the slot estimation path.
+        """
+        with self._state_lock:
+            if self._active_count >= MAX_CONCURRENCY:
+                return False, self._active_count
+            max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
+            if self._active_session_counts.get(session_key, 0) >= max_for_session:
+                return False, self._active_count
+            # Session group conflict — e.g. can't run SDXL if upscale is active
+            if self._active_count > 0:
+                for key, count in self._active_session_counts.items():
+                    if count <= 0:
+                        continue
+                    active_group = get_session_group_from_key(key)
+                    if active_group and active_group != group:
+                        return False, self._active_count
+            return True, self._active_count
+
     @property
     def gpu(self) -> GpuInstance:
         return self._gpu
 
     @property
     def is_idle(self) -> bool:
-        return self._active_count == 0
+        with self._state_lock:
+            return self._active_count == 0
 
     @property
     def active_count(self) -> int:
-        return self._active_count
+        with self._state_lock:
+            return self._active_count
 
     @property
     def active_jobs(self) -> list[InferenceJob]:
@@ -242,6 +276,88 @@ class GpuWorker:
 
             return True
 
+    def check_vram_budget(self, stage: WorkStage, job: InferenceJob) -> bool:
+        """Check if this GPU has enough VRAM for a new stage.
+
+        When the GPU is idle, model loading handles eviction so we always
+        return True (``_ensure_models_for_stage`` calls ``ensure_free_vram``
+        before execution, which evicts LRU models as needed).
+        When busy, we query NVML free VRAM, add back PyTorch's
+        cached-allocator slack (released by ``empty_cache()``) and evictable
+        model VRAM, then compare against the cost of loading new models plus
+        the working-memory estimate for this stage.
+        """
+        with self._state_lock:
+            active = self._active_count
+        if active == 0:
+            return True  # idle — _ensure_models_for_stage handles eviction
+
+        gpu = self._gpu
+
+        # ── Cost side ──────────────────────────────────────────────
+        # Models not yet on this GPU
+        model_cost = sum(
+            c.estimated_vram_bytes
+            for c in stage.required_components
+            if not gpu.is_component_loaded(c.fingerprint)
+        )
+        # Working memory (activations, cuDNN workspace)
+        working_cost = _get_min_free_vram(stage.type, job)
+        total_needed = model_cost + working_cost
+
+        # ── Available side ─────────────────────────────────────────
+        _, _, nvml_free = nvml.get_memory_info(gpu.nvml_handle)
+
+        # PyTorch allocator cache: reserved but not in use by live tensors.
+        # empty_cache() in the model-load path frees these blocks.
+        pt_reserved = torch.cuda.memory_reserved(gpu.device)
+        pt_allocated = torch.cuda.memory_allocated(gpu.device)
+        pt_slack = max(0, pt_reserved - pt_allocated)
+
+        # Evictable models: cached but not protected by active jobs or this stage
+        protect = gpu.get_active_fingerprints()
+        protect.update(c.fingerprint for c in stage.required_components)
+        evictable = gpu.get_evictable_vram(protect)
+
+        available = nvml_free + pt_slack + evictable
+        fits = available >= total_needed
+
+        log.info(f"  VRAM budget [{gpu.uuid}]: "
+                 f"need {total_needed // (1024**2)}MB "
+                 f"(models={model_cost // (1024**2)}MB, "
+                 f"working={working_cost // (1024**2)}MB) | "
+                 f"avail {available // (1024**2)}MB "
+                 f"(free={nvml_free // (1024**2)}MB, "
+                 f"pt_slack={pt_slack // (1024**2)}MB, "
+                 f"evictable={evictable // (1024**2)}MB) "
+                 f"→ {'OK' if fits else 'REJECTED'}")
+
+        return fits
+
+    def log_vram_state(self, context: str) -> None:
+        """Log detailed VRAM breakdown for this GPU."""
+        gpu = self._gpu
+        stats = gpu.get_vram_stats()
+        models = gpu.get_cached_models_info()
+        total_model_vram = sum(
+            m['actual_vram'] if m['actual_vram'] > 0 else m['vram']
+            for m in models
+        )
+
+        log.info(
+            f"  VRAM [{gpu.uuid}] ({context}): "
+            f"NVML {stats['used'] // (1024**2)}MB used / "
+            f"{stats['free'] // (1024**2)}MB free / "
+            f"{stats['total'] // (1024**2)}MB total | "
+            f"PyTorch {stats['allocated'] // (1024**2)}MB alloc / "
+            f"{stats['reserved'] // (1024**2)}MB reserved | "
+            f"Models {total_model_vram // (1024**2)}MB in {len(models)} cached"
+        )
+        for m in models:
+            vram = m['actual_vram'] if m['actual_vram'] > 0 else m['vram']
+            source = f" ({m['source']})" if m.get('source') else ""
+            log.info(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
+
     def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
         """Dispatch a work item to this worker."""
         if self._gpu.is_failed:
@@ -271,6 +387,7 @@ class GpuWorker:
         try:
             log.info(f"  GpuWorker[{self._gpu.uuid}]: Processing {job} at {stage} "
                      f"(active={self._active_count})")
+            self.log_vram_state(f"pre-load {stage.type.value}")
 
             # Model loading (serialized) — included in GPU time
             import time as _time
@@ -312,9 +429,13 @@ class GpuWorker:
 
                 # Snapshot baseline memory and reset peak tracking so we can
                 # measure the actual working memory this stage consumes.
+                # Also snapshot active_count NOW (before execution) so we know
+                # whether this was the only stage running during measurement.
                 with torch.cuda.device(self._gpu.device):
                     torch.cuda.reset_peak_memory_stats()
                 mem_baseline = torch.cuda.memory_allocated(self._gpu.device)
+                with self._state_lock:
+                    active_at_start = self._active_count
 
                 try:
                     output_image = await self._loop.run_in_executor(
@@ -335,13 +456,20 @@ class GpuWorker:
                 stage_duration = _time.monotonic() - stage_start
                 job.gpu_time_s += stage_duration
 
-                # Feed the measurement back so future VRAM checks are accurate
+                # Feed the measurement back so future VRAM checks are accurate.
+                # IMPORTANT: Only update when running solo — when multiple
+                # stages run concurrently, max_memory_allocated() captures ALL
+                # of them, producing wildly inflated per-component values
+                # (e.g. tagger showing 7128MB instead of ~900MB).
                 stage_pixels = _get_stage_pixels(stage.type, job)
-                _update_working_memory(stage.type, working_mem, stage_pixels)
+                is_solo = active_at_start <= 1
+                if is_solo:
+                    _update_working_memory(stage.type, working_mem, stage_pixels)
                 log.info(f"  Stage {stage.type.value}: working memory "
                          f"{working_mem // (1024**2)}MB "
                          f"(baseline {mem_baseline // (1024**2)}MB, "
-                         f"peak {mem_peak // (1024**2)}MB)")
+                         f"peak {mem_peak // (1024**2)}MB"
+                         f"{'' if is_solo else ', CONCURRENT — measurement skipped'})")
 
                 # Get model name for this stage
                 model_name = None
@@ -712,3 +840,106 @@ class GpuWorker:
 
         else:
             raise RuntimeError(f"GPU worker cannot execute stage type {stage.type}")
+
+
+# ── Slot estimation (for /api/status) ──────────────────────────────
+#
+# Reference resolutions for conservative VRAM estimation.
+# Using 1536×1024 (common large-format SDXL size) rather than 1024×1024
+# to avoid underestimating working memory for typical high-res jobs.
+_REF_DENOISE_LATENT_PX = (1536 // 8) * (1024 // 8)  # 24576 latent pixels
+_REF_IMAGE_PX = 1536 * 1024                           # 1572864 image pixels
+
+
+def _vram_available(gpu: GpuInstance) -> int:
+    """Return VRAM available for new allocations (NVML free + allocator slack + evictable)."""
+    _, _, nvml_free = nvml.get_memory_info(gpu.nvml_handle)
+    pt_slack = max(0,
+                   torch.cuda.memory_reserved(gpu.device)
+                   - torch.cuda.memory_allocated(gpu.device))
+    # get_evictable_vram checks active fingerprints internally
+    evictable = gpu.get_evictable_vram()
+    return nvml_free + pt_slack + evictable
+
+
+def _unloaded_model_cost(gpu: GpuInstance, categories: list[str]) -> int:
+    """Sum estimated VRAM for model categories not currently loaded on the GPU."""
+    from scheduling.model_registry import VramEstimates
+    _model_vram = {
+        "sdxl_unet": VramEstimates.SDXL_UNET,
+        "sdxl_te1": VramEstimates.SDXL_TEXT_ENCODER_1,
+        "sdxl_te2": VramEstimates.SDXL_TEXT_ENCODER_2,
+        "sdxl_vae": VramEstimates.SDXL_VAE_DECODER,
+        "upscale": VramEstimates.UPSCALE,
+        "bgremove": VramEstimates.BGREMOVE,
+    }
+    loaded_cats = {m['category'] for m in gpu.get_cached_models_info()}
+    return sum(
+        _model_vram.get(cat, 500 * 1024**2)
+        for cat in categories
+        if cat not in loaded_cats
+    )
+
+
+def _working_memory_cost(stage_type: StageType, ref_pixels: int) -> int:
+    """Estimate working memory using measured BPP or fallback."""
+    with _bpp_lock:
+        bpp = _measured_bpp.get(stage_type, 0.0)
+    if bpp > 0:
+        return int(bpp * ref_pixels * _VRAM_HEADROOM)
+    return _VRAM_FALLBACK_BYTES.get(stage_type, 1 * 1024**3)
+
+
+def estimate_gpu_slots(worker: GpuWorker) -> dict[str, int]:
+    """Estimate available job slots on a single GPU, per capability.
+
+    Uses ``check_slot_availability`` for atomic concurrency + group checks,
+    then VRAM budget for busy GPUs.  For SDXL, the bottleneck is UNet
+    denoise (concurrency=1, ~5GB model + working memory), but total cost
+    includes all pipeline components that need loading.
+
+    Returns ``{capability: 0_or_1}`` per GPU.
+    """
+    gpu = worker.gpu
+    if gpu.is_failed:
+        return {}
+
+    slots: dict[str, int] = {}
+
+    # ── SDXL slot ──
+    if gpu.supports_capability("sdxl"):
+        can_accept, active = worker.check_slot_availability("sdxl_unet", "sdxl")
+        if not can_accept:
+            slots["sdxl"] = 0
+        elif active == 0:
+            slots["sdxl"] = 1  # idle GPU — _ensure_models_for_stage handles eviction
+        else:
+            # Busy — check VRAM for UNet + working memory.
+            # Also include TE1/TE2/VAE loading cost if not cached, since
+            # the full pipeline will need them across stages.
+            available = _vram_available(gpu)
+            model_cost = _unloaded_model_cost(
+                gpu, ["sdxl_unet", "sdxl_te1", "sdxl_te2", "sdxl_vae"])
+            working_cost = _working_memory_cost(
+                StageType.GPU_DENOISE, _REF_DENOISE_LATENT_PX)
+            slots["sdxl"] = 1 if available >= (model_cost + working_cost) else 0
+
+    # ── Simple-task slots ──
+    for cap, session_key, group, stage_type in [
+        ("upscale", "upscale", "upscale", StageType.GPU_UPSCALE),
+        ("bgremove", "bgremove", "bgremove", StageType.GPU_BGREMOVE),
+    ]:
+        if not gpu.supports_capability(cap):
+            continue
+        can_accept, active = worker.check_slot_availability(session_key, group)
+        if not can_accept:
+            slots[cap] = 0
+        elif active == 0:
+            slots[cap] = 1
+        else:
+            available = _vram_available(gpu)
+            model_cost = _unloaded_model_cost(gpu, [session_key])
+            working_cost = _working_memory_cost(stage_type, _REF_IMAGE_PX)
+            slots[cap] = 1 if available >= (model_cost + working_cost) else 0
+
+    return slots

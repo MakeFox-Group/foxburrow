@@ -205,6 +205,14 @@ async def status():
                 })
             gpu_info["active_jobs"] = active_jobs
 
+        # Per-GPU slot availability (VRAM-aware)
+        if worker:
+            from scheduling.worker import estimate_gpu_slots
+            try:
+                gpu_info["slots"] = estimate_gpu_slots(worker)
+            except Exception as ex:
+                log.log_exception(ex, f"Failed to estimate slots for GPU [{g.uuid}]")
+                gpu_info["slots"] = {}
         gpu_info["loaded_models"] = g.get_cached_models_info()
         gpus.append(gpu_info)
 
@@ -240,6 +248,15 @@ async def status():
         except Exception as ex:
             log.log_exception(ex, "Failed to compute readiness scores")
 
+    # Real-time VRAM-aware slot estimation — tells makefoxsrv how many more
+    # jobs foxburrow can actually start right now, per capability.
+    available_slots: dict[str, int] = {}
+    if scheduler:
+        try:
+            available_slots = scheduler.estimate_available_slots()
+        except Exception as ex:
+            log.log_exception(ex, "Failed to estimate available slots")
+
     # Model scan progress
     model_scan = None
     scanner = state.model_scanner
@@ -254,6 +271,7 @@ async def status():
     return {
         "gpus": gpus,
         "available": available,
+        "available_slots": available_slots,
         "total": len(pool.gpus),
         "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
         "model_scan": model_scan,
