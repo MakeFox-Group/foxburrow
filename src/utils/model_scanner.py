@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import log
+from api.websocket import streamer
 
 if TYPE_CHECKING:
     from scheduling.model_registry import ModelRegistry
@@ -22,6 +23,10 @@ class ModelScanner:
     via per-directory .fpcache). Diffusers-format models are queued for
     background SHA256 hashing in a thread pool, becoming available to the API
     as each one finishes.
+
+    Fires WebSocket events as models become available:
+      - ``model_discovered``: per-model with model_type/name/path/format
+      - ``model_scan_progress``: running completed/total counts
     """
 
     def __init__(
@@ -44,6 +49,8 @@ class ModelScanner:
 
         Single-file models are registered immediately in the calling thread.
         Diffusers models are queued for background fingerprinting.
+        Fires ``model_available`` and ``model_scan_progress`` WebSocket events
+        for every model (both types).
 
         Returns the background daemon thread (already started).
         """
@@ -56,24 +63,44 @@ class ModelScanner:
             else:
                 diffusers[name] = path
 
+        # Total spans both types so progress is meaningful end-to-end.
+        grand_total = len(single_file) + len(diffusers)
+        with self._lock:
+            self._total = grand_total
+            self._completed = 0
+            self._scanning = True
+
         # Register single-file models immediately — fast pseudo-fingerprint,
         # no SHA256 needed (uses .fpcache stat-based lookup or fast hash).
         for name, path in single_file.items():
+            success = False
             try:
                 self._registry.register_sdxl_checkpoint(path)
                 self._app_state.sdxl_models[name] = path
+                success = True
             except Exception as ex:
                 log.log_exception(ex, f"Failed to register single-file model: {name}")
+
+            with self._lock:
+                self._completed += 1
+                done = self._completed
+
+            if success:
+                streamer.fire_event("model_discovered", {
+                    "model_type": "sdxl", "name": name, "path": path,
+                    "format": "single_file"})
+            streamer.fire_event("model_scan_progress", {
+                "completed": done, "total": grand_total,
+                "scanning": done < grand_total})
 
         if single_file:
             log.info(f"  ModelScanner: {len(single_file)} single-file model(s) available immediately")
 
-        with self._lock:
-            self._total = len(diffusers)
-            self._completed = 0
-            self._scanning = bool(diffusers)
-
         if not diffusers:
+            with self._lock:
+                self._scanning = False
+            streamer.fire_event("model_scan_progress", {
+                "completed": grand_total, "total": grand_total, "scanning": False})
             log.info("  ModelScanner: No diffusers models to background-hash")
             return _make_noop_thread()
 
@@ -82,19 +109,19 @@ class ModelScanner:
                      f"({self._max_workers} workers)")
             start_time = time.monotonic()
 
-            def _register_one(item: tuple[str, str]) -> tuple[str, bool]:
+            def _register_one(item: tuple[str, str]) -> tuple[str, str, bool]:
                 name, path = item
                 try:
                     self._registry.register_sdxl_checkpoint(path)
                     self._app_state.sdxl_models[name] = path
-                    return name, True
+                    return name, path, True
                 except Exception as ex:
                     log.log_exception(ex, f"Failed to register diffusers model: {name}")
-                    return name, False
+                    return name, path, False
 
             workers = min(self._max_workers, len(diffusers))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for name, success in pool.map(_register_one, diffusers.items()):
+                for name, path, success in pool.map(_register_one, diffusers.items()):
                     with self._lock:
                         self._completed += 1
                         done = self._completed
@@ -102,8 +129,15 @@ class ModelScanner:
 
                     if success:
                         log.info(f"  ModelScanner: Model available: {name} ({done}/{total})")
+                        streamer.fire_event("model_discovered", {
+                            "model_type": "sdxl", "name": name, "path": path,
+                            "format": "diffusers"})
                     else:
                         log.warning(f"  ModelScanner: Failed: {name} ({done}/{total})")
+
+                    streamer.fire_event("model_scan_progress", {
+                        "completed": done, "total": total,
+                        "scanning": done < total})
 
             elapsed = time.monotonic() - start_time
             with self._lock:

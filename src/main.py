@@ -278,6 +278,9 @@ def _background_model_init(
     elapsed = time.monotonic() - start_time
     log.info(f"  Background init: complete ({elapsed:.1f}s)")
 
+    from api.websocket import streamer
+    streamer.fire_event("init_complete", {"elapsed_s": round(elapsed, 1)})
+
 
 def discover_model_file(models_dir: str, subdir: str, extensions: list[str]) -> str | None:
     """Find a model file in models_dir/subdir/ with one of the given extensions."""
@@ -658,6 +661,10 @@ def main() -> None:
     from api.server import create_app
 
     async def on_startup():
+        # Store the event loop so background threads can fire WebSocket events
+        from api.websocket import streamer
+        streamer.set_loop(asyncio.get_running_loop())
+
         # Start workers and scheduler immediately so the server can accept jobs
         for w in workers:
             w.start()

@@ -14,6 +14,7 @@ from typing import Callable
 import torch
 
 import log
+from api.websocket import streamer
 from config import GpuConfig
 from gpu import nvml
 
@@ -338,6 +339,30 @@ class GpuPool:
                      f"(CUDA:{cuda_idx}, PCI={nvml_dev.pci_bus_id}, "
                      f"{nvml_dev.total_memory // (1024*1024)}MB, "
                      f"caps={cfg.capabilities})")
+            streamer.fire_event("gpu_added", {
+                "uuid": cfg.uuid,
+                "name": cfg.name,
+                "device_id": cuda_idx,
+                "total_memory": nvml_dev.total_memory,
+                "capabilities": sorted(cfg.capabilities),
+            })
+
+    def remove_gpu(self, uuid: str) -> bool:
+        """Remove a GPU by UUID and fire a ``gpu_removed`` event.
+
+        Returns True if found and removed, False if not found.
+        """
+        for i, gpu in enumerate(self.gpus):
+            if gpu.uuid.lower() == uuid.lower():
+                self.gpus.pop(i)
+                log.info(f"  GpuPool: Removed GPU [{gpu.uuid}] ({gpu.name})")
+                streamer.fire_event("gpu_removed", {
+                    "uuid": gpu.uuid,
+                    "name": gpu.name,
+                    "device_id": gpu.device_id,
+                })
+                return True
+        return False
 
     def has_capability(self, cap: str) -> bool:
         return any(g.supports_capability(cap) for g in self.gpus)

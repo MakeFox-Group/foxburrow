@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import log
+from api.websocket import streamer
 from utils import fingerprint
 
 # Supported LoRA file extensions
@@ -90,6 +91,10 @@ def rescan_loras(
 
     Adds new LoRAs, removes deleted ones, updates changed files.
     Kicks off background hashing for any new entries missing fingerprints.
+    Fires WebSocket events automatically:
+      - ``model_removed`` for each deleted LoRA
+      - ``model_discovered`` for each new/updated LoRA (fingerprint may be null)
+      - ``lora_scan_complete`` with the overall summary
 
     Returns a summary dict with counts of added/removed/updated/unchanged.
     """
@@ -102,13 +107,20 @@ def rescan_loras(
     removed = old_names - new_names
     updated = 0
 
-    # Remove deleted entries
+    # Remove deleted entries and notify
     for name in removed:
-        del current_index[name]
+        entry = current_index.pop(name)
+        streamer.fire_event("model_removed", {
+            "model_type": "lora", "name": name, "path": entry.path})
 
-    # Add new entries
+    # Add new entries and notify
     for name in added:
-        current_index[name] = fresh[name]
+        entry = fresh[name]
+        current_index[name] = entry
+        streamer.fire_event("model_discovered", {
+            "model_type": "lora", "name": name, "path": entry.path,
+            "fingerprint": entry.fingerprint,
+            "size_bytes": entry.size_bytes})
 
     # Check for changes in existing entries (mtime or size changed)
     for name in old_names & new_names:
@@ -117,6 +129,10 @@ def rescan_loras(
         if old.path != new.path or old.mtime != new.mtime or old.size_bytes != new.size_bytes:
             current_index[name] = new
             updated += 1
+            streamer.fire_event("model_discovered", {
+                "model_type": "lora", "name": name, "path": new.path,
+                "fingerprint": new.fingerprint,
+                "size_bytes": new.size_bytes})
 
     unchanged = len(old_names & new_names) - updated
 
@@ -136,6 +152,8 @@ def rescan_loras(
     log.info(f"  LoRA rescan: +{summary['added']} -{summary['removed']} "
              f"~{summary['updated']} ={summary['unchanged']} "
              f"(total: {summary['total']})")
+
+    streamer.fire_event("lora_scan_complete", summary)
 
     return summary
 
@@ -164,6 +182,7 @@ def start_background_hashing(
                  f"({workers} workers)")
         completed = 0
         last_log = time.monotonic()
+        last_completed = 0
 
         def _hash_one(entry: LoraEntry) -> tuple[LoraEntry, str | None]:
             try:
@@ -176,16 +195,23 @@ def start_background_hashing(
             for entry, fp in pool.map(_hash_one, unhashed):
                 if fp is not None:
                     entry.fingerprint = fp
+                    # Re-announce with the computed fingerprint
+                    streamer.fire_event("model_discovered", {
+                        "model_type": "lora", "name": entry.name,
+                        "path": entry.path, "fingerprint": fp,
+                        "size_bytes": entry.size_bytes})
                 completed += 1
 
                 now = time.monotonic()
                 # Log progress periodically
                 if (now - last_log) >= 10:
                     elapsed = now - last_log
-                    rate = 500 / elapsed if elapsed > 0 else 0
+                    done_since = completed - last_completed
+                    rate = done_since / elapsed if elapsed > 0 else 0
                     log.info(f"  LoRA hashing: {completed}/{len(unhashed)} "
                              f"({rate:.0f}/sec)")
                     last_log = now
+                    last_completed = completed
 
         log.info(f"  LoRA hashing: complete ({completed}/{len(unhashed)} hashed)")
 

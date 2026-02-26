@@ -256,10 +256,8 @@ async def status():
         "available": available,
         "total": len(pool.gpus),
         "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
-        "sdxl_models": sorted(sdxl_models_snapshot.keys()),
         "model_scan": model_scan,
         "readiness": readiness,
-        "available_loras": sorted(state.lora_index.keys()),
     }
 
 
@@ -299,6 +297,190 @@ async def model_list():
         "path": path,
         "type": "single_file" if path.endswith(".safetensors") else "diffusers",
     } for name, path in sorted(models.items())]
+
+
+@router.post("/rescan-models")
+async def rescan_models():
+    """Rediscover SDXL models, register new ones, remove deleted ones."""
+    from main import discover_sdxl_models
+    from api.websocket import streamer
+    from utils.model_scanner import ModelScanner
+    from config import _auto_threads
+
+    state = _get_state()
+    models_dir = os.path.normpath(os.path.abspath(state.config.server.models_dir))
+    sdxl_dir = os.path.join(models_dir, "sdxl")
+    if not os.path.isdir(sdxl_dir):
+        return JSONResponse({"error": "SDXL models directory not found"}, status_code=500)
+
+    # Discover fresh model list (fast stat-based walk, no hashing)
+    fresh = await asyncio.get_running_loop().run_in_executor(
+        None, discover_sdxl_models, models_dir)
+
+    old_names = set(state.sdxl_models.keys())
+    new_names = set(fresh.keys())
+
+    added = new_names - old_names
+    removed = old_names - new_names
+
+    # Remove deleted models
+    for name in removed:
+        path = state.sdxl_models.pop(name)
+        streamer.fire_event("model_removed", {
+            "model_type": "sdxl", "name": name, "path": path})
+
+    # Register new models via ModelScanner (handles fingerprinting)
+    if added:
+        new_models = {name: fresh[name] for name in added}
+        fp_threads = _auto_threads(state.config.threads.fingerprint, 8)
+        scanner = ModelScanner(state.registry, state, max_workers=fp_threads)
+        scanner.start(new_models)
+        state.model_scanner = scanner
+
+    summary = {
+        "added": len(added),
+        "removed": len(removed),
+        "unchanged": len(old_names & new_names),
+        "total": len(state.sdxl_models) + len(added),
+    }
+
+    log.info(f"  Model rescan: +{summary['added']} -{summary['removed']} "
+             f"={summary['unchanged']} (total: {summary['total']})")
+
+    return summary
+
+
+@router.delete("/gpu/{uuid}")
+async def remove_gpu(uuid: str):
+    """Remove a GPU from the pool at runtime."""
+    state = _get_state()
+    pool = state.gpu_pool
+    scheduler = state.scheduler
+
+    # Find the GPU
+    gpu = None
+    for g in pool.gpus:
+        if g.uuid.lower() == uuid.lower():
+            gpu = g
+            break
+
+    if gpu is None:
+        return JSONResponse({"error": f"GPU {uuid} not found in pool"}, status_code=404)
+
+    # Refuse if GPU has active jobs
+    if scheduler and scheduler.workers:
+        for w in scheduler.workers:
+            if w.gpu is gpu and not w.is_idle:
+                return JSONResponse(
+                    {"error": f"GPU {uuid} has active jobs — wait for completion"},
+                    status_code=409)
+
+    # Cancel the worker task and remove from scheduler
+    if scheduler and scheduler.workers:
+        for i, w in enumerate(scheduler.workers):
+            if w.gpu is gpu:
+                if w._task is not None:
+                    w._task.cancel()
+                scheduler.workers.pop(i)
+                break
+
+    # Remove from pool (fires gpu_removed event)
+    pool.remove_gpu(uuid)
+
+    return {
+        "removed": True,
+        "uuid": gpu.uuid,
+        "name": gpu.name,
+        "remaining_gpus": len(pool.gpus),
+    }
+
+
+@router.put("/gpu/{uuid}")
+async def add_gpu(uuid: str):
+    """Re-add a GPU to the pool at runtime from the original config."""
+    state = _get_state()
+    pool = state.gpu_pool
+    scheduler = state.scheduler
+
+    # Check if already active
+    for g in pool.gpus:
+        if g.uuid.lower() == uuid.lower():
+            return JSONResponse(
+                {"error": f"GPU {uuid} is already in the pool"}, status_code=409)
+
+    # Find the GPU config
+    config = state.config
+    gpu_cfg = None
+    for cfg in config.gpus:
+        if cfg.uuid.lower() == uuid.lower():
+            gpu_cfg = cfg
+            break
+
+    if gpu_cfg is None:
+        return JSONResponse(
+            {"error": f"GPU {uuid} not found in foxburrow.ini config"},
+            status_code=404)
+
+    # Re-initialize from NVML
+    from gpu import nvml
+    from gpu.pool import GpuInstance, _cuda_index_from_pci_bus_id
+
+    try:
+        nvml.init()
+        devices = nvml.get_devices()
+    except Exception as ex:
+        return JSONResponse(
+            {"error": f"NVML initialization failed: {ex}"}, status_code=500)
+
+    # Match UUID to NVML device
+    nvml_dev = None
+    config_uuid = uuid.lower()
+    for dev in devices:
+        if dev.uuid.lower() == config_uuid:
+            nvml_dev = dev
+            break
+
+    if nvml_dev is None:
+        return JSONResponse(
+            {"error": f"GPU {uuid} not found via NVML — hardware unavailable"},
+            status_code=404)
+
+    # Resolve CUDA index
+    cuda_idx = _cuda_index_from_pci_bus_id(nvml_dev.pci_bus_id)
+    if cuda_idx is None:
+        cuda_idx = nvml_dev.index
+
+    # Create GPU instance and add to pool
+    gpu = GpuInstance(gpu_cfg, nvml_dev, cuda_idx)
+    pool.gpus.append(gpu)
+
+    # Fire event (set_loop was called during on_startup)
+    from api.websocket import streamer
+    await streamer.broadcast_event("gpu_added", {
+        "uuid": gpu.uuid,
+        "name": gpu.name,
+        "device_id": cuda_idx,
+        "total_memory": nvml_dev.total_memory,
+        "capabilities": sorted(gpu.capabilities),
+    })
+
+    # Create and start a worker for this GPU
+    if scheduler:
+        from scheduling.worker import GpuWorker
+        worker = GpuWorker(gpu, state.queue, scheduler._wake)
+        scheduler.workers.append(worker)
+        worker.start()
+        log.info(f"  GPU [{gpu.uuid}] re-added with worker")
+
+    return {
+        "added": True,
+        "uuid": gpu.uuid,
+        "name": gpu.name,
+        "device_id": cuda_idx,
+        "total_memory": nvml_dev.total_memory,
+        "capabilities": sorted(gpu.capabilities),
+        "total_gpus": len(pool.gpus),
+    }
 
 
 @router.post("/generate")

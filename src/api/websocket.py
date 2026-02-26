@@ -15,11 +15,16 @@ if TYPE_CHECKING:
 
 
 class ProgressStreamer:
-    """Streams job progress to connected WebSocket clients."""
+    """Streams job progress and server events to connected WebSocket clients."""
 
     def __init__(self):
         self._connections: list[WebSocket] = []
         self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Store the asyncio event loop for thread-safe event dispatch."""
+        self._loop = loop
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -123,6 +128,46 @@ class ProgressStreamer:
                 for ws in dead:
                     if ws in self._connections:
                         self._connections.remove(ws)
+
+    async def broadcast_event(self, event_type: str, data: dict) -> None:
+        """Broadcast a typed event to all connected WebSocket clients."""
+        if not self._connections:
+            return
+
+        try:
+            msg = json.dumps({"type": event_type, **data})
+        except (TypeError, ValueError) as exc:
+            log.error(f"  WebSocket: broadcast_event({event_type!r}) "
+                      f"serialization failed: {exc}")
+            return
+
+        async with self._lock:
+            snapshot = list(self._connections)
+
+        dead: list[WebSocket] = []
+        for ws in snapshot:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    if ws in self._connections:
+                        self._connections.remove(ws)
+
+    def fire_event(self, event_type: str, data: dict) -> None:
+        """Thread-safe: schedule broadcast_event on the stored event loop.
+
+        Safe to call from any thread — silently no-ops if no loop is set
+        (e.g. during early startup before the server is listening).
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            self.broadcast_event(event_type, data), loop)
 
 
 # Global instance
