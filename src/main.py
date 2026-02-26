@@ -379,6 +379,17 @@ def main() -> None:
         log.info("=" * 60)
         sys.exit(0)
 
+    # Root user warning
+    if os.getuid() == 0:
+        log.warning("!!! Running as root !!!")
+        log.warning("  This is not recommended. Consider running as a non-root user.")
+
+    # Network exposure warning
+    if config.server.address in ("0.0.0.0", "::"):
+        log.warning(f"  Listening on {config.server.address} — this may expose FoxBurrow")
+        log.warning("  to ALL network interfaces, including public ones.")
+        log.warning("  Use 127.0.0.1 to restrict to local connections only.")
+
     # API secret status
     if config.server.secret:
         log.info(f"  API authentication: ENABLED")
@@ -405,11 +416,17 @@ def main() -> None:
         log.error("No GPUs matched config. Check [GPU-<uuid>] sections in foxburrow.ini.")
         sys.exit(1)
 
+    # ── Model discovery ─────────────────────────────────────────────
+    # Track which capabilities are actually available based on models found.
+    available_capabilities: set[str] = set()
+
     # Discover SDXL models
     sdxl_models = discover_sdxl_models(models_dir)
     app_state.sdxl_models = sdxl_models
 
     if sdxl_models:
+        available_capabilities.add("sdxl")
+
         # Set default model
         if config.server.default_sdxl_model and config.server.default_sdxl_model in sdxl_models:
             app_state.default_sdxl_model_dir = sdxl_models[config.server.default_sdxl_model]
@@ -429,8 +446,6 @@ def main() -> None:
         # Register SDXL checkpoints
         for name, path in sdxl_models.items():
             app_state.registry.register_sdxl_checkpoint(path)
-    else:
-        log.warning("  No SDXL models found.")
 
     # Discover LoRA files
     loras_dir = os.path.join(models_dir, "loras")
@@ -439,7 +454,6 @@ def main() -> None:
         from utils.lora_index import discover_loras, start_background_hashing
         app_state.lora_index = discover_loras(loras_dir)
         log.info(f"  Discovered {len(app_state.lora_index)} LoRA files")
-        # Background hashing — fingerprints computed lazily for cache misses
         _lora_hash_thread = start_background_hashing(app_state.lora_index)
     else:
         log.info(f"  LoRA directory not found: {loras_dir} (skipping)")
@@ -448,16 +462,17 @@ def main() -> None:
     upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
                                        [".pth", ".safetensors", ".onnx"])
     if upscale_path:
+        available_capabilities.add("upscale")
         from handlers.upscale import set_model_path
         set_model_path(upscale_path)
         app_state.registry.register_upscale_model(upscale_path)
         log.info(f"  Upscale model: {upscale_path}")
 
     # Discover bgremove model (in models/other/)
-    # RMBG-2.0 is a directory-based model (config.json + custom code + weights)
+    bgremove_found = False
     bgremove_dir = os.path.join(models_dir, "other", "bgremove")
     if os.path.isfile(os.path.join(bgremove_dir, "config.json")):
-        # HuggingFace-style model directory (RMBG-2.0)
+        bgremove_found = True
         from handlers.bgremove import set_model_path
         set_model_path(bgremove_dir)
         model_file = os.path.join(bgremove_dir, "model.safetensors")
@@ -465,25 +480,55 @@ def main() -> None:
             app_state.registry.register_bgremove_model(model_file)
         log.info(f"  BGRemove model: {bgremove_dir}")
     else:
-        # Fallback: look for a standalone model file
         bgremove_path = discover_model_file(models_dir, os.path.join("other", "bgremove"),
                                             [".safetensors", ".pth", ".onnx"])
         if bgremove_path:
+            bgremove_found = True
             from handlers.bgremove import set_model_path
             set_model_path(bgremove_path)
             app_state.registry.register_bgremove_model(bgremove_path)
             log.info(f"  BGRemove model: {bgremove_path}")
+    if bgremove_found:
+        available_capabilities.add("bgremove")
 
     # Discover tagger model (in models/other/)
+    tagger_found = False
+    tagger_dir = os.path.join(models_dir, "other", "tagger")
     tagger_path = discover_model_file(models_dir, os.path.join("other", "tagger"), [".onnx"])
     if tagger_path:
-        from handlers.tagger import set_model_path, init_tagger
+        tagger_found = True
+        from handlers.tagger import set_model_path
         set_model_path(os.path.dirname(tagger_path))
-    else:
-        tagger_dir = os.path.join(models_dir, "other", "tagger")
-        if os.path.isdir(tagger_dir):
+    elif os.path.isdir(tagger_dir):
+        # Check for safetensors + tags.json (JTP PILOT2 SigLIP format)
+        has_model = any(f.endswith(".safetensors") for f in os.listdir(tagger_dir))
+        has_tags = os.path.isfile(os.path.join(tagger_dir, "tags.json"))
+        if has_model and has_tags:
+            tagger_found = True
             from handlers.tagger import set_model_path
             set_model_path(tagger_dir)
+    if tagger_found:
+        available_capabilities.add("tag")
+
+    # ── Report missing models and strip unavailable capabilities ───
+    missing = {
+        "sdxl":     "No SDXL checkpoints found. Place .safetensors files in models/sdxl/",
+        "upscale":  "No upscale model found. Place a RealESRGAN model in models/other/upscale/",
+        "bgremove": "No background removal model found. Place RMBG-2.0 in models/other/bgremove/",
+        "tag":      "No tagger model found. Place JTP PILOT2 SigLIP files in models/other/tagger/",
+    }
+    for cap, msg in missing.items():
+        if cap not in available_capabilities:
+            log.warning(f"  {msg}")
+            log.warning(f"    '{cap}' capability has been disabled.")
+
+    # Remove unavailable capabilities from all GPUs
+    for gpu_inst in app_state.gpu_pool.gpus:
+        removed = gpu_inst.capabilities - available_capabilities
+        if removed:
+            gpu_inst.capabilities &= available_capabilities
+            gpu_inst.onload -= removed
+            gpu_inst.unevictable -= removed
 
     # Pre-load models specified in per-GPU onload config
     for gpu in app_state.gpu_pool.gpus:
