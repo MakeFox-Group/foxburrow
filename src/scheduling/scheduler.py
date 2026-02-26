@@ -64,6 +64,9 @@ class GpuScheduler:
 
     def set_workers(self, workers: list[GpuWorker]) -> None:
         self._workers = workers
+        # Give each worker a reference to all workers for cross-GPU failure propagation
+        for w in workers:
+            w._all_workers = workers
 
     def start(self) -> None:
         self._task = asyncio.get_running_loop().create_task(self._run_loop())
@@ -136,6 +139,9 @@ class GpuScheduler:
 
     def _score_worker(self, worker: "GpuWorker", group: WorkGroup) -> int:
         """Score how well a worker matches a work group. Higher is better."""
+        if worker.gpu.is_failed:
+            return -2**31
+
         stage = group.stage
 
         if not worker.can_accept_work(stage):

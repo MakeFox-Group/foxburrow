@@ -11,15 +11,20 @@ from utils import fingerprint as fp_util
 
 
 class VramEstimates:
-    """Estimated VRAM usage per component type (bytes) for fp16 models."""
+    """Estimated VRAM usage per component type (bytes) for fp16 models.
+
+    These are first-load fallbacks. After the first actual load of each
+    component, update_actual_vram() replaces the estimate with the real
+    measured value so all future ensure_free_vram() calls are accurate.
+    """
     SDXL_TEXT_ENCODER_1 = 250 * 1024 * 1024    # ~250 MB (fp16 CLIP-L)
-    SDXL_TEXT_ENCODER_2 = 700 * 1024 * 1024    # ~700 MB (fp16 CLIP-bigG)
-    SDXL_UNET = 2500 * 1024 * 1024             # ~2.5 GB (fp16 UNet)
-    SDXL_VAE_DECODER = 100 * 1024 * 1024       # ~100 MB (fp16 VAE dec)
-    SDXL_VAE_ENCODER = 100 * 1024 * 1024       # ~100 MB (fp16 VAE enc)
+    SDXL_TEXT_ENCODER_2 = 1400 * 1024 * 1024   # ~1400 MB (fp16 CLIP-bigG, measured ~1324 MB)
+    SDXL_UNET = 5200 * 1024 * 1024             # ~5.2 GB (fp16 UNet, measured ~4897-5135 MB)
+    SDXL_VAE_DECODER = 170 * 1024 * 1024       # ~170 MB (fp16 VAE dec, measured ~161 MB)
+    SDXL_VAE_ENCODER = 170 * 1024 * 1024       # ~170 MB (fp16 VAE enc, measured ~161 MB)
     UPSCALE = 400 * 1024 * 1024                # ~400 MB
-    BGREMOVE = 300 * 1024 * 1024               # ~300 MB
-    TAGGER = 150 * 1024 * 1024                 # ~150 MB
+    BGREMOVE = 450 * 1024 * 1024               # ~450 MB (measured ~440 MB)
+    TAGGER = 900 * 1024 * 1024                 # ~900 MB (measured ~856-898 MB)
 
 
 # Diffusers safetensors filenames by component
@@ -207,6 +212,18 @@ class ModelRegistry:
         if self._bgremove_component is None:
             raise RuntimeError("BGRemove model not registered.")
         return self._bgremove_component
+
+    def update_actual_vram(self, fingerprint: str, actual_bytes: int) -> None:
+        """Replace estimated VRAM with actual measured value for a component.
+
+        After the first load of any component, the worker calls this so all
+        future ensure_free_vram() calls and readiness scoring use the real
+        VRAM footprint instead of the initial guess.
+        """
+        with self._lock:
+            comp = self._components.get(fingerprint)
+            if comp is not None and actual_bytes > 0:
+                comp.estimated_vram_bytes = actual_bytes
 
     @property
     def sdxl_checkpoints(self) -> dict[str, list[ModelComponentId]]:

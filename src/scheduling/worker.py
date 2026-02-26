@@ -51,6 +51,29 @@ _MIN_FREE_VRAM: dict[StageType, int] = {
 }
 
 
+_CUDA_FATAL_PATTERNS = [
+    "illegal memory access",           # cudaErrorIllegalAddress / Xid 31 MMU fault
+    "unspecified launch failure",       # cudaErrorLaunchFailure
+    "cuda error: an illegal instruction was encountered",  # cudaErrorIllegalInstruction
+    "device-side assert",              # cudaErrorAssert (kernel assertion failure)
+]
+
+
+def _is_cuda_fatal(ex: Exception) -> bool:
+    """Check if a CUDA error indicates permanent context corruption.
+
+    These errors mean the CUDA context is irrecoverably broken — the GPU
+    driver issued an MMU fault or similar fatal error. All GPUs sharing
+    this process's CUDA context are affected and must be marked dead.
+
+    OOM errors are explicitly excluded — they are recoverable.
+    """
+    if isinstance(ex, torch.cuda.OutOfMemoryError):
+        return False
+    msg = str(ex).lower()
+    return any(p in msg for p in _CUDA_FATAL_PATTERNS)
+
+
 class GpuWorker:
     """Per-GPU background worker. Receives work items, loads models, executes stages."""
 
@@ -70,6 +93,9 @@ class GpuWorker:
 
         # Model loading serialization
         self._model_load_lock = asyncio.Lock()
+
+        # Cross-GPU failure propagation — set by scheduler via set_workers()
+        self._all_workers: list[GpuWorker] = []
 
     @property
     def gpu(self) -> GpuInstance:
@@ -108,6 +134,8 @@ class GpuWorker:
 
     def can_accept_work(self, stage: WorkStage) -> bool:
         """Whether this worker can accept a new work item for the given stage."""
+        if self._gpu.is_failed:
+            return False
         if stage.required_capability and not self._gpu.supports_capability(stage.required_capability):
             return False
 
@@ -137,6 +165,8 @@ class GpuWorker:
 
     def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
         """Dispatch a work item to this worker."""
+        if self._gpu.is_failed:
+            raise RuntimeError(f"GPU [{self._gpu.uuid}] is permanently failed — cannot dispatch")
         with self._state_lock:
             if self._active_count == 0:
                 if not self._gpu.try_acquire():
@@ -267,10 +297,12 @@ class GpuWorker:
                     job.completed_at = datetime.utcnow()
                     job.set_result(result)
                     self._broadcast_complete(job, success=True)
+                    self._gpu.record_success()
                     log.info(f"  GpuWorker[{self._gpu.uuid}]: {job} completed")
                 else:
                     with self._state_lock:
                         self._active_jobs.pop(job.job_id, None)
+                    self._gpu.record_success()
                     self._queue.re_enqueue(job)
 
             except Exception as ex:
@@ -278,12 +310,30 @@ class GpuWorker:
                     self._active_jobs.pop(job.job_id, None)
                 job.active_gpus = []
                 log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
+                if _is_cuda_fatal(ex):
+                    log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "
+                              f"Process restart required.")
+                    for w in self._all_workers:
+                        w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
+                elif not isinstance(ex, torch.cuda.OutOfMemoryError):
+                    # OOM is a job-level failure, not a hardware fault — don't
+                    # count it toward the consecutive failure threshold.
+                    self._gpu.record_failure()
                 job.completed_at = datetime.utcnow()
                 job.set_result(JobResult(success=False, error=str(ex)))
                 self._broadcast_complete(job, success=False, error=str(ex))
 
         except Exception as ex:
+            # Outer handler catches model-loading failures and other setup errors.
+            # Only CUDA fatal errors trigger GPU disabling here — model load errors
+            # (FileNotFoundError, KeyError, etc.) are config problems, not hardware faults.
             log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
+            if _is_cuda_fatal(ex):
+                log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "
+                          f"Process restart required.")
+                for w in self._all_workers:
+                    w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
+            job.completed_at = datetime.utcnow()
             job.set_result(JobResult(success=False, error=str(ex)))
             self._broadcast_complete(job, success=False, error=str(ex))
 
@@ -403,6 +453,11 @@ class GpuWorker:
             actual_vram = after - before
             log.info(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
                      f"(estimated {component.estimated_vram_bytes // (1024*1024)}MB)")
+            # Feed actual VRAM measurement back to the registry so future
+            # ensure_free_vram() calls use the real value instead of the estimate
+            if actual_vram > 0:
+                from state import app_state
+                app_state.registry.update_actual_vram(component.fingerprint, actual_vram)
             # UNet eviction clears LoRA adapter tracking (adapters live in PEFT layers)
             evict_cb = None
             if component.category == "sdxl_unet":
@@ -442,6 +497,9 @@ class GpuWorker:
         log.info(f"  Loaded upscale: {actual_vram // (1024*1024)}MB actual"
                  + (f" (estimated {comp.estimated_vram_bytes // (1024*1024)}MB)" if comp else ""))
         if comp:
+            if actual_vram > 0:
+                from state import app_state
+                app_state.registry.update_actual_vram(comp.fingerprint, actual_vram)
             self._gpu.cache_model(comp.fingerprint, "upscale", model, comp.estimated_vram_bytes,
                                   source="realesrgan")
 
@@ -466,6 +524,9 @@ class GpuWorker:
         log.info(f"  Loaded bgremove: {actual_vram // (1024*1024)}MB actual"
                  + (f" (estimated {comp.estimated_vram_bytes // (1024*1024)}MB)" if comp else ""))
         if comp:
+            if actual_vram > 0:
+                from state import app_state
+                app_state.registry.update_actual_vram(comp.fingerprint, actual_vram)
             self._gpu.cache_model(comp.fingerprint, "bgremove", model, comp.estimated_vram_bytes,
                                   source="rmbg")
 

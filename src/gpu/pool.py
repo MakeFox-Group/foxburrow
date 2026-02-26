@@ -92,6 +92,12 @@ class GpuInstance:
         # Adapters live inside the UNet's PEFT layers; cleared when UNet is evicted
         self._loaded_lora_adapters: dict[str, str] = {}
 
+        # GPU failure tracking — permanently disables the GPU when a fatal
+        # CUDA error corrupts the context (e.g. cudaErrorIllegalAddress / Xid 31)
+        self._failed = False
+        self._fail_reason: str = ""
+        self._consecutive_failures = 0
+
     def get_vram_stats(self) -> dict:
         """Return actual VRAM usage from PyTorch + NVML."""
         allocated = torch.cuda.memory_allocated(self.device)
@@ -122,6 +128,32 @@ class GpuInstance:
 
     def supports_capability(self, cap: str) -> bool:
         return cap.lower() in self.capabilities
+
+    # ---- Failure tracking ----
+
+    @property
+    def is_failed(self) -> bool:
+        """Whether this GPU has been permanently marked as failed."""
+        return self._failed
+
+    def mark_failed(self, reason: str) -> None:
+        """Permanently mark this GPU as failed. No further work will be dispatched."""
+        if not self._failed:
+            self._failed = True
+            self._fail_reason = reason
+            log.error(f"  GPU [{self.uuid}]: PERMANENTLY FAILED — {reason}")
+
+    def record_success(self) -> None:
+        """Record a successful job completion, resetting the consecutive failure counter."""
+        self._consecutive_failures = 0
+
+    def record_failure(self) -> bool:
+        """Record a job failure. Returns True if GPU should be disabled (5 consecutive)."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 5:
+            self.mark_failed(f"{self._consecutive_failures} consecutive job failures")
+            return True
+        return False
 
     def mark_unevictable(self, fingerprint: str) -> None:
         """Mark a cached model fingerprint as unevictable."""
