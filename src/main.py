@@ -269,11 +269,15 @@ def _background_model_init(
         scanner._thread.join()
 
     # 5. GPU onload and unevictable (needs registered models)
-    for gpu in app_state.gpu_pool.gpus:
-        _process_gpu_onload(gpu, app_state)
+    # Parallelize across GPUs — each targets a different CUDA device.
+    gpus = app_state.gpu_pool.gpus
+    if gpus:
+        with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
+            list(gpu_pool.map(
+                lambda g: _process_gpu_onload(g, app_state), gpus))
 
-    for gpu in app_state.gpu_pool.gpus:
-        _process_gpu_unevictable(gpu, app_state)
+        for gpu in gpus:
+            _process_gpu_unevictable(gpu, app_state)
 
     # 6. LoRA hashing — same pool, starts AFTER SDXL models are done.
     # Last consumer shuts down the shared pool when complete.
