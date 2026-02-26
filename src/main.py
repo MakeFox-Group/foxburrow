@@ -230,16 +230,43 @@ def _background_model_init(
     start_time = time.monotonic()
     log.info("  Background init: starting...")
 
-    # 1. Pre-fetch HF configs (network I/O, cached after first run)
-    _prefetch_sdxl_configs()
-
     # ONE shared fingerprint pool — SDXL base models go first (priority),
     # then LoRA hashing reuses the same threads.
     from concurrent.futures import ThreadPoolExecutor
     fp_threads = _auto_threads(config.threads.fingerprint, 8)
     fp_pool = ThreadPoolExecutor(max_workers=fp_threads)
+    gpus = app_state.gpu_pool.gpus
 
-    # 2. Register utility models (upscale, bgremove) — fast, single files.
+    # 1. Start model scanning FIRST — CPU/disk only, runs concurrently
+    #    with all the warm-up work below.
+    if all_sdxl:
+        from utils.model_scanner import ModelScanner
+        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
+        scanner.start(all_sdxl, pool=fp_pool)
+        app_state.model_scanner = scanner
+
+    # 2. Pre-warm everything while scanner runs in background.
+    #    Without this, parallel GPU onload threads all hit cold-start costs
+    #    simultaneously: first `import timm` holds the GIL for ~5-10s (huge
+    #    model registry), first CUDA op per device initializes the runtime
+    #    (~2-5s each, driver-serialized). Paying these once upfront avoids
+    #    serializing the parallel GPU onload.
+
+    # HF config files (network on first run, then cached locally)
+    _prefetch_sdxl_configs()
+
+    # Heavy library imports (GIL-bound — do once before threads fan out)
+    import timm              # noqa: F401 — massive model registry
+    import safetensors.torch  # noqa: F401
+
+    # CUDA context init: first op per device triggers expensive runtime init.
+    # Driver serializes this internally so sequential is optimal.
+    if gpus:
+        log.info(f"  Pre-warming CUDA contexts for {len(gpus)} GPU(s)...")
+        for gpu in gpus:
+            torch.zeros(1, device=gpu.device)
+
+    # 3. Register utility models (upscale, bgremove) — fast, single files.
     # Must happen BEFORE GPU onload so upscale/bgremove components exist.
     upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
                                        [".pth", ".safetensors", ".onnx"])
@@ -256,22 +283,8 @@ def _background_model_init(
         if bgremove_path:
             app_state.registry.register_bgremove_model(bgremove_path)
 
-    # 3. Start SDXL model scanning AND GPU onload concurrently.
-    # Model scanning: fingerprints SDXL checkpoints — models become available
-    # progressively as each one completes (ready for inference immediately).
-    # GPU onload (tag/upscale/bgremove): loads tagger etc. onto GPUs.
-    # These are INDEPENDENT — taggers don't need SDXL models.
-    import threading
-    gpus = app_state.gpu_pool.gpus
-
-    # Start model scanning (non-blocking background thread)
-    if all_sdxl:
-        from utils.model_scanner import ModelScanner
-        scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)
-        scanner.start(all_sdxl, pool=fp_pool)
-        app_state.model_scanner = scanner
-
-    # Load non-SDXL items onto GPUs in parallel (tag, upscale, bgremove).
+    # 4. Parallel GPU onload — everything is warm (imports done, CUDA hot).
+    # Tagger/upscale/bgremove load truly in parallel across all GPUs.
     # Runs concurrently with model scanning — GPUs are usable ASAP.
     if gpus:
         with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
@@ -280,13 +293,13 @@ def _background_model_init(
                     g, app_state, types={"tag", "upscale", "bgremove"}),
                 gpus))
 
-    # 4. Wait for model scanning to finish.
+    # 5. Wait for model scanning to finish.
     # Base models get priority I/O — LoRA hashing starts after.
     scanner = app_state.model_scanner
     if scanner is not None and scanner._thread is not None:
         scanner._thread.join()
 
-    # 5. Now load SDXL-specific onloads (model pre-loads into GPU VRAM)
+    # 6. Now load SDXL-specific onloads (model pre-loads into GPU VRAM)
     # and mark unevictable entries. Requires models to be registered.
     if gpus:
         with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
@@ -297,7 +310,7 @@ def _background_model_init(
         for gpu in gpus:
             _process_gpu_unevictable(gpu, app_state)
 
-    # 6. LoRA hashing — same fingerprint pool, starts AFTER SDXL models.
+    # 7. LoRA hashing — same fingerprint pool, starts AFTER SDXL models.
     # Last consumer shuts down the shared pool when complete.
     if app_state.lora_index:
         from utils.lora_index import start_background_hashing
