@@ -12,6 +12,10 @@ import sys
 # Must be set BEFORE importing torch or any CUDA library.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
+# Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
+# instead of ~/.cache/huggingface/. Must be set before any HF imports.
+os.environ.setdefault("HF_HOME", os.path.join(os.path.abspath("data"), "hf_cache"))
+
 import torch
 import uvicorn
 
@@ -445,20 +449,8 @@ def main() -> None:
     if all_sdxl:
         available_capabilities.add("sdxl")
 
-        # Initialize tokenizers from first available model (only needs path, not fingerprint).
-        # Prefer a diffusers model directory since it loads fastest for tokenizer init.
-        first_model_path = None
-        for _name, _path in all_sdxl.items():
-            if os.path.isdir(_path):
-                first_model_path = _path
-                break
-        if first_model_path is None:
-            first_model_path = next(iter(all_sdxl.values()))
-
-        from handlers.sdxl import init_tokenizers
-        init_tokenizers(first_model_path)
-
         # Start model scanner — registers single-file instantly, queues diffusers for background
+        # Tokenizers are initialized lazily on first generation request.
         from utils.model_scanner import ModelScanner
         fp_threads = _auto_threads(config.threads.fingerprint, 8)
         scanner = ModelScanner(app_state.registry, app_state, max_workers=fp_threads)

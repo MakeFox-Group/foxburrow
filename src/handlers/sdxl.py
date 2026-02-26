@@ -241,7 +241,10 @@ def tokenize(job: InferenceJob) -> None:
     if inp is None:
         raise RuntimeError("SdxlInput is required for tokenization.")
     if _tokenizer_1 is None or _tokenizer_2 is None:
-        raise RuntimeError("SDXL tokenizers not initialized. Call init_tokenizers() first.")
+        if inp.model_dir:
+            init_tokenizers(inp.model_dir)
+        else:
+            raise RuntimeError("SDXL tokenizers not initialized and no model_dir available.")
 
     # CLIP-L pads with 49407 (EOS), CLIP-G pads with 0
     CLIP_L_PAD = 49407
