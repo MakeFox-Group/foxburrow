@@ -24,6 +24,9 @@ nvidia-ml-py>=12.535
 # Background removal (RMBG-2.0 dependency)
 kornia>=0.7
 
+# TUI console
+textual>=0.50
+
 # Image / numeric
 Pillow>=10.0
 numpy>=1.24

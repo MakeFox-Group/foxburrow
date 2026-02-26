@@ -96,11 +96,12 @@ class GpuInstance:
         """Return actual VRAM usage from PyTorch + NVML."""
         allocated = torch.cuda.memory_allocated(self.device)
         reserved = torch.cuda.memory_reserved(self.device)
-        _, total, free = nvml.get_memory_info(self.nvml_handle)
+        total, used, free = nvml.get_memory_info(self.nvml_handle)
         return {
             "allocated": allocated,       # PyTorch tensor VRAM
             "reserved": reserved,         # PyTorch cached allocator
-            "total": total,
+            "total": total,               # GPU total capacity (NVML)
+            "used": used,                 # Total VRAM in use (NVML)
             "free": free,                 # NVML-reported free
         }
 

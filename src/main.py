@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import secrets
@@ -12,6 +13,14 @@ import threading
 # Force CUDA to enumerate GPUs by PCI bus ID (matching NVML ordering).
 # Must be set BEFORE importing torch or any CUDA library.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+# Enable expandable memory segments in PyTorch's CUDA caching allocator.
+# Without this, the allocator creates fixed-size blocks that can't be merged,
+# causing fragmentation: OOM errors even when total free VRAM appears sufficient
+# (e.g. "437 MiB reserved but unallocated" yet can't allocate 26 MiB).
+# expandable_segments lets PyTorch grow/shrink allocations dynamically, virtually
+# eliminating fragmentation on multi-model GPU workloads.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 # Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
 # instead of ~/.cache/huggingface/. Must be set before any HF imports.
@@ -556,7 +565,18 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
                 log.log_exception(ex, f"GPU [{gpu.uuid}]: unevictable={entry} failed")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="foxburrow — GPU inference server")
+    parser.add_argument(
+        "--no-tui", action="store_true",
+        help="Disable the TUI console (headless mode — logs to stdout)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
+
     # Start file logging before anything else so the full startup is captured.
     log.init_file(os.path.abspath("logs/foxburrow.log"))
     log.info("foxburrow starting (Python/PyTorch)")
@@ -756,15 +776,20 @@ def main() -> None:
     # Create FastAPI app
     from api.server import create_app
 
+    # Shared startup logic for both TUI and headless modes.
+    # tui_mode: when True, skip SIGINT override (Textual handles Ctrl+C)
+    #           and signal the ready_event so the main thread can launch the TUI.
+    ready_event = threading.Event() if not args.no_tui else None
+
     async def on_startup():
-        # Override uvicorn's SIGINT handler — first Ctrl+C kills immediately.
-        # All background threads are daemon threads and die with the process.
-        import signal
-        def _force_exit(signum, frame):
-            log.info("  SIGINT — exiting")
-            os._exit(0)
-        signal.signal(signal.SIGINT, _force_exit)
-        signal.signal(signal.SIGTERM, _force_exit)
+        if args.no_tui:
+            # Headless: override uvicorn's SIGINT handler — first Ctrl+C kills immediately.
+            import signal
+            def _force_exit(signum, frame):
+                log.info("  SIGINT — exiting")
+                os._exit(0)
+            signal.signal(signal.SIGINT, _force_exit)
+            signal.signal(signal.SIGTERM, _force_exit)
 
         # Store the event loop so background threads can fire WebSocket events
         from api.websocket import streamer
@@ -793,17 +818,61 @@ def main() -> None:
         )
         t.start()
 
+        # Signal TUI that the server is ready
+        if ready_event is not None:
+            ready_event.set()
+
     app = create_app(on_startup=on_startup)
 
     url = f"{config.server.address}:{config.server.port}"
     log.info(f"  Starting server on {url}")
 
-    uvicorn.run(
-        app,
-        host=config.server.address,
-        port=config.server.port,
-        log_level="warning",
-    )
+    if args.no_tui:
+        # ── Headless mode: uvicorn blocks on main thread (original behavior) ──
+        uvicorn.run(
+            app,
+            host=config.server.address,
+            port=config.server.port,
+            log_level="warning",
+        )
+    else:
+        # ── TUI mode: uvicorn in daemon thread, Textual on main thread ──
+        uvi_config = uvicorn.Config(
+            app,
+            host=config.server.address,
+            port=config.server.port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(uvi_config)
+
+        def _run_uvicorn_in_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.serve())
+
+        uvi_thread = threading.Thread(
+            target=_run_uvicorn_in_thread,
+            name="uvicorn",
+            daemon=True,
+        )
+        uvi_thread.start()
+
+        # Wait for the server to be ready (on_startup fires ready_event)
+        if not ready_event.wait(timeout=30):
+            log.error("  Server failed to start within 30s — aborting")
+            server.should_exit = True
+            sys.exit(1)
+
+        # Launch TUI on main thread
+        from tui.app import FoxburrowApp
+        tui = FoxburrowApp(uvicorn_server=server)
+        tui.run()
+
+        # TUI exited — shut down uvicorn
+        server.should_exit = True
+        uvi_thread.join(timeout=5)
+        if uvi_thread.is_alive():
+            log.warning("  uvicorn did not stop cleanly within 5s")
 
 
 if __name__ == "__main__":
