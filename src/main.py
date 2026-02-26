@@ -174,6 +174,35 @@ def discover_sdxl_models(models_dir: str) -> dict[str, str]:
     return models
 
 
+_SDXL_HF_CONFIGS = [
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    "stabilityai/stable-diffusion-xl-refiner-1.0",
+]
+
+_HF_CONFIG_PATTERNS = ["**/*.json", "*.json", "*.txt", "**/*.txt", "**/*.model"]
+
+
+def _prefetch_sdxl_configs() -> None:
+    """Pre-download SDXL config/tokenizer files from HuggingFace.
+
+    Downloads only config JSONs and tokenizer vocab files (~10-15MB),
+    NOT model weights. Cached in data/hf_cache/ (via HF_HOME env var).
+    Subsequent runs are instant cache hits with no network access.
+    """
+    from huggingface_hub import snapshot_download
+
+    for repo_id in _SDXL_HF_CONFIGS:
+        try:
+            snapshot_download(
+                repo_id,
+                allow_patterns=_HF_CONFIG_PATTERNS,
+            )
+            log.info(f"  HF configs cached: {repo_id}")
+        except Exception as ex:
+            log.warning(f"  Failed to pre-fetch HF configs for {repo_id}: {ex}")
+            log.warning("  Single-file checkpoint extraction may fail without network access.")
+
+
 def discover_model_file(models_dir: str, subdir: str, extensions: list[str]) -> str | None:
     """Find a model file in models_dir/subdir/ with one of the given extensions."""
     search_dir = os.path.join(models_dir, subdir)
@@ -448,6 +477,11 @@ def main() -> None:
 
     if all_sdxl:
         available_capabilities.add("sdxl")
+
+        # Pre-fetch SDXL config/tokenizer files from HuggingFace if not already cached.
+        # These are needed by diffusers to decompose single-file checkpoints.
+        # Downloads only configs (~10-15MB), NOT model weights.
+        _prefetch_sdxl_configs()
 
         # Start model scanner — registers single-file instantly, queues diffusers for background
         # Tokenizers are initialized lazily on first generation request.
