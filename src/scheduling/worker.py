@@ -171,7 +171,9 @@ class GpuWorker:
                 # Without this, NVML reports almost no free VRAM even when the cached
                 # blocks hold no live tensors (e.g. after a previous stage's working
                 # memory was freed but PyTorch kept the blocks reserved).
-                torch.cuda.empty_cache()
+                # Target THIS worker's GPU — not the default device (cuda:0).
+                with torch.cuda.device(self._gpu.device):
+                    torch.cuda.empty_cache()
 
                 await self._loop.run_in_executor(
                     None, self._ensure_models_for_stage, stage, job)
@@ -207,7 +209,9 @@ class GpuWorker:
                     # back to the OS immediately. This MUST run even on OOM — otherwise
                     # PyTorch's caching allocator keeps the failed allocation's blocks
                     # reserved, causing cascading OOM on all subsequent jobs.
-                    torch.cuda.empty_cache()
+                    # Target THIS worker's GPU — not the default device (cuda:0).
+                    with torch.cuda.device(self._gpu.device):
+                        torch.cuda.empty_cache()
 
                 stage_duration = _time.monotonic() - stage_start
                 job.gpu_time_s += stage_duration

@@ -562,6 +562,23 @@ def main() -> None:
     if config.server.hf_token:
         os.environ.setdefault("HF_TOKEN", config.server.hf_token)
 
+    # Restrict CUDA visibility to only enabled GPUs.
+    # Without this, PyTorch/CUDA runtime creates driver contexts on ALL GPUs
+    # (visible in nvidia-smi), and third-party libs like diffusers can leak
+    # VRAM onto disabled GPUs via the default device (cuda:0).
+    # CUDA accepts GPU UUIDs directly — no index mapping needed.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        enabled_uuids = [cfg.uuid for cfg in config.gpus if cfg.enabled]
+        if enabled_uuids:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(enabled_uuids)
+            log.info(f"  CUDA visibility: {len(enabled_uuids)} enabled GPU(s)")
+        elif config.gpus:
+            # All GPUs disabled — hide everything
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            log.warning("  All GPUs are disabled in config — CUDA has no visible devices")
+    else:
+        log.info(f"  CUDA_VISIBLE_DEVICES already set: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
     # Safety gate: server won't start unless enabled=true
     if not config.server.enabled:
         log.info("")
