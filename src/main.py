@@ -409,15 +409,9 @@ def main() -> None:
     models_dir = os.path.normpath(os.path.abspath(config.server.models_dir))
     log.info(f"  Models dir: {models_dir}")
 
-    # Initialize GPU pool
-    app_state.gpu_pool.initialize(config.gpus)
-
-    if not app_state.gpu_pool.gpus:
-        log.error("No GPUs matched config. Check [GPU-<uuid>] sections in foxburrow.ini.")
-        sys.exit(1)
-
     # ── Model discovery ─────────────────────────────────────────────
-    # Track which capabilities are actually available based on models found.
+    # Scan for models BEFORE GPU init — no point initializing GPUs if
+    # there's nothing to serve.
     available_capabilities: set[str] = set()
 
     # Discover SDXL models
@@ -510,7 +504,7 @@ def main() -> None:
     if tagger_found:
         available_capabilities.add("tag")
 
-    # ── Report missing models and strip unavailable capabilities ───
+    # ── Report missing models ──────────────────────────────────────
     missing = {
         "sdxl":     "No SDXL checkpoints found. Place .safetensors files in models/sdxl/",
         "upscale":  "No upscale model found. Place a RealESRGAN model in models/other/upscale/",
@@ -522,17 +516,24 @@ def main() -> None:
             log.warning(f"  {msg}")
             log.warning(f"    '{cap}' capability has been disabled.")
 
-    # Remove unavailable capabilities from all GPUs
+    if not available_capabilities:
+        log.error("No models found — nothing to do. Install at least one model and try again.")
+        sys.exit(1)
+
+    # ── Initialize GPU pool ────────────────────────────────────────
+    app_state.gpu_pool.initialize(config.gpus)
+
+    if not app_state.gpu_pool.gpus:
+        log.error("No GPUs matched config. Check [GPU-<uuid>] sections in foxburrow.ini.")
+        sys.exit(1)
+
+    # Strip unavailable capabilities from all GPUs
     for gpu_inst in app_state.gpu_pool.gpus:
         removed = gpu_inst.capabilities - available_capabilities
         if removed:
             gpu_inst.capabilities &= available_capabilities
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
-
-    if not available_capabilities:
-        log.error("No models found — nothing to do. Install at least one model and try again.")
-        sys.exit(1)
 
     # Pre-load models specified in per-GPU onload config
     for gpu in app_state.gpu_pool.gpus:
