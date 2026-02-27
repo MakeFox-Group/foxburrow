@@ -223,6 +223,10 @@ def _is_cuda_fatal(ex: Exception) -> bool:
     if isinstance(ex, torch.cuda.OutOfMemoryError):
         return False
     msg = str(ex).lower()
+    # OOM can surface as torch.AcceleratorError instead of OutOfMemoryError.
+    # Check the message to catch these — OOM is always recoverable.
+    if "out of memory" in msg or "cudaerrormemoryallocation" in msg:
+        return False
     return any(p in msg for p in _CUDA_FATAL_PATTERNS)
 
 
