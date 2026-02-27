@@ -103,13 +103,20 @@ class GpuInstance:
         allocated = torch.cuda.memory_allocated(self.device)
         reserved = torch.cuda.memory_reserved(self.device)
         total, used, free = nvml.get_memory_info(self.nvml_handle)
-        return {
+        stats = {
             "allocated": allocated,       # PyTorch tensor VRAM
             "reserved": reserved,         # PyTorch cached allocator
             "total": total,               # GPU total capacity (NVML)
             "used": used,                 # Total VRAM in use (NVML)
             "free": free,                 # NVML-reported free
         }
+        from gpu.torch_ext import HAS_ALLOC_TAGS, ALLOC_TAG_MODEL_WEIGHTS, ALLOC_TAG_ACTIVATIONS
+        if HAS_ALLOC_TAGS:
+            stats["model_vram"] = torch.cuda.memory_allocated_by_tag(
+                ALLOC_TAG_MODEL_WEIGHTS, self.device)
+            stats["activation_vram"] = torch.cuda.memory_allocated_by_tag(
+                ALLOC_TAG_ACTIVATIONS, self.device)
+        return stats
 
     @property
     def is_busy(self) -> bool:
@@ -430,6 +437,12 @@ class GpuPool:
                 "total_memory": nvml_dev.total_memory,
                 "capabilities": sorted(cfg.capabilities),
             })
+
+        # Probe fork features against the actual CUDA allocator backend.
+        # Must run after at least one GPU is registered (CUDA context ready).
+        if self.gpus:
+            from gpu.torch_ext import check_runtime_support
+            check_runtime_support(self.gpus[0].device)
 
     def remove_gpu(self, uuid: str) -> bool:
         """Remove a GPU by UUID and fire a ``gpu_removed`` event.
