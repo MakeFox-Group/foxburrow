@@ -11,9 +11,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import contextlib
+
 import log
 from gpu import nvml
 from gpu.pool import GpuInstance
+from gpu.torch_ext import (
+    HAS_ALLOC_TAGS, HAS_HISTOGRAM, HAS_PEAK_SCOPE,
+    ALLOC_TAG_ACTIVATIONS, ALLOC_TAG_MODEL_WEIGHTS,
+)
 from scheduling.job import (
     InferenceJob, JobResult, JobType, StageType, WorkStage,
 )
@@ -401,6 +407,15 @@ class GpuWorker:
         evictable = gpu.get_evictable_vram(protect)
 
         available = nvml_free + pt_slack + evictable
+
+        # When tag-based tracking is available, log exact model VRAM for
+        # diagnostics (helps identify estimate drift vs actual usage).
+        tag_info = ""
+        if HAS_ALLOC_TAGS:
+            actual_model_vram = torch.cuda.memory_allocated_by_tag(
+                ALLOC_TAG_MODEL_WEIGHTS, gpu.device)
+            tag_info = f", tag_models={actual_model_vram // (1024**2)}MB"
+
         fits = available >= total_needed
 
         log.info(f"  VRAM budget [{gpu.uuid}]: "
@@ -410,7 +425,7 @@ class GpuWorker:
                  f"avail {available // (1024**2)}MB "
                  f"(free={nvml_free // (1024**2)}MB, "
                  f"pt_slack={pt_slack // (1024**2)}MB, "
-                 f"evictable={evictable // (1024**2)}MB) "
+                 f"evictable={evictable // (1024**2)}MB{tag_info}) "
                  f"→ {'OK' if fits else 'REJECTED'}")
 
         return fits
@@ -425,6 +440,12 @@ class GpuWorker:
             for m in models
         )
 
+        # Build tag-based VRAM suffix when available
+        tag_info = ""
+        if "model_vram" in stats:
+            tag_info = (f" | Tags: model={stats['model_vram'] // (1024**2)}MB, "
+                        f"activation={stats['activation_vram'] // (1024**2)}MB")
+
         log.info(
             f"  VRAM [{gpu.uuid}] ({context}): "
             f"NVML {stats['used'] // (1024**2)}MB used / "
@@ -433,11 +454,19 @@ class GpuWorker:
             f"PyTorch {stats['allocated'] // (1024**2)}MB alloc / "
             f"{stats['reserved'] // (1024**2)}MB reserved | "
             f"Models {total_model_vram // (1024**2)}MB in {len(models)} cached"
+            f"{tag_info}"
         )
         for m in models:
             vram = m['actual_vram'] if m['actual_vram'] > 0 else m['vram']
             source = f" ({m['source']})" if m.get('source') else ""
             log.info(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
+
+        if HAS_HISTOGRAM:
+            hist = torch.cuda.allocation_histogram(gpu.device)
+            large_bins = {k: v for k, v in hist.items()
+                          if v["count"] > 0 and v["total_bytes"] > 10 * 1024**2}
+            if large_bins:
+                log.info(f"    Histogram [{gpu.uuid}]: {large_bins}")
 
     def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
         """Dispatch a work item to this worker."""
@@ -514,23 +543,35 @@ class GpuWorker:
                 import time as _time
                 stage_start = _time.monotonic()
 
-                # Snapshot baseline memory and reset peak tracking so we can
-                # measure the actual working memory this stage consumes.
-                # Also snapshot active_count NOW (before execution) so we know
+                # Snapshot active_count NOW (before execution) so we know
                 # whether this was the only stage running during measurement.
-                with torch.cuda.device(self._gpu.device):
-                    torch.cuda.reset_peak_memory_stats()
-                mem_baseline = torch.cuda.memory_allocated(self._gpu.device)
                 with self._state_lock:
                     active_at_start = self._active_count
+
+                # Set up memory measurement: prefer PeakMemoryScope (no global
+                # state reset, per-scope baseline) over reset_peak_memory_stats
+                # which races with concurrent stages.
+                peak_scope = None
+                mem_baseline = 0
+                if HAS_PEAK_SCOPE:
+                    peak_scope = torch.cuda.PeakMemoryScope(device=self._gpu.device)
+                    peak_scope.__enter__()
+                else:
+                    with torch.cuda.device(self._gpu.device):
+                        torch.cuda.reset_peak_memory_stats()
+                    mem_baseline = torch.cuda.memory_allocated(self._gpu.device)
 
                 try:
                     output_image = await self._loop.run_in_executor(
                         None, self._execute_stage, job, stage)
                 finally:
-                    # Capture peak before empty_cache clears it
-                    mem_peak = torch.cuda.max_memory_allocated(self._gpu.device)
-                    working_mem = mem_peak - mem_baseline
+                    if peak_scope is not None:
+                        peak_scope.__exit__(None, None, None)
+                        working_mem = peak_scope.peak_bytes
+                    else:
+                        # Capture peak before empty_cache clears it
+                        mem_peak = torch.cuda.max_memory_allocated(self._gpu.device)
+                        working_mem = mem_peak - mem_baseline
 
                     # Release working memory (UNet activations, attention matrices, etc.)
                     # back to the OS immediately. This MUST run even on OOM — otherwise
@@ -545,18 +586,17 @@ class GpuWorker:
 
                 # Feed the measurement back so future VRAM checks are accurate.
                 # IMPORTANT: Only update when running solo — when multiple
-                # stages run concurrently, max_memory_allocated() captures ALL
-                # of them, producing wildly inflated per-component values
-                # (e.g. tagger showing 7128MB instead of ~900MB).
+                # stages run concurrently, peak tracking (scoped or global)
+                # captures ALL allocations on the device, producing inflated
+                # per-component values.
                 stage_pixels = _get_stage_pixels(stage.type, job)
                 is_solo = active_at_start <= 1
                 if is_solo:
                     _update_working_memory(stage.type, working_mem, stage_pixels)
                 log.info(f"  Stage {stage.type.value}: working memory "
-                         f"{working_mem // (1024**2)}MB "
-                         f"(baseline {mem_baseline // (1024**2)}MB, "
-                         f"peak {mem_peak // (1024**2)}MB"
-                         f"{'' if is_solo else ', CONCURRENT — measurement skipped'})")
+                         f"{working_mem // (1024**2)}MB"
+                         f"{' (scoped)' if peak_scope is not None else ''}"
+                         f"{'' if is_solo else ' CONCURRENT — BPP update skipped'}")
 
                 # Get model name for this stage
                 model_name = None
@@ -762,7 +802,10 @@ class GpuWorker:
             # Load the model component, measuring actual VRAM usage
             from handlers.sdxl import load_component
             before = torch.cuda.memory_allocated(self._gpu.device)
-            model = load_component(component.category, model_dir, self._gpu.device)
+            tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
+                       if HAS_ALLOC_TAGS else contextlib.nullcontext())
+            with tag_ctx:
+                model = load_component(component.category, model_dir, self._gpu.device)
             after = torch.cuda.memory_allocated(self._gpu.device)
             actual_vram = after - before
             log.info(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
@@ -814,7 +857,10 @@ class GpuWorker:
             self._gpu.ensure_free_vram(comp.estimated_vram_bytes,
                                        protect={comp.fingerprint})
         before = torch.cuda.memory_allocated(self._gpu.device)
-        model = load_model(self._gpu.device)
+        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
+                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        with tag_ctx:
+            model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
         actual_vram = after - before
         log.info(f"  Loaded upscale: {actual_vram // (1024*1024)}MB actual"
@@ -847,7 +893,10 @@ class GpuWorker:
             self._gpu.ensure_free_vram(comp.estimated_vram_bytes,
                                        protect={comp.fingerprint})
         before = torch.cuda.memory_allocated(self._gpu.device)
-        model = load_model(self._gpu.device)
+        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
+                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        with tag_ctx:
+            model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
         actual_vram = after - before
         log.info(f"  Loaded bgremove: {actual_vram // (1024*1024)}MB actual"
@@ -911,8 +960,15 @@ class GpuWorker:
 
     def _execute_stage(self, job: InferenceJob, stage: WorkStage):
         """Execute a single job's current stage. Returns output image for final stages."""
-        from PIL import Image
+        # Tag all allocations during stage execution as activations (thread-local,
+        # must be set here on the executor thread — not on the asyncio event loop).
+        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_ACTIVATIONS)
+                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        with tag_ctx:
+            return self._dispatch_stage(job, stage)
 
+    def _dispatch_stage(self, job: InferenceJob, stage: WorkStage):
+        """Dispatch to the appropriate handler for a stage type."""
         # Store fingerprint mapping so handlers retrieve the correct model instance
         # when multiple models of the same category are cached (e.g. two sdxl_te1
         # from different checkpoints).  Without this, _get_cached_model returns the
