@@ -33,8 +33,12 @@ def load_model(device: torch.device) -> torch.nn.Module:
     try:
         from transformers import AutoModelForImageSegmentation
 
+        # low_cpu_mem_usage=False skips accelerate's init_empty_weights()
+        # context which uses meta tensors.  Without this, a failure during
+        # model init (e.g. stale birefnet.py) can leak the meta-device
+        # context and corrupt subsequent model loads (like upscale).
         model = AutoModelForImageSegmentation.from_pretrained(
-            _model_path, trust_remote_code=True)
+            _model_path, trust_remote_code=True, low_cpu_mem_usage=False)
         model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model

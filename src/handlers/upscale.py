@@ -150,7 +150,12 @@ def load_model(device: torch.device) -> nn.Module:
         state = state["params_ema"]
     elif "params" in state:
         state = state["params"]
-    model.load_state_dict(state, strict=True)
+
+    # If a leaked accelerate init_empty_weights() context left parameters
+    # on meta device, assign=True replaces them with the loaded tensors
+    # instead of trying to copy into meta (which raises NotImplementedError).
+    has_meta = any(p.is_meta for p in model.parameters())
+    model.load_state_dict(state, strict=True, assign=has_meta)
     model.to(device).half().eval()
 
     log.info(f"  Upscale: Loaded RealESRGAN x2plus to {device}")
