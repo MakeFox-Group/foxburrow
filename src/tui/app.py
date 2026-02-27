@@ -100,13 +100,13 @@ class FoxburrowApp(App):
             items = list(self._log_buffer)
             self._log_buffer.clear()
 
-        if not items:
-            return
-
         try:
             log_panel = self.query_one("#log-panel", LogPanel)
-            for line, level in items:
-                log_panel.write_log(line, level)
+            if items:
+                log_panel.write_batch(items)
+            else:
+                # Even with no new items, check if user scrolled back to bottom
+                log_panel.check_auto_resume()
         except Exception as e:
             log.debug(f"TUI log drain error: {e}")
 

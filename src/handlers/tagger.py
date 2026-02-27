@@ -155,6 +155,28 @@ def init_tagger(device: torch.device) -> None:
         )
         model.head = _GatedHead(min(model.head.weight.shape), num_tags)
     safetensors.torch.load_model(model, safetensors_path)
+
+    # timm may create some buffers on the meta device (no backing data).
+    # safetensors only populates parameters present in the file, leaving
+    # those buffers as meta tensors.  Materialize them as zeros on CPU
+    # before the .to(device) call, which can't copy from meta tensors.
+    for name, param in list(model.named_parameters()):
+        if param.is_meta:
+            materialized = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], nn.Parameter(materialized, requires_grad=param.requires_grad))
+    for name, buf in list(model.named_buffers()):
+        if buf.is_meta:
+            materialized = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            parent.register_buffer(parts[-1], materialized)
+
     model.to(device=device, dtype=torch.float16).eval()
 
     # Only hold the lock for the dict write — never during heavy loading.

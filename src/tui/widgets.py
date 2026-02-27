@@ -150,11 +150,13 @@ class GpuPanel(Static):
                 text.append(f" {job.type.value} {stage_name}")
                 if stage:
                     text.append(f" ({job.current_stage_index + 1}/{len(job.pipeline)})")
+                if job.stage_status == "loading":
+                    text.append(" loading...", style="bold yellow")
                 text.append(f" {elapsed:.1f}s", style="dim")
                 text.append("\n")
 
-                # Denoise progress bar
-                if job.denoise_total_steps > 0:
+                # Denoise progress bar (only while denoise stage is running)
+                if job.denoise_total_steps > 0 and job.stage_status == "running":
                     text.append("  ")
                     text.append_text(_progress_bar(job.denoise_step, job.denoise_total_steps))
                     pct = job.denoise_step / job.denoise_total_steps * 100
@@ -223,7 +225,12 @@ _LEVEL_STYLES: dict[LogLevel, str] = {
 
 
 class LogPanel(Vertical):
-    """Scrollable log panel wrapping a RichLog widget."""
+    """Scrollable log panel wrapping a RichLog widget.
+
+    Auto-detects when the user scrolls away from the bottom and pauses
+    auto-scroll so new log lines don't snap back.  Resumes when the user
+    scrolls back to the bottom or presses Space.
+    """
 
     DEFAULT_CSS = """
     LogPanel {
@@ -258,24 +265,57 @@ class LogPanel(Vertical):
         self._rich_log = self.query_one("#tui-rich-log", RichLog)
         self._paused_label = self.query_one("#tui-paused-label", Static)
 
-    def write_log(self, line: str, level: LogLevel = LogLevel.INFO) -> None:
-        """Append a log line with level-appropriate styling."""
-        if self._rich_log is None:
-            return
-        style = _LEVEL_STYLES.get(level, "")
-        text = Text(line, style=style)
-        self._rich_log.write(text)
+    def _is_at_bottom(self) -> bool:
+        """Check if the RichLog is scrolled to (or near) the bottom."""
+        rl = self._rich_log
+        if rl is None:
+            return True
+        # Not enough content to scroll — effectively at bottom
+        if rl.max_scroll_y <= 2:
+            return True
+        return rl.scroll_y >= rl.max_scroll_y - 2
 
-    def toggle_auto_scroll(self) -> None:
-        """Toggle auto-scroll and update the paused indicator."""
-        self._auto_scroll = not self._auto_scroll
+    def _set_paused(self, paused: bool) -> None:
+        """Update auto-scroll state and paused indicator."""
+        self._auto_scroll = not paused
         if self._rich_log is not None:
             self._rich_log.auto_scroll = self._auto_scroll
         if self._paused_label is not None:
-            if self._auto_scroll:
-                self._paused_label.update("")
+            if paused:
+                self._paused_label.update(
+                    Text("[PAUSED — Space or scroll to bottom to resume]",
+                         style="bold yellow"))
             else:
-                self._paused_label.update(Text("[PAUSED]", style="bold yellow"))
+                self._paused_label.update("")
+
+    def write_batch(self, items: list[tuple[str, LogLevel]]) -> None:
+        """Write a batch of log lines, auto-pausing if user scrolled up.
+
+        Called by the drain timer.  Checks scroll position BEFORE writing
+        so that a user who scrolled up won't get snapped back to the bottom.
+        """
+        if self._rich_log is None or not items:
+            return
+
+        # Detect user scroll-up: auto_scroll is on but we're not at bottom
+        if self._auto_scroll and not self._is_at_bottom():
+            self._set_paused(True)
+
+        for line, level in items:
+            style = _LEVEL_STYLES.get(level, "")
+            text = Text(line, style=style)
+            self._rich_log.write(text)
+
+    def check_auto_resume(self) -> None:
+        """Resume auto-scroll if the user has scrolled back to the bottom."""
+        if self._auto_scroll or self._rich_log is None:
+            return
+        if self._is_at_bottom():
+            self._set_paused(False)
+
+    def toggle_auto_scroll(self) -> None:
+        """Manual toggle via Space key."""
+        self._set_paused(self._auto_scroll)
 
     @property
     def is_paused(self) -> bool:

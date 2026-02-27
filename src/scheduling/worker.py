@@ -466,6 +466,16 @@ class GpuWorker:
                      f"(active={self._active_count})")
             self.log_vram_state(f"pre-load {stage.type.value}")
 
+            # Make job visible to TUI immediately (during model loading)
+            if job.started_at is None:
+                job.started_at = datetime.utcnow()
+            job.stage_status = "loading"
+            gpu_info = {"uuid": self._gpu.uuid, "name": self._gpu.name,
+                        "stage": stage.type.value}
+            job.active_gpus = [gpu_info]
+            with self._state_lock:
+                self._active_jobs[job.job_id] = job
+
             # Model loading (serialized) — included in GPU time
             import time as _time
             load_start = _time.monotonic()
@@ -490,15 +500,7 @@ class GpuWorker:
 
             # Execute stage
             try:
-                if job.started_at is None:
-                    job.started_at = datetime.utcnow()
-                with self._state_lock:
-                    self._active_jobs[job.job_id] = job
-
-                # Track GPU for this stage
-                gpu_info = {"uuid": self._gpu.uuid, "name": self._gpu.name,
-                            "stage": stage.type.value}
-                job.active_gpus = [gpu_info]
+                job.stage_status = "running"
 
                 # Measure actual GPU execution time (model loading already measured above)
                 import time as _time
@@ -585,6 +587,8 @@ class GpuWorker:
                 job.current_stage_index += 1
 
                 if job.is_complete:
+                    job.stage_status = ""
+                    job.active_gpus = []
                     with self._state_lock:
                         self._active_jobs.pop(job.job_id, None)
                     result = JobResult(
@@ -602,15 +606,18 @@ class GpuWorker:
                     self._gpu.record_success()
                     log.info(f"  GpuWorker[{self._gpu.uuid}]: {job} completed")
                 else:
+                    job.stage_status = ""
+                    job.active_gpus = []
                     with self._state_lock:
                         self._active_jobs.pop(job.job_id, None)
                     self._gpu.record_success()
                     self._queue.re_enqueue(job)
 
             except Exception as ex:
+                job.stage_status = ""
+                job.active_gpus = []
                 with self._state_lock:
                     self._active_jobs.pop(job.job_id, None)
-                job.active_gpus = []
                 log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
                 if _is_cuda_fatal(ex):
                     log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "
