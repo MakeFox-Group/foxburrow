@@ -740,22 +740,17 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
             )
         else:
             with torch.no_grad():
-                noise_pred_uncond = unet(
-                    latent_input, t,
-                    encoder_hidden_states=neg_prompt_embeds,
+                # Batched CFG: run uncond + cond in a single UNet forward pass
+                latent_in = torch.cat([latent_input, latent_input])
+                out = unet(
+                    latent_in, t,
+                    encoder_hidden_states=torch.cat([neg_prompt_embeds, prompt_embeds]),
                     added_cond_kwargs={
-                        "text_embeds": neg_pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
+                        "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
+                        "time_ids": torch.cat([add_time_ids, add_time_ids]),
                     },
                 ).sample
-                noise_pred_cond = unet(
-                    latent_input, t,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
+                noise_pred_uncond, noise_pred_cond = out.chunk(2)
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
         latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample

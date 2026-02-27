@@ -29,6 +29,13 @@ os.environ.setdefault("HF_HOME", os.path.join(os.path.abspath("data"), "hf_cache
 import torch
 import uvicorn
 
+# Explicitly enable all Scaled Dot-Product Attention backends.
+# This matches Forge's --attention-pytorch behaviour and ensures PyTorch picks
+# the fastest available kernel (flash, mem-efficient, or math) per operation.
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
 import log
 from config import FoxBurrowConfig, _auto_threads
 from gpu.pool import GpuPool
