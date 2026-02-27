@@ -40,12 +40,12 @@ def load_model(device: torch.device) -> torch.nn.Module:
         _orig_get_init_context = PreTrainedModel.get_init_context
 
         @classmethod
-        def _no_meta_init(cls, *args, **kwargs):
+        def _cpu_instead_of_meta(cls, *args, **kwargs):
             contexts = _orig_get_init_context.__func__(cls, *args, **kwargs)
-            return [c for c in contexts
-                    if not (isinstance(c, torch.device) and c.type == "meta")]
+            return [torch.device("cpu") if (isinstance(c, torch.device) and c.type == "meta") else c
+                    for c in contexts]
 
-        PreTrainedModel.get_init_context = _no_meta_init
+        PreTrainedModel.get_init_context = _cpu_instead_of_meta
         try:
             model = AutoModelForImageSegmentation.from_pretrained(
                 _model_path, trust_remote_code=True)
