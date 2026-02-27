@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from gpu.pool import GpuPool
 from scheduling.model_registry import ModelRegistry
-from scheduling.queue import JobQueue
+from scheduling.queue import AdmissionControl, JobQueue
 
 if TYPE_CHECKING:
     from scheduling.job import InferenceJob
@@ -23,6 +23,7 @@ class AppState:
         self.registry: ModelRegistry = ModelRegistry()
         self.pipeline_factory = None
         self.queue: JobQueue = JobQueue()
+        self.admission: AdmissionControl | None = None
         self.scheduler = None
         self.sdxl_models: dict[str, str] = {}
         self.model_scanner: ModelScanner | None = None

@@ -88,6 +88,24 @@ def _resolve_model(model_name: str | None) -> tuple[str | None, str | None]:
     return models[model_name], None
 
 
+def _check_admission(job_type) -> JSONResponse | None:
+    """Check admission control. Returns a 503 error response if rejected, None if admitted."""
+    state = _get_state()
+    if state.admission is None:
+        return None
+    err = state.admission.try_admit(job_type)
+    if err:
+        return _error(503, err)
+    return None
+
+
+def _release_admission(job_type) -> None:
+    """Release an admission slot (used when enqueue fails after admission)."""
+    state = _get_state()
+    if state.admission is not None:
+        state.admission.release(job_type)
+
+
 def _find_gpu_with_tagger(state) -> "GpuInstance | None":
     """Find a GPU with the tagger loaded.
 
@@ -286,10 +304,14 @@ async def status():
                     if g.supports_capability("tag") and is_loaded_on(g.device))
     available_slots["tag"] = tag_count
 
-    # Max concurrent tasks: GPUCount + floor(GPUCount / 2)
-    # Scales naturally with GPU count while preventing oversubscription.
-    num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
-    max_concurrent = num_active_gpus + (num_active_gpus // 2)
+    # Max concurrent tasks and admission snapshot
+    admission_snapshot = None
+    if state.admission is not None:
+        admission_snapshot = state.admission.snapshot()
+        max_concurrent = state.admission.max_concurrent
+    else:
+        num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
+        max_concurrent = num_active_gpus + (num_active_gpus // 2)
 
     # Model scan progress
     model_scan = None
@@ -311,6 +333,7 @@ async def status():
         "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
         "model_scan": model_scan,
         "readiness": readiness,
+        "admission": admission_snapshot,
     }
 
 
@@ -1310,46 +1333,57 @@ async def enqueue_generate(req: GenerateRequest):
     if err:
         return _error(400, err)
 
-    seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
-    orig_w, orig_h = req.width, req.height
-    gen_w, gen_h = _snap_dims(orig_w, orig_h)
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.SDXL_GENERATE)
+        if rejected:
+            return rejected
+        admitted = True
 
-    # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
-    cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
-        req.prompt, req.negative_prompt, req.loras)
+        seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
+        orig_w, orig_h = req.width, req.height
+        gen_w, gen_h = _snap_dims(orig_w, orig_h)
 
-    model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.debug(f"Enqueue generate: {orig_w}x{orig_h} steps={req.steps} "
-             f"cfg={req.cfg_scale} seed={seed} model={model_short}"
-             + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+        # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
+        cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
+            req.prompt, req.negative_prompt, req.loras)
 
-    factory = state.pipeline_factory
-    queue = state.queue
+        model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
+        log.debug(f"Enqueue generate: {orig_w}x{orig_h} steps={req.steps} "
+                 f"cfg={req.cfg_scale} seed={seed} model={model_short}"
+                 + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
-    job = InferenceJob(
-        job_type=JobType.SDXL_GENERATE,
-        pipeline=factory.create_sdxl_pipeline(model_dir),
-        sdxl_input=SdxlJobInput(
-            prompt=cleaned_prompt,
-            negative_prompt=cleaned_neg,
-            width=gen_w,
-            height=gen_h,
-            steps=req.steps,
-            cfg_scale=req.cfg_scale,
-            seed=seed,
-            model_dir=model_dir,
-            loras=all_loras,
-            regional_prompting=req.regional_prompting,
-        ),
-    )
-    job.vae_tile_width = req.vae_tile_width
-    job.vae_tile_height = req.vae_tile_height
-    job.orig_width = orig_w
-    job.orig_height = orig_h
+        factory = state.pipeline_factory
+        queue = state.queue
 
-    _register_job(job)
-    queue.enqueue(job)
-    return {"job_id": job.job_id}
+        job = InferenceJob(
+            job_type=JobType.SDXL_GENERATE,
+            pipeline=factory.create_sdxl_pipeline(model_dir),
+            sdxl_input=SdxlJobInput(
+                prompt=cleaned_prompt,
+                negative_prompt=cleaned_neg,
+                width=gen_w,
+                height=gen_h,
+                steps=req.steps,
+                cfg_scale=req.cfg_scale,
+                seed=seed,
+                model_dir=model_dir,
+                loras=all_loras,
+                regional_prompting=req.regional_prompting,
+            ),
+        )
+        job.vae_tile_width = req.vae_tile_width
+        job.vae_tile_height = req.vae_tile_height
+        job.orig_width = orig_w
+        job.orig_height = orig_h
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.SDXL_GENERATE)
+        raise
 
 
 @router.post("/enqueue/generate-hires")
@@ -1397,54 +1431,65 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
     if base_w == gen_w and base_h == gen_h:
         return _error(400, "Base and hires dimensions are identical — use /enqueue/generate instead.")
 
-    seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.SDXL_GENERATE_HIRES)
+        if rejected:
+            return rejected
+        admitted = True
 
-    # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
-    cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
-        req.prompt, req.negative_prompt, req.loras)
+        seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
 
-    model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.debug(f"Enqueue generate-hires: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
-             f"steps={req.steps} hires_steps={req.hires_steps} "
-             f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
-             f"seed={seed} model={model_short}"
-             + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+        # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
+        cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
+            req.prompt, req.negative_prompt, req.loras)
 
-    factory = state.pipeline_factory
-    queue = state.queue
+        model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
+        log.debug(f"Enqueue generate-hires: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
+                 f"steps={req.steps} hires_steps={req.hires_steps} "
+                 f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
+                 f"seed={seed} model={model_short}"
+                 + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
-    job = InferenceJob(
-        job_type=JobType.SDXL_GENERATE_HIRES,
-        pipeline=factory.create_sdxl_hires_pipeline(model_dir),
-        sdxl_input=SdxlJobInput(
-            prompt=cleaned_prompt,
-            negative_prompt=cleaned_neg,
-            width=base_w,
-            height=base_h,
-            steps=req.steps,
-            cfg_scale=req.cfg_scale,
-            seed=seed,
-            model_dir=model_dir,
-            loras=all_loras,
-            regional_prompting=req.regional_prompting,
-        ),
-        hires_input=SdxlHiresInput(
-            hires_width=gen_w,
-            hires_height=gen_h,
-            hires_steps=req.hires_steps,
-            denoising_strength=req.hires_denoising_strength,
-        ),
-    )
-    job.unet_tile_width = req.unet_tile_width
-    job.unet_tile_height = req.unet_tile_height
-    job.vae_tile_width = req.vae_tile_width
-    job.vae_tile_height = req.vae_tile_height
-    job.orig_width = orig_w
-    job.orig_height = orig_h
+        factory = state.pipeline_factory
+        queue = state.queue
 
-    _register_job(job)
-    queue.enqueue(job)
-    return {"job_id": job.job_id}
+        job = InferenceJob(
+            job_type=JobType.SDXL_GENERATE_HIRES,
+            pipeline=factory.create_sdxl_hires_pipeline(model_dir),
+            sdxl_input=SdxlJobInput(
+                prompt=cleaned_prompt,
+                negative_prompt=cleaned_neg,
+                width=base_w,
+                height=base_h,
+                steps=req.steps,
+                cfg_scale=req.cfg_scale,
+                seed=seed,
+                model_dir=model_dir,
+                loras=all_loras,
+                regional_prompting=req.regional_prompting,
+            ),
+            hires_input=SdxlHiresInput(
+                hires_width=gen_w,
+                hires_height=gen_h,
+                hires_steps=req.hires_steps,
+                denoising_strength=req.hires_denoising_strength,
+            ),
+        )
+        job.unet_tile_width = req.unet_tile_width
+        job.unet_tile_height = req.unet_tile_height
+        job.vae_tile_width = req.vae_tile_width
+        job.vae_tile_height = req.vae_tile_height
+        job.orig_width = orig_w
+        job.orig_height = orig_h
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.SDXL_GENERATE_HIRES)
+        raise
 
 
 @router.post("/enqueue/upscale")
@@ -1462,20 +1507,31 @@ async def enqueue_upscale(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.debug(f"Enqueue upscale: {input_image.width}x{input_image.height}")
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.UPSCALE)
+        if rejected:
+            return rejected
+        admitted = True
 
-    factory = state.pipeline_factory
-    queue = state.queue
+        log.debug(f"Enqueue upscale: {input_image.width}x{input_image.height}")
 
-    job = InferenceJob(
-        job_type=JobType.UPSCALE,
-        pipeline=factory.create_upscale_pipeline(),
-        input_image=input_image,
-    )
+        factory = state.pipeline_factory
+        queue = state.queue
 
-    _register_job(job)
-    queue.enqueue(job)
-    return {"job_id": job.job_id}
+        job = InferenceJob(
+            job_type=JobType.UPSCALE,
+            pipeline=factory.create_upscale_pipeline(),
+            input_image=input_image,
+        )
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.UPSCALE)
+        raise
 
 
 @router.post("/enqueue/bgremove")
@@ -1493,20 +1549,31 @@ async def enqueue_bgremove(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.debug(f"Enqueue bgremove: {input_image.width}x{input_image.height}")
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.BGREMOVE)
+        if rejected:
+            return rejected
+        admitted = True
 
-    factory = state.pipeline_factory
-    queue = state.queue
+        log.debug(f"Enqueue bgremove: {input_image.width}x{input_image.height}")
 
-    job = InferenceJob(
-        job_type=JobType.BGREMOVE,
-        pipeline=factory.create_bgremove_pipeline(),
-        input_image=input_image,
-    )
+        factory = state.pipeline_factory
+        queue = state.queue
 
-    _register_job(job)
-    queue.enqueue(job)
-    return {"job_id": job.job_id}
+        job = InferenceJob(
+            job_type=JobType.BGREMOVE,
+            pipeline=factory.create_bgremove_pipeline(),
+            input_image=input_image,
+        )
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.BGREMOVE)
+        raise
 
 
 @router.post("/enqueue/tag")
@@ -1632,68 +1699,79 @@ async def enqueue_enhance(request: Request):
     if err:
         return _error(400, err)
 
-    # Base dimensions = original input image size
-    base_w = input_image.width
-    base_h = input_image.height
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.ENHANCE)
+        if rejected:
+            return rejected
+        admitted = True
 
-    # Only upscale if the input image is smaller than the target in either dimension
-    needs_upscale = base_w < gen_hires_w or base_h < gen_hires_h
+        # Base dimensions = original input image size
+        base_w = input_image.width
+        base_h = input_image.height
 
-    if not needs_upscale:
-        # Image is already large enough — just resize to target dimensions
-        if base_w != gen_hires_w or base_h != gen_hires_h:
-            input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
-            log.debug(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
-                     f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
+        # Only upscale if the input image is smaller than the target in either dimension
+        needs_upscale = base_w < gen_hires_w or base_h < gen_hires_h
 
-    # Parse LoRA tags from prompt
-    cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
-        prompt, negative_prompt, None)
+        if not needs_upscale:
+            # Image is already large enough — just resize to target dimensions
+            if base_w != gen_hires_w or base_h != gen_hires_h:
+                input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
+                log.debug(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
+                         f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
 
-    model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.debug(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
-             f"upscale={'yes' if needs_upscale else 'no'} "
-             f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
-             f"cfg={cfg_scale} seed={seed} model={model_short}"
-             + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+        # Parse LoRA tags from prompt
+        cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
+            prompt, negative_prompt, None)
 
-    factory = state.pipeline_factory
-    queue = state.queue
+        model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
+        log.debug(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
+                 f"upscale={'yes' if needs_upscale else 'no'} "
+                 f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
+                 f"cfg={cfg_scale} seed={seed} model={model_short}"
+                 + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
-    job = InferenceJob(
-        job_type=JobType.ENHANCE,
-        pipeline=factory.create_enhance_pipeline(model_dir, needs_upscale=needs_upscale),
-        sdxl_input=SdxlJobInput(
-            prompt=cleaned_prompt,
-            negative_prompt=cleaned_neg,
-            width=base_w,
-            height=base_h,
-            steps=0,  # not used for enhance — hires_steps drives denoise
-            cfg_scale=cfg_scale,
-            seed=seed,
-            model_dir=model_dir,
-            loras=all_loras,
-            regional_prompting=qp.get("regional_prompting", "false").lower() == "true",
-        ),
-        hires_input=SdxlHiresInput(
-            hires_width=gen_hires_w,
-            hires_height=gen_hires_h,
-            hires_steps=hires_steps,
-            denoising_strength=denoising_strength,
-        ),
-        input_image=input_image,
-    )
-    job.is_hires_pass = True  # denoise uses hires path from the start
-    job.unet_tile_width  = unet_tile_w
-    job.unet_tile_height = unet_tile_h
-    job.vae_tile_width   = vae_tile_w
-    job.vae_tile_height  = vae_tile_h
-    job.orig_width = orig_hires_w
-    job.orig_height = orig_hires_h
+        factory = state.pipeline_factory
+        queue = state.queue
 
-    _register_job(job)
-    queue.enqueue(job)
-    return {"job_id": job.job_id}
+        job = InferenceJob(
+            job_type=JobType.ENHANCE,
+            pipeline=factory.create_enhance_pipeline(model_dir, needs_upscale=needs_upscale),
+            sdxl_input=SdxlJobInput(
+                prompt=cleaned_prompt,
+                negative_prompt=cleaned_neg,
+                width=base_w,
+                height=base_h,
+                steps=0,  # not used for enhance — hires_steps drives denoise
+                cfg_scale=cfg_scale,
+                seed=seed,
+                model_dir=model_dir,
+                loras=all_loras,
+                regional_prompting=qp.get("regional_prompting", "false").lower() == "true",
+            ),
+            hires_input=SdxlHiresInput(
+                hires_width=gen_hires_w,
+                hires_height=gen_hires_h,
+                hires_steps=hires_steps,
+                denoising_strength=denoising_strength,
+            ),
+            input_image=input_image,
+        )
+        job.is_hires_pass = True  # denoise uses hires path from the start
+        job.unet_tile_width  = unet_tile_w
+        job.unet_tile_height = unet_tile_h
+        job.vae_tile_width   = vae_tile_w
+        job.vae_tile_height  = vae_tile_h
+        job.orig_width = orig_hires_w
+        job.orig_height = orig_hires_h
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.ENHANCE)
+        raise
 
 
 # ====================================================================

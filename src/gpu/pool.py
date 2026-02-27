@@ -558,7 +558,7 @@ class GpuPool:
         return None
 
     def available_count(self, cap: str) -> int:
-        return sum(1 for g in self.gpus if g.supports_capability(cap))
+        return sum(1 for g in self.gpus if not g.is_failed and g.supports_capability(cap))
 
     def get_all_capabilities(self) -> set[str]:
         caps: set[str] = set()

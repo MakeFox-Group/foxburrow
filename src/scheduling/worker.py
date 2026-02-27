@@ -659,6 +659,7 @@ class GpuWorker:
                     )
                     self._store_job_result(job, result)
                     job.completed_at = datetime.utcnow()
+                    self._release_admission(job)
                     job.set_result(result)
                     self._broadcast_complete(job, success=True)
                     self._gpu.record_success()
@@ -683,6 +684,7 @@ class GpuWorker:
                     for w in self._all_workers:
                         w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
                     job.completed_at = datetime.utcnow()
+                    self._release_admission(job)
                     job.set_result(JobResult(success=False, error=str(ex)))
                     self._broadcast_complete(job, success=False, error=str(ex))
                 elif isinstance(ex, torch.cuda.OutOfMemoryError):
@@ -698,6 +700,7 @@ class GpuWorker:
                     log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
                     self._gpu.record_failure()
                     job.completed_at = datetime.utcnow()
+                    self._release_admission(job)
                     job.set_result(JobResult(success=False, error=str(ex)))
                     self._broadcast_complete(job, success=False, error=str(ex))
 
@@ -715,6 +718,7 @@ class GpuWorker:
                 for w in self._all_workers:
                     w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
                 job.completed_at = datetime.utcnow()
+                self._release_admission(job)
                 job.set_result(JobResult(success=False, error=str(ex)))
                 self._broadcast_complete(job, success=False, error=str(ex))
             elif isinstance(ex, torch.cuda.OutOfMemoryError):
@@ -728,6 +732,7 @@ class GpuWorker:
             else:
                 log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
                 job.completed_at = datetime.utcnow()
+                self._release_admission(job)
                 job.set_result(JobResult(success=False, error=str(ex)))
                 self._broadcast_complete(job, success=False, error=str(ex))
 
@@ -809,6 +814,12 @@ class GpuWorker:
                     streamer.broadcast_complete(job, success, error), self._loop)
         except Exception:
             pass  # WebSocket broadcast is best-effort
+
+    def _release_admission(self, job: InferenceJob) -> None:
+        """Release the admission control slot for a completed job."""
+        from state import app_state
+        if app_state.admission is not None:
+            app_state.admission.release(job.type)
 
     def _ensure_models_for_stage(self, stage: WorkStage, job: InferenceJob) -> None:
         """Load model components required for the given stage."""

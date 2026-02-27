@@ -768,6 +768,10 @@ def main() -> None:
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
 
+    # Initialize admission control (after capabilities are finalized)
+    from scheduling.queue import AdmissionControl
+    app_state.admission = AdmissionControl(app_state.gpu_pool)
+
     # Create pipeline factory
     app_state.pipeline_factory = PipelineFactory(app_state.registry)
 
