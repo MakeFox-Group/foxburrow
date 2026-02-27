@@ -2023,7 +2023,10 @@ class BiRefNet(
                 if 'bb.' in key and 'refiner.' not in key:
                     value.requires_grad = False
 
-        self.post_init()
+        # NOTE: self.post_init() intentionally omitted — it triggers
+        # HuggingFace's _init_weights which conflicts with some PyTorch
+        # versions (_is_hf_initialized kwarg error).  Weights are loaded
+        # from a checkpoint anyway, so random init is unnecessary.
 
     def forward_enc(self, x):
         if self.config.bb in ['vgg16', 'vgg16bn', 'resnet50']:
