@@ -19,6 +19,37 @@ from api.websocket import streamer
 from config import GpuConfig
 from gpu import nvml
 
+# Save originals at import time — before any accelerate context can patch them.
+# accelerate's init_empty_weights() monkey-patches these to create meta tensors;
+# if the context leaks, ALL subsequent model construction is broken process-wide.
+_ORIG_REGISTER_PARAMETER = nn.Module.register_parameter
+_ORIG_REGISTER_BUFFER = nn.Module.register_buffer
+
+
+def repair_accelerate_leak() -> bool:
+    """Detect and repair a leaked accelerate init_empty_weights() context.
+
+    accelerate's init_empty_weights() monkey-patches nn.Module.register_parameter
+    and nn.Module.register_buffer to create meta tensors.  If the context doesn't
+    exit cleanly (threading, exceptions), these patches persist process-wide,
+    breaking ALL subsequent model construction.
+
+    Returns True if a leak was detected and repaired.
+    """
+    test = nn.Linear(1, 1, bias=False)
+    if not test.weight.is_meta:
+        return False
+    log.warning("  Detected leaked accelerate init_empty_weights() context "
+                "— restoring nn.Module")
+    nn.Module.register_parameter = _ORIG_REGISTER_PARAMETER
+    nn.Module.register_buffer = _ORIG_REGISTER_BUFFER
+    # Verify
+    test2 = nn.Linear(1, 1, bias=False)
+    if test2.weight.is_meta:
+        log.error("  Failed to repair accelerate leak!")
+        return False
+    return True
+
 
 def fix_meta_tensors(model: nn.Module) -> int:
     """Replace any remaining meta tensors in a model with zero-filled tensors.

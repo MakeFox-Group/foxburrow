@@ -14,7 +14,7 @@ from torchvision.transforms import transforms, InterpolationMode
 import torchvision.transforms.functional as TF
 
 import log
-from gpu.pool import fix_meta_tensors
+from gpu.pool import fix_meta_tensors, repair_accelerate_leak
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -28,11 +28,6 @@ _tagger_lock = threading.Lock()
 # Separate lock for timm.create_model() which is NOT thread-safe
 _model_create_lock = threading.Lock()
 
-# Save originals at import time — before any accelerate context can patch them.
-# accelerate's init_empty_weights() monkey-patches these to create meta tensors;
-# if the context leaks, ALL subsequent model construction is broken process-wide.
-_ORIG_REGISTER_PARAMETER = nn.Module.register_parameter
-_ORIG_REGISTER_BUFFER = nn.Module.register_buffer
 
 
 # ====================================================================
@@ -112,29 +107,6 @@ def set_model_path(path: str) -> None:
     _model_path = path
 
 
-def _repair_accelerate_leak() -> None:
-    """Detect and repair a leaked accelerate init_empty_weights() context.
-
-    accelerate's init_empty_weights() monkey-patches nn.Module.register_parameter
-    and nn.Module.register_buffer to create meta tensors.  If the context manager
-    doesn't exit cleanly (e.g. exception inside timm.create_model()), these patches
-    persist process-wide, breaking ALL subsequent model construction.
-
-    We detect the leak by creating a tiny test module and checking if its
-    parameters end up on the meta device, then restore the originals we saved
-    at import time.
-    """
-    test = nn.Linear(1, 1, bias=False)
-    if not test.weight.is_meta:
-        return  # No leak
-    log.warning("  Tagger: Detected leaked accelerate init_empty_weights() "
-                "context — restoring nn.Module")
-    nn.Module.register_parameter = _ORIG_REGISTER_PARAMETER
-    nn.Module.register_buffer = _ORIG_REGISTER_BUFFER
-    # Verify
-    test2 = nn.Linear(1, 1, bias=False)
-    if test2.weight.is_meta:
-        log.warning("  Tagger: Failed to repair accelerate leak!")
 
 
 def init_tagger(device: torch.device) -> None:
@@ -190,7 +162,7 @@ def init_tagger(device: torch.device) -> None:
     # timm may leak accelerate's init_empty_weights() context, which
     # monkey-patches nn.Module globally to create meta tensors.  Detect
     # and repair this BEFORE doing anything else with nn.Module.
-    _repair_accelerate_leak()
+    repair_accelerate_leak()
 
     # Fix any meta tensors left by timm/accelerate in the model.
     n = fix_meta_tensors(model)

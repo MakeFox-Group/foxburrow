@@ -21,14 +21,19 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 
 import log
 from gpu import nvml
-from gpu.pool import fix_meta_tensors
+from gpu.pool import fix_meta_tensors, repair_accelerate_leak
 from scheduling.job import InferenceJob, SdxlTokenizeResult, SdxlEncodeResult, SdxlRegionalEncodeResult
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
 
 def _fix_from_pretrained(model: torch.nn.Module, label: str) -> None:
-    """Fix meta tensors left behind by from_pretrained()/accelerate."""
+    """Fix meta tensors left behind by from_pretrained()/accelerate.
+
+    Also repairs any leaked accelerate init_empty_weights() context so
+    that subsequent model construction (on any thread) isn't poisoned.
+    """
+    repair_accelerate_leak()
     n = fix_meta_tensors(model)
     if n:
         log.info(f"  SDXL: Fixed {n} meta tensor(s) in {label}")
