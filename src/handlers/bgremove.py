@@ -34,7 +34,7 @@ def load_model(device: torch.device) -> torch.nn.Module:
         from transformers import AutoModelForImageSegmentation
 
         model = AutoModelForImageSegmentation.from_pretrained(
-            _model_path, trust_remote_code=True, device_map="cpu")
+            _model_path, trust_remote_code=True, low_cpu_mem_usage=False)
         model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
