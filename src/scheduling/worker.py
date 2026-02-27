@@ -16,10 +16,7 @@ import contextlib
 import log
 from gpu import nvml
 from gpu.pool import GpuInstance
-from gpu.torch_ext import (
-    HAS_ALLOC_TAGS, HAS_HISTOGRAM, HAS_PEAK_SCOPE,
-    ALLOC_TAG_ACTIVATIONS, ALLOC_TAG_MODEL_WEIGHTS,
-)
+from gpu import torch_ext
 from scheduling.job import (
     InferenceJob, JobResult, JobType, StageType, WorkStage,
 )
@@ -411,9 +408,9 @@ class GpuWorker:
         # When tag-based tracking is available, log exact model VRAM for
         # diagnostics (helps identify estimate drift vs actual usage).
         tag_info = ""
-        if HAS_ALLOC_TAGS:
+        if torch_ext.HAS_ALLOC_TAGS:
             actual_model_vram = torch.cuda.memory_allocated_by_tag(
-                ALLOC_TAG_MODEL_WEIGHTS, gpu.device)
+                torch_ext.ALLOC_TAG_MODEL_WEIGHTS, gpu.device)
             tag_info = f", tag_models={actual_model_vram // (1024**2)}MB"
 
         fits = available >= total_needed
@@ -461,7 +458,7 @@ class GpuWorker:
             source = f" ({m['source']})" if m.get('source') else ""
             log.info(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
 
-        if HAS_HISTOGRAM:
+        if torch_ext.HAS_HISTOGRAM:
             hist = torch.cuda.allocation_histogram(gpu.device)
             large_bins = {k: v for k, v in hist.items()
                           if v["count"] > 0 and v["total_bytes"] > 10 * 1024**2}
@@ -553,7 +550,7 @@ class GpuWorker:
                 # which races with concurrent stages.
                 peak_scope = None
                 mem_baseline = 0
-                if HAS_PEAK_SCOPE:
+                if torch_ext.HAS_PEAK_SCOPE:
                     peak_scope = torch.cuda.PeakMemoryScope(device=self._gpu.device)
                     peak_scope.__enter__()
                 else:
@@ -802,8 +799,8 @@ class GpuWorker:
             # Load the model component, measuring actual VRAM usage
             from handlers.sdxl import load_component
             before = torch.cuda.memory_allocated(self._gpu.device)
-            tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
-                       if HAS_ALLOC_TAGS else contextlib.nullcontext())
+            tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
+                       if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
             with tag_ctx:
                 model = load_component(component.category, model_dir, self._gpu.device)
             after = torch.cuda.memory_allocated(self._gpu.device)
@@ -857,8 +854,8 @@ class GpuWorker:
             self._gpu.ensure_free_vram(comp.estimated_vram_bytes,
                                        protect={comp.fingerprint})
         before = torch.cuda.memory_allocated(self._gpu.device)
-        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
-                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
+                   if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
         with tag_ctx:
             model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
@@ -893,8 +890,8 @@ class GpuWorker:
             self._gpu.ensure_free_vram(comp.estimated_vram_bytes,
                                        protect={comp.fingerprint})
         before = torch.cuda.memory_allocated(self._gpu.device)
-        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_MODEL_WEIGHTS)
-                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
+                   if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
         with tag_ctx:
             model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
@@ -962,8 +959,8 @@ class GpuWorker:
         """Execute a single job's current stage. Returns output image for final stages."""
         # Tag all allocations during stage execution as activations (thread-local,
         # must be set here on the executor thread — not on the asyncio event loop).
-        tag_ctx = (torch.cuda.tag_allocations(ALLOC_TAG_ACTIVATIONS)
-                   if HAS_ALLOC_TAGS else contextlib.nullcontext())
+        tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_ACTIVATIONS)
+                   if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
         with tag_ctx:
             return self._dispatch_stage(job, stage)
 
