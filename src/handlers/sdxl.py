@@ -755,6 +755,16 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
         latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
 
+    # Diagnostic: check latent health after denoising
+    lat_min = latents.min().item()
+    lat_max = latents.max().item()
+    lat_has_nan = torch.isnan(latents).any().item()
+    if lat_has_nan or (lat_min == 0 and lat_max == 0):
+        log.warning(f"  SDXL: Denoise — BAD latents after denoising: "
+                    f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
+    else:
+        log.info(f"  SDXL: Denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
+
     job.latents = latents
 
 
@@ -1044,6 +1054,16 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         state.uncond_text_embeds = None
         unet.set_attn_processor(original_procs)
 
+    # Diagnostic: check latent health after regional denoising
+    lat_min = latents.min().item()
+    lat_max = latents.max().item()
+    lat_has_nan = torch.isnan(latents).any().item()
+    if lat_has_nan or (lat_min == 0 and lat_max == 0):
+        log.warning(f"  SDXL: Regional denoise — BAD latents: "
+                    f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
+    else:
+        log.info(f"  SDXL: Regional denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
+
     job.latents = latents
 
 
@@ -1077,15 +1097,44 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
     lat_tile_w = tile_w // 8
     lat_tile_h = tile_h // 8
 
+    # Diagnostic: check latent stats before decode
+    lat_min = scaled_latents.min().item()
+    lat_max = scaled_latents.max().item()
+    lat_has_nan = torch.isnan(scaled_latents).any().item()
+    if lat_has_nan or (lat_min == 0 and lat_max == 0):
+        log.warning(f"  SDXL: VAE decode — BAD latents before decode: "
+                    f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
+
     # Use tiled decode if image needs splitting
     if lat_w > lat_tile_w or lat_h > lat_tile_h:
         image = _vae_decode_tiled(scaled_latents, vae, lat_tile_w, lat_tile_h, job=job)
     else:
         with torch.no_grad():
             decoded = vae.decode(scaled_latents.to(device)).sample
+
+        # Diagnostic: check decoded tensor stats
+        dec_min = decoded.min().item()
+        dec_max = decoded.max().item()
+        dec_has_nan = torch.isnan(decoded).any().item()
+        dec_mean = decoded.mean().item()
+        if dec_has_nan or dec_max - dec_min < 0.01:
+            log.warning(f"  SDXL: VAE decode — BAD decoded tensor: "
+                        f"min={dec_min:.4f} max={dec_max:.4f} mean={dec_mean:.4f} "
+                        f"has_nan={dec_has_nan}")
+
         image = _tensor_to_pil(decoded)
 
-    log.info(f"  SDXL: VAE decode complete. Image={image.width}x{image.height}")
+    # Detect suspiciously dark output
+    arr = np.array(image)
+    mean_pixel = arr.mean()
+    if mean_pixel < 5.0:
+        log.warning(f"  SDXL: VAE decode — BLACK IMAGE detected! "
+                    f"mean_pixel={mean_pixel:.2f} "
+                    f"latent_range=[{lat_min:.4f}, {lat_max:.4f}] "
+                    f"has_nan={lat_has_nan}")
+
+    log.info(f"  SDXL: VAE decode complete. Image={image.width}x{image.height} "
+             f"mean_px={mean_pixel:.1f}")
     return image
 
 
@@ -1688,11 +1737,18 @@ def _get_cached_model(gpu: GpuInstance, category: str,
         cached = gpu.get_cached_model(fp)
         if cached:
             return cached.model
+        log.warning(f"  _get_cached_model: fingerprint lookup FAILED for "
+                    f"{category} fp={fp[:16]}… on GPU [{gpu.uuid}] — "
+                    f"falling back to category scan")
 
     # Fallback: category scan (for callers without fingerprint context)
     with gpu._cache_lock:
         for cached in gpu._cache.values():
             if cached.category == category:
+                if fp:
+                    log.warning(f"  _get_cached_model: category fallback found "
+                                f"{category} fp={cached.fingerprint[:16]}… "
+                                f"(wanted {fp[:16]}…)")
                 return cached.model
     raise RuntimeError(f"Model {category} not found in GPU [{gpu.uuid}] cache")
 
@@ -1705,9 +1761,16 @@ def _get_cached_model_optional(gpu: GpuInstance, category: str,
         cached = gpu.get_cached_model(fp)
         if cached:
             return cached.model
+        log.warning(f"  _get_cached_model_optional: fingerprint lookup FAILED for "
+                    f"{category} fp={fp[:16]}… on GPU [{gpu.uuid}] — "
+                    f"falling back to category scan")
 
     with gpu._cache_lock:
         for cached in gpu._cache.values():
             if cached.category == category:
+                if fp:
+                    log.warning(f"  _get_cached_model_optional: category fallback found "
+                                f"{category} fp={cached.fingerprint[:16]}… "
+                                f"(wanted {fp[:16]}…)")
                 return cached.model
     return None
