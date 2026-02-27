@@ -20,8 +20,8 @@ class VramEstimates:
     SDXL_TEXT_ENCODER_1 = 250 * 1024 * 1024    # ~250 MB (fp16 CLIP-L)
     SDXL_TEXT_ENCODER_2 = 1400 * 1024 * 1024   # ~1400 MB (fp16 CLIP-bigG, measured ~1324 MB)
     SDXL_UNET = 5200 * 1024 * 1024             # ~5.2 GB (fp16 UNet, measured ~4897-5135 MB)
-    SDXL_VAE_DECODER = 170 * 1024 * 1024       # ~170 MB (fp16 VAE dec, measured ~161 MB)
-    SDXL_VAE_ENCODER = 170 * 1024 * 1024       # ~170 MB (fp16 VAE enc, measured ~161 MB)
+    SDXL_VAE_DECODER = 340 * 1024 * 1024       # ~340 MB (fp32 VAE dec, ~2x fp16)
+    SDXL_VAE_ENCODER = 340 * 1024 * 1024       # ~340 MB (fp32 VAE enc, ~2x fp16)
     UPSCALE = 400 * 1024 * 1024                # ~400 MB
     BGREMOVE = 450 * 1024 * 1024               # ~450 MB (measured ~440 MB)
     TAGGER = 900 * 1024 * 1024                 # ~900 MB (measured ~856-898 MB)

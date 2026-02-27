@@ -236,11 +236,13 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         return model
 
     elif category in ("sdxl_vae", "sdxl_vae_enc"):
+        # VAE must run in float32 — float16 causes NaN overflow in the decoder
+        # for certain latent distributions (a well-known SDXL VAE issue).
         model = AutoencoderKL.from_pretrained(
-            model_dir, subfolder="vae", torch_dtype=dtype)
+            model_dir, subfolder="vae", torch_dtype=torch.float32)
         model.to(device)
         model.eval()
-        log.info(f"  SDXL: Loaded VAE to {device}")
+        log.info(f"  SDXL: Loaded VAE (float32) to {device}")
         return model
 
     else:
@@ -268,7 +270,14 @@ def _load_component_from_single_file(
     # Without this, .to(device) would move the shared reference and break
     # any other GPU that was using the same model object.
     model = copy.deepcopy(components[cache_key])
-    model.to(device)
+
+    # VAE must run in float32 — float16 causes NaN overflow in the decoder
+    # for certain latent distributions (a well-known SDXL VAE issue).
+    if category in ("sdxl_vae", "sdxl_vae_enc"):
+        model.to(device=device, dtype=torch.float32)
+    else:
+        model.to(device)
+
     log.info(f"  SDXL: Moved {category} to {device} (from checkpoint cache)")
     return model
 
@@ -1437,7 +1446,7 @@ def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
 
     arr = np.array(image.convert("RGB"), dtype=np.float32)
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    t = (t / 127.5 - 1.0).to(dtype=torch.float16, device=device)
+    t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
 
     with torch.no_grad():
         dist = vae.encode(t).latent_dist
@@ -1496,7 +1505,7 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
 
             tile_np = arr[py:py2, px:px2]
             t = torch.from_numpy(tile_np).permute(2, 0, 1).unsqueeze(0)
-            t = (t / 127.5 - 1.0).to(dtype=torch.float16, device=device)
+            t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
 
             with torch.no_grad():
                 tile_lat_t = vae.encode(t).latent_dist.mean * VAE_SCALE_FACTOR
