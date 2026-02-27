@@ -250,6 +250,7 @@ class GpuWorker:
         self._state_lock = threading.Lock()
         self._active_count = 0
         self._active_session_counts: dict[str, int] = defaultdict(int)
+        self._active_stage_counts: dict[StageType, int] = defaultdict(int)
         self._active_jobs: dict[str, InferenceJob] = {}
 
         # Model loading serialization
@@ -339,6 +340,10 @@ class GpuWorker:
 
         with self._state_lock:
             if self._active_count >= MAX_CONCURRENCY:
+                return False
+
+            # Per-stage-type limit: never run the same stage type twice on one GPU
+            if self._active_stage_counts[stage.type] >= 1:
                 return False
 
             max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
@@ -448,6 +453,7 @@ class GpuWorker:
                 if not self._gpu.try_acquire():
                     raise RuntimeError(f"GPU [{self._gpu.uuid}] semaphore unexpectedly held")
             self._active_count += 1
+            self._active_stage_counts[stage.type] += 1
             key = get_session_key(stage.type)
             if key:
                 self._active_session_counts[key] += 1
@@ -665,6 +671,8 @@ class GpuWorker:
                 became_idle = False
                 with self._state_lock:
                     self._active_count -= 1
+                    self._active_stage_counts[stage.type] = max(
+                        0, self._active_stage_counts[stage.type] - 1)
                     key = get_session_key(stage.type)
                     if key:
                         self._active_session_counts[key] = max(

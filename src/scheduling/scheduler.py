@@ -181,9 +181,11 @@ class GpuScheduler:
         # Starvation prevention
         score += int(10 * group.oldest_age_seconds)
 
-        # Prefer idle workers
+        # Prefer less-loaded GPUs — spread work across devices
         if worker.is_idle:
-            score += 100
+            score += 200
+        else:
+            score -= 300 * worker.active_count
 
         return score
 
