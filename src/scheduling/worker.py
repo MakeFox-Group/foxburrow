@@ -916,6 +916,13 @@ class GpuWorker:
         """Execute a single job's current stage. Returns output image for final stages."""
         from PIL import Image
 
+        # Store fingerprint mapping so handlers retrieve the correct model instance
+        # when multiple models of the same category are cached (e.g. two sdxl_te1
+        # from different checkpoints).  Without this, _get_cached_model returns the
+        # LRU entry — which may be an unprotected model that gets evicted mid-inference.
+        job._stage_model_fps = {c.category: c.fingerprint
+                                for c in stage.required_components}
+
         # Move intermediate tensors to this GPU if they were produced on a different one
         self._migrate_tensors_to_device(job)
 

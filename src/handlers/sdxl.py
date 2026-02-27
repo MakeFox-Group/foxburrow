@@ -380,8 +380,8 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     log.info("  SDXL: Running text encoders...")
 
     # Get models from GPU cache
-    te1 = _get_cached_model(gpu, "sdxl_te1")
-    te2 = _get_cached_model(gpu, "sdxl_te2")
+    te1 = _get_cached_model(gpu, "sdxl_te1", job)
+    te2 = _get_cached_model(gpu, "sdxl_te2", job)
 
     device = gpu.device
 
@@ -432,8 +432,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
     log.info(f"  SDXL: Running regional text encoders ({len(region_toks)} regions)...")
 
-    te1 = _get_cached_model(gpu, "sdxl_te1")
-    te2 = _get_cached_model(gpu, "sdxl_te2")
+    te1 = _get_cached_model(gpu, "sdxl_te1", job)
+    te2 = _get_cached_model(gpu, "sdxl_te2", job)
     device = gpu.device
 
     region_embeds: list[torch.Tensor] = []
@@ -625,7 +625,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     # Different seed for hires to avoid correlated noise
     scheduler_seed = (inp.seed ^ 0x9E3779B9) if is_hires else inp.seed
 
-    unet = _get_cached_model(gpu, "sdxl_unet")
+    unet = _get_cached_model(gpu, "sdxl_unet", job)
     device = gpu.device
 
     # Apply LoRA adapters if requested
@@ -861,7 +861,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
     scheduler_seed = (inp.seed ^ 0x9E3779B9) if is_hires else inp.seed
 
-    unet = _get_cached_model(gpu, "sdxl_unet")
+    unet = _get_cached_model(gpu, "sdxl_unet", job)
     device = gpu.device
 
     # Apply LoRA adapters if requested
@@ -1053,7 +1053,7 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
     if latents is None:
         raise RuntimeError("Latents are required for VAE decoding.")
 
-    vae = _get_cached_model(gpu, "sdxl_vae")
+    vae = _get_cached_model(gpu, "sdxl_vae", job)
     device = gpu.device
 
     # Scale latent and match VAE dtype/device
@@ -1094,7 +1094,7 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     if job.input_image is None:
         raise RuntimeError("input_image is required for VAE encode.")
 
-    vae = _get_cached_model(gpu, "sdxl_vae")
+    vae = _get_cached_model(gpu, "sdxl_vae", job)
     device = gpu.device
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
@@ -1140,7 +1140,7 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
     target_w = hires.hires_width
     target_h = hires.hires_height
 
-    vae = _get_cached_model(gpu, "sdxl_vae")
+    vae = _get_cached_model(gpu, "sdxl_vae", job)
 
     scaled = latents.to(device=device, dtype=vae.dtype) / VAE_SCALE_FACTOR
     hires_lat_h = scaled.shape[2]
@@ -1672,8 +1672,24 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
              f"({n_unet_keys} unet params, {elapsed_ms:.0f}ms)")
 
 
-def _get_cached_model(gpu: GpuInstance, category: str) -> object:
-    """Retrieve a loaded model from the GPU cache by category."""
+def _get_cached_model(gpu: GpuInstance, category: str,
+                      job: "InferenceJob | None" = None) -> object:
+    """Retrieve a loaded model from the GPU cache.
+
+    When *job* is provided and carries ``_stage_model_fps`` (set by the worker
+    before execution), the exact fingerprint is used for lookup.  This prevents
+    returning the wrong model when multiple instances of the same category are
+    cached (e.g. two sdxl_te1 from different checkpoints) — the LRU entry might
+    be unprotected by active fingerprints and get evicted mid-inference.
+    """
+    # Exact fingerprint lookup (preferred — race-safe)
+    fp = getattr(job, '_stage_model_fps', {}).get(category) if job else None
+    if fp:
+        cached = gpu.get_cached_model(fp)
+        if cached:
+            return cached.model
+
+    # Fallback: category scan (for callers without fingerprint context)
     with gpu._cache_lock:
         for cached in gpu._cache.values():
             if cached.category == category:
@@ -1681,8 +1697,15 @@ def _get_cached_model(gpu: GpuInstance, category: str) -> object:
     raise RuntimeError(f"Model {category} not found in GPU [{gpu.uuid}] cache")
 
 
-def _get_cached_model_optional(gpu: GpuInstance, category: str) -> object | None:
-    """Retrieve a loaded model from the GPU cache by category, or None if not loaded."""
+def _get_cached_model_optional(gpu: GpuInstance, category: str,
+                               job: "InferenceJob | None" = None) -> object | None:
+    """Retrieve a loaded model from the GPU cache, or None if not loaded."""
+    fp = getattr(job, '_stage_model_fps', {}).get(category) if job else None
+    if fp:
+        cached = gpu.get_cached_model(fp)
+        if cached:
+            return cached.model
+
     with gpu._cache_lock:
         for cached in gpu._cache.values():
             if cached.category == category:
