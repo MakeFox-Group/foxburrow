@@ -380,7 +380,7 @@ class PyramidVisionTransformerImpr(nn.Module):
                                               embed_dim=embed_dims[3])
 
         # transformer encoder
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        dpr = np.linspace(0, drop_path_rate, sum(depths)).tolist()  # stochastic depth decay rule
         cur = 0
         self.block1 = nn.ModuleList([Block(
             dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -439,7 +439,7 @@ class PyramidVisionTransformerImpr(nn.Module):
             #load_checkpoint(self, pretrained, map_location='cpu', strict=False, logger=logger)
 
     def reset_drop_path(self, drop_path_rate):
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(self.depths))]
+        dpr = np.linspace(0, drop_path_rate, sum(self.depths)).tolist()
         cur = 0
         for i in range(self.depths[0]):
             self.block1[i].drop_path.drop_prob = dpr[cur + i]
@@ -1128,7 +1128,7 @@ class SwinTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         # stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        dpr = np.linspace(0, drop_path_rate, sum(depths)).tolist()  # stochastic depth decay rule
 
         # build layers
         self.layers = nn.ModuleList()
@@ -2022,6 +2022,8 @@ class BiRefNet(
             for key, value in self.named_parameters():
                 if 'bb.' in key and 'refiner.' not in key:
                     value.requires_grad = False
+
+        self.post_init()
 
     def forward_enc(self, x):
         if self.config.bb in ['vgg16', 'vgg16bn', 'resnet50']:

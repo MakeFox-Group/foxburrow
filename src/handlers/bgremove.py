@@ -31,26 +31,10 @@ def load_model(device: torch.device) -> torch.nn.Module:
         raise RuntimeError("BGRemove model path not configured.")
 
     try:
-        from transformers import AutoModelForImageSegmentation, PreTrainedModel
+        from transformers import AutoModelForImageSegmentation
 
-        # Newer transformers unconditionally uses torch.device("meta") context
-        # during from_pretrained, which breaks BiRefNet's SwinTransformer init
-        # (it calls torch.linspace().item() which fails on meta tensors).
-        # Temporarily patch get_init_context to exclude the meta device.
-        _orig_get_init_context = PreTrainedModel.get_init_context
-
-        @classmethod
-        def _cpu_instead_of_meta(cls, *args, **kwargs):
-            contexts = _orig_get_init_context.__func__(cls, *args, **kwargs)
-            return [torch.device("cpu") if (isinstance(c, torch.device) and c.type == "meta") else c
-                    for c in contexts]
-
-        PreTrainedModel.get_init_context = _cpu_instead_of_meta
-        try:
-            model = AutoModelForImageSegmentation.from_pretrained(
-                _model_path, trust_remote_code=True)
-        finally:
-            PreTrainedModel.get_init_context = _orig_get_init_context
+        model = AutoModelForImageSegmentation.from_pretrained(
+            _model_path, trust_remote_code=True)
         model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
