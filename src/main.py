@@ -20,6 +20,12 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 # Matches Stable Diffusion WebUI Forge's --cuda-malloc flag.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
 
+# Make CUDA operations synchronous so errors are reported at the exact kernel that
+# fails, not at some later unrelated API call.  Slower, but needed to diagnose
+# the recurring illegal memory access crashes on RTX 5070 (Blackwell/sm_120).
+# TODO: Remove once the root cause is found and fixed.
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
 # Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
 # instead of ~/.cache/huggingface/. Must be set before any HF imports.
 os.environ.setdefault("HF_HOME", os.path.join(os.path.abspath("data"), "hf_cache"))
