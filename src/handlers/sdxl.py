@@ -784,6 +784,18 @@ def _unet_tiled_regional(
     noise_sum  = torch.zeros_like(latent_input)
     weight_sum = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=latent_input.dtype)
 
+    # Set up batched CFG state once — processor handles per-element routing
+    state.region_embeds = pos_stacked
+    state.active = True
+    if neg_stacked is not None:
+        state.uncond_region_embeds = neg_stacked
+        state.uncond_text_embeds = None
+    else:
+        state.uncond_region_embeds = None
+        state.uncond_text_embeds = neg_prompt_embeds
+
+    uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
+
     for ty in range(tiles_y):
         for tx in range(tiles_x):
             y0 = min(ty * stride_y, lat_h - tile_h)
@@ -802,42 +814,17 @@ def _unet_tiled_regional(
             state.set_tile_masks(tile_masks, tile_bounds=(y0, x0, y1, x1))
 
             with torch.no_grad():
-                # Uncond pass
-                if neg_stacked is not None:
-                    # Per-region negatives: use regional attention for uncond too
-                    state.region_embeds = neg_stacked
-                    state.active = True
-                    noise_pred_uncond = unet(
-                        tile, t,
-                        encoder_hidden_states=neg_stacked[0:1],
-                        added_cond_kwargs={
-                            "text_embeds": neg_pooled_prompt_embeds,
-                            "time_ids": add_time_ids,
-                        },
-                    ).sample
-                else:
-                    # Shared negative: standard attention
-                    state.active = False
-                    noise_pred_uncond = unet(
-                        tile, t,
-                        encoder_hidden_states=neg_prompt_embeds,
-                        added_cond_kwargs={
-                            "text_embeds": neg_pooled_prompt_embeds,
-                            "time_ids": add_time_ids,
-                        },
-                    ).sample
-
-                # Cond pass: regional attention
-                state.region_embeds = pos_stacked
-                state.active = True
-                noise_pred_cond = unet(
-                    tile, t,
-                    encoder_hidden_states=pos_stacked[0:1],
+                # Batched CFG: uncond + cond in a single UNet pass per tile
+                tile_in = torch.cat([tile, tile])
+                out = unet(
+                    tile_in, t,
+                    encoder_hidden_states=torch.cat([uncond_enc, pos_stacked[0:1]]),
                     added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
+                        "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
+                        "time_ids": torch.cat([add_time_ids, add_time_ids]),
                     },
                 ).sample
+                noise_pred_uncond, noise_pred_cond = out.chunk(2)
 
             noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
             w = _gaussian_weights(y1 - y0, x1 - x0, device, latent_input.dtype)
@@ -845,6 +832,8 @@ def _unet_tiled_regional(
             weight_sum[:, :, y0:y1, x0:x1] += w
 
     state.active = False
+    state.uncond_region_embeds = None
+    state.uncond_text_embeds = None
     return noise_sum / weight_sum
 
 
@@ -1020,49 +1009,39 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
                 )
             else:
                 with torch.no_grad():
-                    # Uncond pass
-                    if neg_stacked is not None:
-                        # Per-region negatives: use regional attention for uncond too
-                        state.region_embeds = neg_stacked
-                        state.active = True
-                        noise_pred_uncond = unet(
-                            latent_input, t,
-                            encoder_hidden_states=neg_stacked[0:1],
-                            added_cond_kwargs={
-                                "text_embeds": neg_pooled_prompt_embeds,
-                                "time_ids": add_time_ids,
-                            },
-                        ).sample
-                    else:
-                        # Shared negative: standard attention
-                        state.active = False
-                        noise_pred_uncond = unet(
-                            latent_input, t,
-                            encoder_hidden_states=neg_prompt_embeds,
-                            added_cond_kwargs={
-                                "text_embeds": neg_pooled_prompt_embeds,
-                                "time_ids": add_time_ids,
-                            },
-                        ).sample
-
-                    # Cond pass: regional attention
+                    # Batched CFG: uncond + cond in a single UNet forward pass.
+                    # The RegionalAttnProcessor splits the batch internally —
+                    # cond gets regional attention, uncond gets regional (per-region
+                    # negs) or standard SDPA (shared neg).
                     state.region_embeds = all_embeds
                     state.active = True
-                    noise_pred_cond = unet(
-                        latent_input, t,
-                        encoder_hidden_states=placeholder_embeds,
+                    if neg_stacked is not None:
+                        state.uncond_region_embeds = neg_stacked
+                        state.uncond_text_embeds = None
+                    else:
+                        state.uncond_region_embeds = None
+                        state.uncond_text_embeds = neg_prompt_embeds
+
+                    latent_in = torch.cat([latent_input, latent_input])
+                    uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
+                    out = unet(
+                        latent_in, t,
+                        encoder_hidden_states=torch.cat([uncond_enc, placeholder_embeds]),
                         added_cond_kwargs={
-                            "text_embeds": pooled_prompt_embeds,
-                            "time_ids": add_time_ids,
+                            "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
+                            "time_ids": torch.cat([add_time_ids, add_time_ids]),
                         },
                     ).sample
+                    noise_pred_uncond, noise_pred_cond = out.chunk(2)
 
                 noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
             latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
     finally:
-        # Restore original attention processors
+        # Restore original attention processors and clear batched CFG state
         state.active = False
+        state.uncond_region_embeds = None
+        state.uncond_text_embeds = None
         unet.set_attn_processor(original_procs)
 
     job.latents = latents

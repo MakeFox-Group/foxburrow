@@ -3,6 +3,11 @@
 Hooks cross-attention (attn2) layers to composite per-region text conditioning
 with spatial masks. Self-attention passes through unchanged.
 
+Supports batched CFG: when batch_size > 1, the processor splits the batch into
+uncond (first half) and cond (second half), applies the appropriate attention to
+each, and recombines.  Set state.uncond_region_embeds for per-region negatives
+or state.uncond_text_embeds for shared negatives before a batched forward pass.
+
 NOTE: RegionalAttnState is not thread-safe. It is protected by the sdxl_unet
 session concurrency limit of 1 — only one UNet denoise stage runs per GPU at
 a time. Do not raise that limit without adding synchronization.
@@ -23,6 +28,11 @@ class RegionalAttnState:
         self.active: bool = False
         self.region_embeds: torch.Tensor | None = None   # [N, 77, embed_dim]
         self.region_masks: torch.Tensor | None = None     # [N, 1, h, w]
+        # Batched CFG: embeddings for the uncond half of the batch.
+        # Set uncond_region_embeds for per-region negatives (regional attention),
+        # or uncond_text_embeds for shared negatives (standard SDPA).
+        self.uncond_region_embeds: torch.Tensor | None = None  # [N, 77, embed_dim]
+        self.uncond_text_embeds: torch.Tensor | None = None    # [1, 77, embed_dim]
         # Cache keyed by (tile_bounds, seq_len) so interpolated masks persist
         # across denoising steps for the same tile geometry.
         self._mask_cache: dict[tuple, torch.Tensor] = {}
@@ -100,6 +110,10 @@ class RegionalAttnProcessor:
     Handles both self-attention (passthrough) and cross-attention (regional
     compositing) depending on whether encoder_hidden_states is provided and
     the shared state is active.
+
+    When the batch has more than one element (batched CFG), the processor
+    splits into uncond (first half) and cond (second half), processes each
+    with the appropriate embeddings, and recombines.
     """
 
     def __init__(self, state: RegionalAttnState):
@@ -120,8 +134,37 @@ class RegionalAttnProcessor:
             return _standard_sdpa(attn, hidden_states, encoder_hidden_states,
                                   attention_mask, temb)
 
-        # Cross-attention with regional prompting
+        if hidden_states.shape[0] > 1:
+            # Batched CFG: split uncond/cond, process separately, recombine
+            return self._batched_cfg_attention(attn, hidden_states, attention_mask, temb)
+
+        # Single sample: regional cross-attention
         return self._regional_cross_attention(attn, hidden_states, attention_mask, temb)
+
+    def _batched_cfg_attention(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        attention_mask,
+        temb,
+    ) -> torch.Tensor:
+        """Handle batched CFG: uncond is first half, cond is second half."""
+        uncond_hs = hidden_states[:1]
+        cond_hs = hidden_states[1:]
+
+        # Cond half: always regional attention with region_embeds
+        cond_out = self._regional_cross_attention(attn, cond_hs, attention_mask, temb)
+
+        # Uncond half: regional with per-region negs, or standard SDPA with shared neg
+        if self.state.uncond_region_embeds is not None:
+            uncond_out = self._regional_cross_attention(
+                attn, uncond_hs, attention_mask, temb,
+                region_embeds=self.state.uncond_region_embeds)
+        else:
+            uncond_out = _standard_sdpa(
+                attn, uncond_hs, self.state.uncond_text_embeds, attention_mask, temb)
+
+        return torch.cat([uncond_out, cond_out], dim=0)
 
     def _regional_cross_attention(
         self,
@@ -129,8 +172,11 @@ class RegionalAttnProcessor:
         hidden_states: torch.Tensor,
         attention_mask,
         temb,
+        region_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        N = self.state.region_embeds.shape[0]
+        if region_embeds is None:
+            region_embeds = self.state.region_embeds
+        N = region_embeds.shape[0]
 
         # Norm + residual
         residual = hidden_states
@@ -151,9 +197,9 @@ class RegionalAttnProcessor:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
         if attn.norm_cross:
-            encoder_hidden_states = attn.norm_encoder_hidden_states(self.state.region_embeds)
+            encoder_hidden_states = attn.norm_encoder_hidden_states(region_embeds)
         else:
-            encoder_hidden_states = self.state.region_embeds
+            encoder_hidden_states = region_embeds
 
         # Q from UNet features, expanded for N regions (contiguous for reshape)
         query = attn.to_q(hidden_states)                    # [1, seq_len, inner_dim]
