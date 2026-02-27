@@ -33,8 +33,13 @@ def load_model(device: torch.device) -> torch.nn.Module:
     try:
         from transformers import AutoModelForImageSegmentation
 
-        model = AutoModelForImageSegmentation.from_pretrained(
-            _model_path, trust_remote_code=True, device_map="cpu")
+        # Newer transformers unconditionally uses torch.device("meta") context
+        # during from_pretrained, which breaks BiRefNet's SwinTransformer init
+        # (it calls torch.linspace().item() which fails on meta tensors).
+        # Force CPU device context to override the meta init.
+        with torch.device("cpu"):
+            model = AutoModelForImageSegmentation.from_pretrained(
+                _model_path, trust_remote_code=True)
         model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
