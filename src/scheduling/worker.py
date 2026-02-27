@@ -753,12 +753,22 @@ class GpuWorker:
             import io as _io
 
             if result.output_image is not None:
+                image = result.output_image
+                # Resize to originally-requested dimensions if the job was
+                # generated at snapped-up sizes (orig_width/orig_height are
+                # set by enqueue endpoints that use _snap_dims).
+                orig_w = getattr(job, "orig_width", None)
+                orig_h = getattr(job, "orig_height", None)
+                if (orig_w is not None and orig_h is not None
+                        and (image.width != orig_w or image.height != orig_h)):
+                    from PIL import Image as _Image
+                    image = image.resize((orig_w, orig_h), _Image.LANCZOS)
                 buf = _io.BytesIO()
-                mode = "RGBA" if result.output_image.mode == "RGBA" else "RGB"
+                mode = "RGBA" if image.mode == "RGBA" else "RGB"
                 if mode == "RGBA":
-                    result.output_image.save(buf, format="PNG")
+                    image.save(buf, format="PNG")
                 else:
-                    result.output_image.convert("RGB").save(buf, format="PNG")
+                    image.convert("RGB").save(buf, format="PNG")
                 app_state.job_results[job.job_id] = (buf.getvalue(), "image/png")
             elif result.output_latents is not None:
                 import struct

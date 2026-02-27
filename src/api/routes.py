@@ -130,12 +130,28 @@ def _parse_request_loras(prompt: str, negative_prompt: str,
 
 def _validate_dimensions(width: int, height: int, max_dim: int = 2048,
                           multiple: int = 64) -> str | None:
-    if (width % multiple != 0 or height % multiple != 0
-            or width < multiple or width > max_dim
+    if (width < multiple or width > max_dim
             or height < multiple or height > max_dim):
-        return (f"Width and height must be divisible by {multiple} "
-                f"and between {multiple}-{max_dim}.")
+        return f"Width and height must be between {multiple}-{max_dim}."
     return None
+
+
+def _snap_up(value: int, multiple: int = 64) -> int:
+    """Round *value* up to the next multiple (e.g. 64)."""
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _snap_dims(width: int, height: int, multiple: int = 64) -> tuple[int, int]:
+    """Snap both dimensions up to the nearest *multiple*."""
+    return _snap_up(width, multiple), _snap_up(height, multiple)
+
+
+def _resize_if_needed(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Resize *image* down to target dimensions if it was generated at a
+    snapped-up size.  Uses LANCZOS for quality."""
+    if image.width != target_w or image.height != target_h:
+        image = image.resize((target_w, target_h), Image.LANCZOS)
+    return image
 
 
 def _image_response(image: Image.Image, mode: str = "RGB") -> Response:
@@ -550,13 +566,15 @@ async def generate(req: GenerateRequest):
         return _error(400, err)
 
     seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
+    orig_w, orig_h = req.width, req.height
+    gen_w, gen_h = _snap_dims(orig_w, orig_h)
 
     # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
     cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Generate request: {req.width}x{req.height} steps={req.steps} "
+    log.info(f"Generate request: {orig_w}x{orig_h} steps={req.steps} "
              f"cfg={req.cfg_scale} seed={seed} model={model_short}"
              + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
@@ -569,8 +587,8 @@ async def generate(req: GenerateRequest):
         sdxl_input=SdxlJobInput(
             prompt=cleaned_prompt,
             negative_prompt=cleaned_neg,
-            width=req.width,
-            height=req.height,
+            width=gen_w,
+            height=gen_h,
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
@@ -588,8 +606,10 @@ async def generate(req: GenerateRequest):
     if not result.success:
         return _error(500, result.error or "Unknown error")
 
-    log.info(f"Generate complete: {result.output_image.width}x{result.output_image.height}")
-    return _image_response(result.output_image)
+    output = _resize_if_needed(result.output_image, orig_w, orig_h)
+    log.info(f"Generate complete: {result.output_image.width}x{result.output_image.height}"
+             + (f" → {orig_w}x{orig_h}" if (gen_w, gen_h) != (orig_w, orig_h) else ""))
+    return _image_response(output)
 
 
 @router.post("/generate-hires")
@@ -620,18 +640,22 @@ async def generate_hires(req: GenerateHiresRequest):
     if err:
         return _error(400, err)
 
+    orig_w, orig_h = req.width, req.height
+    gen_w, gen_h = _snap_dims(orig_w, orig_h)
+
     # Calculate base resolution
     if req.base_width is not None and req.base_height is not None:
         base_w, base_h = req.base_width, req.base_height
         err = _validate_dimensions(base_w, base_h)
         if err:
             return _error(400, f"base_width/base_height: {err}")
+        base_w, base_h = _snap_dims(base_w, base_h)
     else:
         base_w, base_h = calculate_base_resolution(req.width, req.height)
 
-    if base_w > req.width or base_h > req.height:
+    if base_w > gen_w or base_h > gen_h:
         return _error(400, "Base dimensions must not exceed hires dimensions.")
-    if base_w == req.width and base_h == req.height:
+    if base_w == gen_w and base_h == gen_h:
         return _error(400, "Base and hires dimensions are identical — use /generate instead.")
 
     seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
@@ -641,7 +665,7 @@ async def generate_hires(req: GenerateHiresRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"GenerateHires request: base={base_w}x{base_h} hires={req.width}x{req.height} "
+    log.info(f"GenerateHires request: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
              f"steps={req.steps} hires_steps={req.hires_steps} "
              f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
              f"seed={seed} model={model_short}"
@@ -666,8 +690,8 @@ async def generate_hires(req: GenerateHiresRequest):
             regional_prompting=req.regional_prompting,
         ),
         hires_input=SdxlHiresInput(
-            hires_width=req.width,
-            hires_height=req.height,
+            hires_width=gen_w,
+            hires_height=gen_h,
             hires_steps=req.hires_steps,
             denoising_strength=req.hires_denoising_strength,
         ),
@@ -683,8 +707,10 @@ async def generate_hires(req: GenerateHiresRequest):
     if not result.success:
         return _error(500, result.error or "Unknown error")
 
-    log.info(f"GenerateHires complete: {result.output_image.width}x{result.output_image.height}")
-    return _image_response(result.output_image)
+    output = _resize_if_needed(result.output_image, orig_w, orig_h)
+    log.info(f"GenerateHires complete: {result.output_image.width}x{result.output_image.height}"
+             + (f" → {orig_w}x{orig_h}" if (gen_w, gen_h) != (orig_w, orig_h) else ""))
+    return _image_response(output)
 
 
 @router.post("/generate-latents")
@@ -711,6 +737,7 @@ async def generate_latents(req: GenerateRequest):
         return _error(400, err)
 
     seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
+    gen_w, gen_h = _snap_dims(req.width, req.height)
 
     # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
     cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
@@ -730,8 +757,8 @@ async def generate_latents(req: GenerateRequest):
         sdxl_input=SdxlJobInput(
             prompt=cleaned_prompt,
             negative_prompt=cleaned_neg,
-            width=req.width,
-            height=req.height,
+            width=gen_w,
+            height=gen_h,
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
@@ -1033,6 +1060,8 @@ async def hires_latents(request: Request):
     if err:
         return _error(400, err)
 
+    gen_hires_w, gen_hires_h = _snap_dims(hires_width, hires_height)
+
     try:
         hires_steps        = int(qp.get("hires_steps", "15"))
         denoising_strength = float(qp.get("denoising_strength", "0.33"))
@@ -1107,8 +1136,8 @@ async def hires_latents(request: Request):
             loras=all_loras,
         ),
         hires_input=SdxlHiresInput(
-            hires_width=hires_width,
-            hires_height=hires_height,
+            hires_width=gen_hires_w,
+            hires_height=gen_hires_h,
             hires_steps=hires_steps,
             denoising_strength=denoising_strength,
         ),
@@ -1288,13 +1317,15 @@ async def enqueue_generate(req: GenerateRequest):
         return _error(400, err)
 
     seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
+    orig_w, orig_h = req.width, req.height
+    gen_w, gen_h = _snap_dims(orig_w, orig_h)
 
     # Parse LoRA tags from prompt (A1111 syntax) + explicit request loras
     cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue generate: {req.width}x{req.height} steps={req.steps} "
+    log.info(f"Enqueue generate: {orig_w}x{orig_h} steps={req.steps} "
              f"cfg={req.cfg_scale} seed={seed} model={model_short}"
              + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
@@ -1307,8 +1338,8 @@ async def enqueue_generate(req: GenerateRequest):
         sdxl_input=SdxlJobInput(
             prompt=cleaned_prompt,
             negative_prompt=cleaned_neg,
-            width=req.width,
-            height=req.height,
+            width=gen_w,
+            height=gen_h,
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
@@ -1319,6 +1350,8 @@ async def enqueue_generate(req: GenerateRequest):
     )
     job.vae_tile_width = req.vae_tile_width
     job.vae_tile_height = req.vae_tile_height
+    job.orig_width = orig_w
+    job.orig_height = orig_h
 
     _register_job(job)
     queue.enqueue(job)
@@ -1353,17 +1386,21 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
     if err:
         return _error(400, err)
 
+    orig_w, orig_h = req.width, req.height
+    gen_w, gen_h = _snap_dims(orig_w, orig_h)
+
     if req.base_width is not None and req.base_height is not None:
         base_w, base_h = req.base_width, req.base_height
         err = _validate_dimensions(base_w, base_h)
         if err:
             return _error(400, f"base_width/base_height: {err}")
+        base_w, base_h = _snap_dims(base_w, base_h)
     else:
         base_w, base_h = calculate_base_resolution(req.width, req.height)
 
-    if base_w > req.width or base_h > req.height:
+    if base_w > gen_w or base_h > gen_h:
         return _error(400, "Base dimensions must not exceed hires dimensions.")
-    if base_w == req.width and base_h == req.height:
+    if base_w == gen_w and base_h == gen_h:
         return _error(400, "Base and hires dimensions are identical — use /enqueue/generate instead.")
 
     seed = req.seed if req.seed != 0 else random.randint(1, 2**31 - 1)
@@ -1373,7 +1410,7 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue generate-hires: base={base_w}x{base_h} hires={req.width}x{req.height} "
+    log.info(f"Enqueue generate-hires: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
              f"steps={req.steps} hires_steps={req.hires_steps} "
              f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
              f"seed={seed} model={model_short}"
@@ -1398,8 +1435,8 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
             regional_prompting=req.regional_prompting,
         ),
         hires_input=SdxlHiresInput(
-            hires_width=req.width,
-            hires_height=req.height,
+            hires_width=gen_w,
+            hires_height=gen_h,
             hires_steps=req.hires_steps,
             denoising_strength=req.hires_denoising_strength,
         ),
@@ -1408,6 +1445,8 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
     job.unet_tile_height = req.unet_tile_height
     job.vae_tile_width = req.vae_tile_width
     job.vae_tile_height = req.vae_tile_height
+    job.orig_width = orig_w
+    job.orig_height = orig_h
 
     _register_job(job)
     queue.enqueue(job)
@@ -1570,6 +1609,9 @@ async def enqueue_enhance(request: Request):
     if err:
         return _error(400, err)
 
+    orig_hires_w, orig_hires_h = hires_width, hires_height
+    gen_hires_w, gen_hires_h = _snap_dims(hires_width, hires_height, multiple=8)
+
     try:
         hires_steps        = int(qp.get("hires_steps", "15"))
         denoising_strength = float(qp.get("denoising_strength", "0.33"))
@@ -1601,21 +1643,21 @@ async def enqueue_enhance(request: Request):
     base_h = input_image.height
 
     # Only upscale if the input image is smaller than the target in either dimension
-    needs_upscale = base_w < hires_width or base_h < hires_height
+    needs_upscale = base_w < gen_hires_w or base_h < gen_hires_h
 
     if not needs_upscale:
         # Image is already large enough — just resize to target dimensions
-        if base_w != hires_width or base_h != hires_height:
-            input_image = input_image.resize((hires_width, hires_height), Image.LANCZOS)
+        if base_w != gen_hires_w or base_h != gen_hires_h:
+            input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
             log.info(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
-                     f"{hires_width}x{hires_height} (no upscale needed)")
+                     f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
 
     # Parse LoRA tags from prompt
     cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
         prompt, negative_prompt, None)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue enhance: input={base_w}x{base_h} target={hires_width}x{hires_height} "
+    log.info(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
              f"upscale={'yes' if needs_upscale else 'no'} "
              f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
              f"cfg={cfg_scale} seed={seed} model={model_short}"
@@ -1640,8 +1682,8 @@ async def enqueue_enhance(request: Request):
             regional_prompting=qp.get("regional_prompting", "false").lower() == "true",
         ),
         hires_input=SdxlHiresInput(
-            hires_width=hires_width,
-            hires_height=hires_height,
+            hires_width=gen_hires_w,
+            hires_height=gen_hires_h,
             hires_steps=hires_steps,
             denoising_strength=denoising_strength,
         ),
@@ -1652,6 +1694,8 @@ async def enqueue_enhance(request: Request):
     job.unet_tile_height = unet_tile_h
     job.vae_tile_width   = vae_tile_w
     job.vae_tile_height  = vae_tile_h
+    job.orig_width = orig_hires_w
+    job.orig_height = orig_hires_h
 
     _register_job(job)
     queue.enqueue(job)
@@ -1743,11 +1787,17 @@ async def job_result(job_id: str):
 
     # Fallback: try to serialize from the job's completion result
     if result and result.output_image:
+        image = result.output_image
+        orig_w = getattr(job, "orig_width", None)
+        orig_h = getattr(job, "orig_height", None)
+        if (orig_w is not None and orig_h is not None
+                and (image.width != orig_w or image.height != orig_h)):
+            image = image.resize((orig_w, orig_h), Image.LANCZOS)
         buf = io.BytesIO()
-        if result.output_image.mode == "RGBA":
-            result.output_image.save(buf, format="PNG")
+        if image.mode == "RGBA":
+            image.save(buf, format="PNG")
         else:
-            result.output_image.convert("RGB").save(buf, format="PNG")
+            image.convert("RGB").save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
 
     if result and result.output_latents is not None:
