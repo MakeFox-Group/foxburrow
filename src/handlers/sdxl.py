@@ -1817,6 +1817,15 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
         network_alphas=network_alphas,
     )
 
+    # Defense-in-depth: PEFT injects new LoRA modules into the UNet.  If a
+    # concurrent from_pretrained() on another GPU worker has accelerate's
+    # register_parameter patch active, those LoRA modules get meta parameters.
+    # Repair any leak and fix any meta tensors that slipped through.
+    repair_accelerate_leak()
+    n = fix_meta_tensors(unet)
+    if n:
+        log.warning(f"  LoRA: Fixed {n} meta tensor(s) in UNet after adapter injection")
+
     # Track loaded adapter on the GPU
     if hasattr(gpu, '_loaded_lora_adapters'):
         gpu._loaded_lora_adapters[adapter_name] = lora_path

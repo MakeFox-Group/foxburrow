@@ -768,6 +768,11 @@ def main() -> None:
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
 
+    # Patch accelerate's init_on_device() to prevent thread-safety races
+    # that cause permanent meta tensor leaks across concurrent from_pretrained() calls
+    from gpu.pool import patch_accelerate_thread_safety
+    patch_accelerate_thread_safety()
+
     # Initialize admission control (after capabilities are finalized)
     from scheduling.queue import AdmissionControl
     app_state.admission = AdmissionControl(app_state.gpu_pool)

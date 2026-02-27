@@ -51,6 +51,73 @@ def repair_accelerate_leak() -> bool:
     return True
 
 
+def patch_accelerate_thread_safety() -> None:
+    """Monkey-patch accelerate's init_on_device() to be thread-safe.
+
+    accelerate's init_on_device() saves nn.Module.register_parameter to a local
+    variable on entry, patches it globally, then restores from the local on exit.
+    This is NOT thread-safe:
+
+        Thread A enters → saves ORIG, patches to PATCH_A
+        Thread B enters → saves PATCH_A (not ORIG!), patches to PATCH_B
+        Thread A exits  → restores ORIG  (correct)
+        Thread B exits  → restores PATCH_A  (LEAKED!)
+
+    Now register_parameter is permanently the meta-tensor version.  Every
+    subsequent nn.Module construction creates meta tensors process-wide.
+
+    Our fix: replace init_on_device's finally block to ALWAYS restore from our
+    import-time originals (_ORIG_REGISTER_PARAMETER / _ORIG_REGISTER_BUFFER),
+    never from stale local captures.  This makes concurrent entries/exits safe.
+    """
+    from contextlib import contextmanager
+
+    import accelerate.big_modeling as accel_bm
+    from accelerate.utils import parse_flag_from_env
+
+    @contextmanager
+    def _safe_init_on_device(device, include_buffers=None):
+        if include_buffers is None:
+            include_buffers = parse_flag_from_env(
+                "ACCELERATE_INIT_INCLUDE_BUFFERS", False)
+
+        # include_buffers=True uses PyTorch's device context manager (same as
+        # accelerate's original lines 120-123 of big_modeling.py).  No
+        # register_parameter patching needed — torch handles it natively.
+        if include_buffers:
+            with device:
+                yield
+            return
+
+        def register_empty_parameter(module, name, param):
+            _ORIG_REGISTER_PARAMETER(module, name, param)
+            if param is not None:
+                param_cls = type(module._parameters[name])
+                kwargs = module._parameters[name].__dict__
+                kwargs["requires_grad"] = param.requires_grad
+                module._parameters[name] = param_cls(
+                    module._parameters[name].to(device), **kwargs)
+
+        try:
+            nn.Module.register_parameter = register_empty_parameter
+            yield
+        finally:
+            # ALWAYS restore from import-time originals — never from stale
+            # locals that may contain another thread's patched version.
+            nn.Module.register_parameter = _ORIG_REGISTER_PARAMETER
+            # register_buffer isn't patched in this branch, but restore it
+            # unconditionally as a safety net (idempotent no-op normally).
+            nn.Module.register_buffer = _ORIG_REGISTER_BUFFER
+
+    # Patch both the module-internal name (used by init_empty_weights via
+    # module-global lookup) and the public re-export in accelerate.__init__
+    # (used by any code doing `from accelerate import init_on_device`).
+    accel_bm.init_on_device = _safe_init_on_device
+    import accelerate
+    accelerate.init_on_device = _safe_init_on_device
+    log.debug("  Patched accelerate.init_on_device() for thread safety")
+
+
 def fix_meta_tensors(model: nn.Module) -> int:
     """Replace any remaining meta tensors in a model with zero-filled tensors.
 

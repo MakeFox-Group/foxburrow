@@ -178,7 +178,13 @@ def _run_model_forward(
     w: int, h: int, device: torch.device,
 ) -> None:
     """Run a single no_grad forward pass with dummy inputs."""
-    dtype = torch.float16
+    # Infer dtype from model parameters — VAE runs in float32 while others
+    # use float16.  Hardcoding float16 causes "Input type (c10::Half) and
+    # bias type (float) should be the same" errors on float32 models.
+    try:
+        dtype = next(model.parameters()).dtype
+    except StopIteration:
+        dtype = torch.float16
 
     if component_type == "sdxl_unet":
         inputs = _make_unet_input(w, h, device, dtype)
