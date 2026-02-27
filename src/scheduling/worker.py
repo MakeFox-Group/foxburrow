@@ -669,33 +669,51 @@ class GpuWorker:
                 job.active_gpus = []
                 with self._state_lock:
                     self._active_jobs.pop(job.job_id, None)
-                log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
                 if _is_cuda_fatal(ex):
+                    log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
                     log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "
                               f"Process restart required.")
                     for w in self._all_workers:
                         w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
-                elif not isinstance(ex, torch.cuda.OutOfMemoryError):
-                    # OOM is a job-level failure, not a hardware fault — don't
-                    # count it toward the consecutive failure threshold.
-                    self._gpu.record_failure()
-                job.completed_at = datetime.utcnow()
-                job.set_result(JobResult(success=False, error=str(ex)))
-                self._broadcast_complete(job, success=False, error=str(ex))
+                    job.completed_at = datetime.utcnow()
+                    job.set_result(JobResult(success=False, error=str(ex)))
+                    self._broadcast_complete(job, success=False, error=str(ex))
+                elif isinstance(ex, torch.cuda.OutOfMemoryError) and job.oom_retries < 2:
+                    # OOM during execution — re-enqueue so scheduler picks a
+                    # different GPU (or waits until VRAM frees up).
+                    job.oom_retries += 1
+                    log.warning(f"  GpuWorker[{self._gpu.uuid}]: {job} OOM at {stage} "
+                                f"— re-enqueuing (retry {job.oom_retries}/2)")
+                    self._queue.re_enqueue(job)
+                else:
+                    log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
+                    if not isinstance(ex, torch.cuda.OutOfMemoryError):
+                        self._gpu.record_failure()
+                    job.completed_at = datetime.utcnow()
+                    job.set_result(JobResult(success=False, error=str(ex)))
+                    self._broadcast_complete(job, success=False, error=str(ex))
 
         except Exception as ex:
             # Outer handler catches model-loading failures and other setup errors.
-            # Only CUDA fatal errors trigger GPU disabling here — model load errors
-            # (FileNotFoundError, KeyError, etc.) are config problems, not hardware faults.
-            log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
             if _is_cuda_fatal(ex):
+                log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
                 log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "
                           f"Process restart required.")
                 for w in self._all_workers:
                     w.gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
-            job.completed_at = datetime.utcnow()
-            job.set_result(JobResult(success=False, error=str(ex)))
-            self._broadcast_complete(job, success=False, error=str(ex))
+                job.completed_at = datetime.utcnow()
+                job.set_result(JobResult(success=False, error=str(ex)))
+                self._broadcast_complete(job, success=False, error=str(ex))
+            elif isinstance(ex, torch.cuda.OutOfMemoryError) and job.oom_retries < 2:
+                job.oom_retries += 1
+                log.warning(f"  GpuWorker[{self._gpu.uuid}]: {job} OOM loading models for {stage} "
+                            f"— re-enqueuing (retry {job.oom_retries}/2)")
+                self._queue.re_enqueue(job)
+            else:
+                log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
+                job.completed_at = datetime.utcnow()
+                job.set_result(JobResult(success=False, error=str(ex)))
+                self._broadcast_complete(job, success=False, error=str(ex))
 
         finally:
             try:
