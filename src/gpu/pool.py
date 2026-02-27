@@ -274,14 +274,23 @@ class GpuInstance:
         return True
 
     def evict_lru(self, protect: set[str] | None = None) -> CachedModel | None:
-        """Evict the least-recently-used cached model not in the protected
-        or unevictable sets. Prefers evicting models from non-current
-        session groups first. Moves model to CPU. Returns evicted model or None."""
+        """Evict the least-recently-used cached model not in the protected,
+        unevictable, or actively-in-use sets. Prefers evicting models from
+        non-current session groups first. Moves model to CPU.
+        Returns evicted model or None."""
+        # Snapshot active fingerprints BEFORE acquiring _cache_lock to maintain
+        # consistent lock ordering (active_fp_lock → cache_lock), matching
+        # get_evictable_vram(). Models actively being used by another thread's
+        # forward pass must never be evicted — .to("cpu") mid-inference causes
+        # device mismatch errors or silent corruption (black images).
+        active_fps = self.get_active_fingerprints()
         with self._cache_lock:
             # First pass: try to evict from non-current groups (least valuable)
             if self._current_group:
                 for fp in list(self._cache.keys()):
                     if not self._is_evictable(fp, protect):
+                        continue
+                    if fp in active_fps:
                         continue
                     m = self._cache[fp]
                     if _get_group_for_category(m.category) != self._current_group:
@@ -295,9 +304,11 @@ class GpuInstance:
                                  f"(~{model_entry.estimated_vram // (1024*1024)}MB, "
                                  f"non-current group)")
                         return model_entry
-            # Second pass: evict from any group (but still respect unevictable)
+            # Second pass: evict from any group (but still respect unevictable/active)
             for fp in list(self._cache.keys()):
                 if not self._is_evictable(fp, protect):
+                    continue
+                if fp in active_fps:
                     continue
                 model_entry = self._cache.pop(fp)
                 if model_entry.evict_callback:
