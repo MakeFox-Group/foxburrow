@@ -176,6 +176,8 @@ class InferenceJob:
         # Progress tracking
         self.denoise_step: int = 0
         self.denoise_total_steps: int = 0
+        self.stage_step: int = 0          # generic stage progress (e.g. VAE tiles)
+        self.stage_total_steps: int = 0   # total sub-steps for current stage
         self.stage_status: str = ""  # "loading" or "running" — for TUI display
 
         # GPU tracking — updated when worker starts/finishes a stage

@@ -26,6 +26,12 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
 # TODO: Remove once the root cause is found and fixed.
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
+# Enable cuDNN debug logging to diagnose assertion failures in precompiled engines.
+# Level 2 = warnings + errors.  Logs to stderr (captured by TUI or redirect).
+# TODO: Remove once the cuDNN crash on Blackwell is resolved.
+os.environ.setdefault("CUDNN_LOGLEVEL_DBG", "2")
+os.environ.setdefault("CUDNN_LOGDEST_DBG", "stderr")
+
 # Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
 # instead of ~/.cache/huggingface/. Must be set before any HF imports.
 os.environ.setdefault("HF_HOME", os.path.join(os.path.abspath("data"), "hf_cache"))
@@ -39,6 +45,16 @@ import uvicorn
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+# cuDNN configuration for Blackwell (sm_120) stability:
+# - benchmark=False: use default algorithm selection (avoid benchmarking which
+#   may trigger buggy precompiled engines on new architectures)
+# - allow_tf32=False: disable TF32 accumulation in cuDNN convolutions, forcing
+#   fp32 math.  Blackwell's TF32 cuDNN engines in libcudnn_engines_precompiled.so.9
+#   have been observed hitting assertion failures (SIGABRT) after sustained use.
+# TODO: Re-enable TF32 once NVIDIA ships a cuDNN fix for sm_120.
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.allow_tf32 = False
 
 import log
 from config import FoxBurrowConfig, _auto_threads
@@ -591,6 +607,8 @@ def main() -> None:
     # Start file logging before anything else so the full startup is captured.
     log.init_file(os.path.abspath("logs/foxburrow.log"))
     log.info("foxburrow starting (Python/PyTorch)")
+    log.info(f"  PyTorch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, "
+             f"CUDA {torch.version.cuda}")
 
     # Write PID file
     pid_path = os.path.abspath("data/foxburrow.pid")

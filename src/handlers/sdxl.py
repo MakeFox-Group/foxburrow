@@ -1079,7 +1079,7 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 
     # Use tiled decode if image needs splitting
     if lat_w > lat_tile_w or lat_h > lat_tile_h:
-        image = _vae_decode_tiled(scaled_latents, vae, lat_tile_w, lat_tile_h)
+        image = _vae_decode_tiled(scaled_latents, vae, lat_tile_w, lat_tile_h, job=job)
     else:
         with torch.no_grad():
             decoded = vae.decode(scaled_latents.to(device)).sample
@@ -1099,7 +1099,7 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
     tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
-    latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h)
+    latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
     job.latents = latents
     log.info(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
 
@@ -1150,11 +1150,14 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
 
     if hires_img_w >= VAE_TILE_THRESHOLD or hires_img_h >= VAE_TILE_THRESHOLD:
         dtw, dth = _auto_vae_tile(hires_img_w, hires_img_h, VAE_TILE_MAX)
-        intermediate = _vae_decode_tiled(scaled, vae, dtw // 8, dth // 8)
+        intermediate = _vae_decode_tiled(scaled, vae, dtw // 8, dth // 8, job=job)
     else:
         with torch.no_grad():
             decoded = vae.decode(scaled).sample
         intermediate = _tensor_to_pil(decoded)
+    # Clear tile progress before upscale phase
+    job.stage_step = 0
+    job.stage_total_steps = 0
     log.info(f"  HiresTransform: VAE decode → {intermediate.width}x{intermediate.height} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
@@ -1171,7 +1174,7 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
     tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
-    encoded = _vae_encode(upscaled, vae, device, tile_w=tile_w, tile_h=tile_h)
+    encoded = _vae_encode(upscaled, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
     log.info(f"  HiresTransform: VAE encode → {list(encoded.shape)} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
     upscaled.close()
@@ -1365,7 +1368,8 @@ def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 
 def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
-                tile_w: int = 0, tile_h: int = 0) -> torch.Tensor:
+                tile_w: int = 0, tile_h: int = 0,
+                job: InferenceJob | None = None) -> torch.Tensor:
     """VAE-encode a PIL image to latent space. Returns [1,4,H/8,W/8].
     Forces tiled encoding when any dimension >= VAE_TILE_THRESHOLD, with
     non-square tiles auto-computed per axis for optimal coverage."""
@@ -1380,7 +1384,7 @@ def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
         eff_w, eff_h = img_w, img_h
 
     if img_w > eff_w or img_h > eff_h:
-        return _vae_encode_tiled(image, vae, device, eff_w, eff_h)
+        return _vae_encode_tiled(image, vae, device, eff_w, eff_h, job=job)
 
     arr = np.array(image.convert("RGB"), dtype=np.float32)
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
@@ -1395,7 +1399,8 @@ def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
 
 def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
                       device: torch.device,
-                      tile_w_px: int, tile_h_px: int) -> torch.Tensor:
+                      tile_w_px: int, tile_h_px: int,
+                      *, job: InferenceJob | None = None) -> torch.Tensor:
     """Tiled VAE encode for large images. Supports non-square tiles.
     Tiles in pixel space, blends in latent space with linear feathering."""
     min_tile_px = LATENT_TILE_OVERLAP * 8 + 8  # 136px minimum
@@ -1417,14 +1422,20 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
     tiles_y = max(1, (img_h - overlap_px + stride_h_px - 1) // stride_h_px)
     tiles_x = max(1, (img_w - overlap_px + stride_w_px - 1) // stride_w_px)
 
+    total_tiles = tiles_x * tiles_y
     log.info(f"  SDXL: Tiled VAE encode {img_w}x{img_h} — "
-             f"{tiles_x}x{tiles_y} grid ({tiles_x * tiles_y} tiles, "
+             f"{tiles_x}x{tiles_y} grid ({total_tiles} tiles, "
              f"tile={tile_w_px}x{tile_h_px})")
+
+    if job is not None:
+        job.stage_step = 0
+        job.stage_total_steps = total_tiles
 
     lat_sum = np.zeros((1, 4, lat_h, lat_w), dtype=np.float32)
     weights  = np.zeros((1, 1, lat_h, lat_w), dtype=np.float32)
 
     arr = np.array(image.convert("RGB"), dtype=np.float32)
+    tile_count = 0
 
     for ty in range(tiles_y):
         for tx in range(tiles_x):
@@ -1467,6 +1478,10 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
             lat_sum[0, :, ly:ly+th_lat, lx:lx+tw_lat] += tile_lat_np * w_mask[np.newaxis]
             weights [0, 0, ly:ly+th_lat, lx:lx+tw_lat] += w_mask
 
+            tile_count += 1
+            if job is not None:
+                job.stage_step = tile_count
+
         log.info(f"  SDXL: Tiled VAE encode row {ty+1}/{tiles_y}")
 
     latents = torch.from_numpy(lat_sum / weights).to(dtype=torch.float16, device=device)
@@ -1477,6 +1492,7 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
 def _vae_decode_tiled(
     latents: torch.Tensor, vae: AutoencoderKL,
     lat_tile_w: int, lat_tile_h: int,
+    *, job: InferenceJob | None = None,
 ) -> Image.Image:
     """Tiled VAE decode for large images with linear feathering blend.
     Uses numpy broadcasting for weight accumulation (no Python pixel loops)."""
@@ -1497,9 +1513,14 @@ def _vae_decode_tiled(
     tiles_y = max(1, (lat_h - LATENT_TILE_OVERLAP + stride_h - 1) // stride_h)
     tiles_x = max(1, (lat_w - LATENT_TILE_OVERLAP + stride_w - 1) // stride_w)
 
+    total_tiles = tiles_x * tiles_y
     log.info(f"  SDXL: Tiled VAE decode {img_w}x{img_h} — "
-             f"{tiles_x}x{tiles_y} grid ({tiles_x * tiles_y} tiles, "
+             f"{tiles_x}x{tiles_y} grid ({total_tiles} tiles, "
              f"tile={lat_tile_w*8}x{lat_tile_h*8})")
+
+    if job is not None:
+        job.stage_step = 0
+        job.stage_total_steps = total_tiles
 
     # Accumulation buffers: [3, H, W] for RGB + [H, W] for weights
     rgb_sum = np.zeros((3, img_h, img_w), dtype=np.float32)
@@ -1545,6 +1566,8 @@ def _vae_decode_tiled(
             weights[img_y:img_y+tile_img_h, img_x:img_x+tile_img_w] += w_mask
 
             tile_count += 1
+            if job is not None:
+                job.stage_step = tile_count
 
     # Build final image
     w_safe = np.maximum(weights, 1e-8)

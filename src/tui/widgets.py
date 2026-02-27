@@ -155,12 +155,23 @@ class GpuPanel(Static):
                 text.append(f" {elapsed:.1f}s", style="dim")
                 text.append("\n")
 
-                # Denoise progress bar (only while denoise stage is running)
-                if job.denoise_total_steps > 0 and job.stage_status == "running":
+                # Progress bar (denoise steps or VAE tiles)
+                # Snapshot fields to avoid race with executor thread
+                d_step = job.denoise_step
+                d_total = job.denoise_total_steps
+                s_step = job.stage_step
+                s_total = job.stage_total_steps
+                if d_total > 0 and job.stage_status == "running":
                     text.append("  ")
-                    text.append_text(_progress_bar(job.denoise_step, job.denoise_total_steps))
-                    pct = job.denoise_step / job.denoise_total_steps * 100
-                    text.append(f" {pct:.1f}%  step {job.denoise_step}/{job.denoise_total_steps}")
+                    text.append_text(_progress_bar(d_step, d_total))
+                    pct = d_step / d_total * 100
+                    text.append(f" {pct:.1f}%  step {d_step}/{d_total}")
+                    text.append("\n")
+                elif s_total > 0 and job.stage_status == "running":
+                    text.append("  ")
+                    text.append_text(_progress_bar(s_step, s_total))
+                    pct = s_step / s_total * 100
+                    text.append(f" {pct:.1f}%  tile {s_step}/{s_total}")
                     text.append("\n")
         else:
             text.append("(idle)", style="dim italic")

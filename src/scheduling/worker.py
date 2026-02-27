@@ -469,6 +469,10 @@ class GpuWorker:
             # Make job visible to TUI immediately (during model loading)
             if job.started_at is None:
                 job.started_at = datetime.utcnow()
+            job.denoise_step = 0
+            job.denoise_total_steps = 0
+            job.stage_step = 0
+            job.stage_total_steps = 0
             job.stage_status = "loading"
             gpu_info = {"uuid": self._gpu.uuid, "name": self._gpu.name,
                         "stage": stage.type.value}

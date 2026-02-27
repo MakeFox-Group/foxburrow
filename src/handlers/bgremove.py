@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -32,17 +31,11 @@ def load_model(device: torch.device) -> torch.nn.Module:
         raise RuntimeError("BGRemove model path not configured.")
 
     try:
-        from transformers import AutoConfig, AutoModelForImageSegmentation
-        import safetensors.torch as st
+        from transformers import AutoModelForImageSegmentation
 
-        # Load config, then construct model on CPU to avoid meta-tensor issues
-        # in BiRefNet's SwinTransformer init
-        config = AutoConfig.from_pretrained(_model_path, trust_remote_code=True)
-        with torch.device("cpu"):
-            model = AutoModelForImageSegmentation.from_config(
-                config, trust_remote_code=True)
-        st.load_model(model, os.path.join(_model_path, "model.safetensors"))
-        model.to(device).half().eval()
+        model = AutoModelForImageSegmentation.from_pretrained(
+            _model_path, trust_remote_code=True)
+        model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
     except Exception as e:
