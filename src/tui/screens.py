@@ -252,6 +252,10 @@ class HelpScreen(ModalScreen):
             ("q", "Queue detail"),
             ("g", "GPU detail"),
             ("Space", "Pause/resume log scroll"),
+            ("d", "Toggle DEBUG log level"),
+            ("i", "Toggle INFO log level"),
+            ("w", "Toggle WARNING log level"),
+            ("e", "Toggle ERROR log level"),
             ("?", "This help screen"),
             ("Ctrl+C", "Quit"),
         ]

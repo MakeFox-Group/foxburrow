@@ -174,7 +174,7 @@ def start_background_hashing(
     """
     unhashed = [e for e in index.values() if e.fingerprint is None]
     if not unhashed:
-        log.info(f"  LoRA hashing: all {len(index)} entries already cached")
+        log.debug(f"  LoRA hashing: all {len(index)} entries already cached")
         if shutdown_pool and pool is not None:
             pool.shutdown(wait=False)
         return _make_noop_thread()
@@ -183,10 +183,10 @@ def start_background_hashing(
 
     def _manager():
         if pool is not None:
-            log.info(f"  LoRA hashing: {len(unhashed)} files to hash (shared pool)")
+            log.debug(f"  LoRA hashing: {len(unhashed)} files to hash (shared pool)")
         else:
-            log.info(f"  LoRA hashing: {len(unhashed)} files to hash "
-                     f"({workers} workers)")
+            log.debug(f"  LoRA hashing: {len(unhashed)} files to hash "
+                      f"({workers} workers)")
         completed = 0
         last_log = time.monotonic()
         last_completed = 0
@@ -222,8 +222,8 @@ def start_background_hashing(
                     elapsed = now - last_log
                     done_since = completed - last_completed
                     rate = done_since / elapsed if elapsed > 0 else 0
-                    log.info(f"  LoRA hashing: {completed}/{len(unhashed)} "
-                             f"({rate:.0f}/sec)")
+                    log.debug(f"  LoRA hashing: {completed}/{len(unhashed)} "
+                              f"({rate:.0f}/sec)")
                     last_log = now
                     last_completed = completed
         finally:
@@ -232,7 +232,7 @@ def start_background_hashing(
             elif shutdown_pool:
                 use_pool.shutdown(wait=True)
 
-        log.info(f"  LoRA hashing: complete ({completed}/{len(unhashed)} hashed)")
+        log.debug(f"  LoRA hashing: complete ({completed}/{len(unhashed)} hashed)")
 
     t = threading.Thread(target=_manager, name="lora-hash-manager", daemon=True)
     t.start()

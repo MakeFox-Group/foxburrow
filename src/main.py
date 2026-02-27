@@ -124,11 +124,11 @@ def generate_default_config() -> str:
     with open(config_path, "w") as f:
         f.write("\n".join(lines))
 
-    log.info(f"  Generated default config: {config_path}")
+    log.debug(f"  Generated default config: {config_path}")
     log.info(f"  Detected {len(devices)} GPU(s)")
     for dev in devices:
         vram_gb = dev.total_memory / (1024 ** 3)
-        log.info(f"    {dev.name} ({vram_gb:.1f} GB) — {dev.uuid}")
+        log.debug(f"    {dev.name} ({vram_gb:.1f} GB) — {dev.uuid}")
 
     return config_path
 
@@ -163,7 +163,7 @@ def discover_sdxl_models(models_dir: str) -> dict[str, str]:
                             f"({models[model_name]}), skipping {dirpath}")
             else:
                 models[model_name] = dirpath
-                log.info(f"  Discovered SDXL model (diffusers): {model_name}")
+                log.debug(f"  Discovered SDXL model (diffusers): {model_name}")
             # Don't descend into diffusers model subdirectories
             dirnames.clear()
             continue
@@ -184,7 +184,7 @@ def discover_sdxl_models(models_dir: str) -> dict[str, str]:
                             f"({models[model_name]}), skipping {fpath}")
             else:
                 models[model_name] = fpath
-                log.info(f"  Discovered SDXL model (single-file): {model_name}")
+                log.debug(f"  Discovered SDXL model (single-file): {model_name}")
 
     return models
 
@@ -214,7 +214,7 @@ def _prefetch_sdxl_configs() -> None:
                 allow_patterns=_HF_CONFIG_PATTERNS,
                 local_files_only=True,
             )
-            log.info(f"  HF configs cached: {repo_id}")
+            log.debug(f"  HF configs cached: {repo_id}")
             continue
         except Exception:
             pass  # Not cached yet — download below
@@ -225,7 +225,7 @@ def _prefetch_sdxl_configs() -> None:
                 repo_id,
                 allow_patterns=_HF_CONFIG_PATTERNS,
             )
-            log.info(f"  HF configs downloaded: {repo_id}")
+            log.debug(f"  HF configs downloaded: {repo_id}")
         except Exception as ex:
             log.warning(f"  Failed to download HF configs for {repo_id}: {ex}")
             log.warning("  Single-file checkpoint extraction may fail without network access.")
@@ -243,7 +243,7 @@ def _background_model_init(
     """
     import time
     start_time = time.monotonic()
-    log.info("  Background init: starting...")
+    log.debug("  Background init: starting...")
 
     # ONE shared fingerprint pool — SDXL base models go first (priority),
     # then LoRA hashing reuses the same threads.
@@ -277,7 +277,7 @@ def _background_model_init(
     # CUDA context init: first op per device triggers expensive runtime init.
     # Driver serializes this internally so sequential is optimal.
     if gpus:
-        log.info(f"  Pre-warming CUDA contexts for {len(gpus)} GPU(s)...")
+        log.debug(f"  Pre-warming CUDA contexts for {len(gpus)} GPU(s)...")
         for gpu in gpus:
             torch.zeros(1, device=gpu.device)
 
@@ -323,7 +323,7 @@ def _background_model_init(
             t.start()
             tagger_threads.append(t)
     if tagger_threads:
-        log.info(f"  Tagger loading on {len(tagger_threads)} GPU(s) (background)")
+        log.debug(f"  Tagger loading on {len(tagger_threads)} GPU(s) (background)")
 
     # 5. Wait for model scanning to finish.
     # Base models get priority I/O — LoRA hashing starts after.
@@ -480,7 +480,7 @@ def _process_gpu_onload(gpu, app_state, types: set[str] | None = None) -> None:
                         evict_callback=_tagger_evict_cb,
                     )
                     gpu.mark_onload(fp)
-                    log.info(f"  GPU [{gpu.uuid}]: Pre-loaded tagger ({actual_vram // (1024*1024)}MB)")
+                    log.debug(f"  GPU [{gpu.uuid}]: Pre-loaded tagger ({actual_vram // (1024*1024)}MB)")
 
                 elif action["type"] == "upscale":
                     from handlers.upscale import load_model as load_upscale
@@ -489,7 +489,7 @@ def _process_gpu_onload(gpu, app_state, types: set[str] | None = None) -> None:
                     gpu.cache_model(comp.fingerprint, "upscale", model,
                                     comp.estimated_vram_bytes, source="realesrgan")
                     gpu.mark_onload(comp.fingerprint)
-                    log.info(f"  GPU [{gpu.uuid}]: Pre-loaded upscale model")
+                    log.debug(f"  GPU [{gpu.uuid}]: Pre-loaded upscale model")
 
                 elif action["type"] == "bgremove":
                     from handlers.bgremove import load_model as load_bgremove
@@ -498,7 +498,7 @@ def _process_gpu_onload(gpu, app_state, types: set[str] | None = None) -> None:
                     gpu.cache_model(comp.fingerprint, "bgremove", model,
                                     comp.estimated_vram_bytes, source="rmbg")
                     gpu.mark_onload(comp.fingerprint)
-                    log.info(f"  GPU [{gpu.uuid}]: Pre-loaded bgremove model")
+                    log.debug(f"  GPU [{gpu.uuid}]: Pre-loaded bgremove model")
 
                 elif action["type"] == "sdxl":
                     model_name = action["model"]
@@ -524,7 +524,7 @@ def _process_gpu_onload(gpu, app_state, types: set[str] | None = None) -> None:
                         gpu.cache_model(comp.fingerprint, category, model,
                                         comp.estimated_vram_bytes, source=source)
                         gpu.mark_onload(comp.fingerprint)
-                        log.info(f"  GPU [{gpu.uuid}]: Pre-loaded {category} from {source}")
+                        log.debug(f"  GPU [{gpu.uuid}]: Pre-loaded {category} from {source}")
 
             except Exception as ex:
                 log.log_exception(ex, f"GPU [{gpu.uuid}]: onload={entry} failed")
@@ -543,7 +543,7 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
                 if action["type"] == "tag":
                     fp = f"tagger:{gpu.uuid}"
                     gpu.mark_unevictable(fp)
-                    log.info(f"  GPU [{gpu.uuid}]: Marked tagger as unevictable")
+                    log.debug(f"  GPU [{gpu.uuid}]: Marked tagger as unevictable")
 
                 elif action["type"] == "upscale":
                     comp = app_state.registry.get_upscale_component()
@@ -564,7 +564,7 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
                             continue
                         comp = registry_comps[idx]
                         gpu.mark_unevictable(comp.fingerprint)
-                        log.info(f"  GPU [{gpu.uuid}]: Marked {category} ({model_name}) as unevictable")
+                        log.debug(f"  GPU [{gpu.uuid}]: Marked {category} ({model_name}) as unevictable")
 
             except Exception as ex:
                 log.log_exception(ex, f"GPU [{gpu.uuid}]: unevictable={entry} failed")
@@ -583,7 +583,7 @@ def main() -> None:
     args = _parse_args()
 
     # Start file logging before anything else so the full startup is captured.
-    log.init_file(os.path.abspath("logs/foxburrow.log"))
+    log.init_file(os.path.abspath("data/output.jsonl"))
     log.info("foxburrow starting (Python/PyTorch)")
     log.info(f"  PyTorch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, "
              f"CUDA {torch.version.cuda}")
@@ -597,7 +597,7 @@ def main() -> None:
     config_path = find_config()
     first_start = False
     if not config_path:
-        log.info("  No foxburrow.ini found — generating default configuration...")
+        log.debug("  No foxburrow.ini found — generating default configuration...")
         config_path = generate_default_config()
         first_start = True
 
@@ -618,13 +618,13 @@ def main() -> None:
         enabled_uuids = [cfg.uuid for cfg in config.gpus if cfg.enabled]
         if enabled_uuids:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(enabled_uuids)
-            log.info(f"  CUDA visibility: {len(enabled_uuids)} enabled GPU(s)")
+            log.debug(f"  CUDA visibility: {len(enabled_uuids)} enabled GPU(s)")
         elif config.gpus:
             # All GPUs disabled — hide everything
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             log.warning("  All GPUs are disabled in config — CUDA has no visible devices")
     else:
-        log.info(f"  CUDA_VISIBLE_DEVICES already set: {os.environ['CUDA_VISIBLE_DEVICES']}")
+        log.debug(f"  CUDA_VISIBLE_DEVICES already set: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
     # Safety gate: server won't start unless enabled=true
     if not config.server.enabled:
@@ -657,18 +657,18 @@ def main() -> None:
     # API secret status
     if config.server.secret:
         log.info(f"  API authentication: ENABLED")
-        log.info("    Header:  Authorization: Bearer <secret>")
-        log.info("    URL:     ?apikey=<secret>")
-        log.info("    See 'secret=' in foxburrow.ini for your token")
+        log.debug("    Header:  Authorization: Bearer <secret>")
+        log.debug("    URL:     ?apikey=<secret>")
+        log.debug("    See 'secret=' in foxburrow.ini for your token")
         if len(config.server.secret) < 12:
             log.warning("  Your API secret is very short — consider using at least 16 characters.")
     else:
-        log.info("")
+        log.debug("")
         log.warning("!!! WARNING: No API secret configured !!!")
         log.warning("  All API endpoints are PUBLICLY ACCESSIBLE.")
         log.warning("  Anyone who can reach this server can use it.")
         log.warning("  Add 'secret=<your_token>' to [server] in foxburrow.ini")
-        log.info("")
+        log.debug("")
     # Resolve models directory relative to working directory (project root)
     models_dir = os.path.normpath(os.path.abspath(config.server.models_dir))
     log.info(f"  Models dir: {models_dir}")
@@ -689,7 +689,7 @@ def main() -> None:
         app_state.lora_index = discover_loras(loras_dir)
         log.info(f"  Discovered {len(app_state.lora_index)} LoRA files")
     else:
-        log.info(f"  LoRA directory not found: {loras_dir} (skipping)")
+        log.debug(f"  LoRA directory not found: {loras_dir} (skipping)")
 
     # Discover upscale model (in models/other/)
     upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
@@ -698,7 +698,7 @@ def main() -> None:
         available_capabilities.add("upscale")
         from handlers.upscale import set_model_path
         set_model_path(upscale_path)
-        log.info(f"  Upscale model: {upscale_path}")
+        log.debug(f"  Upscale model: {upscale_path}")
 
     # Discover bgremove model (in models/other/)
     bgremove_found = False
@@ -707,7 +707,7 @@ def main() -> None:
         bgremove_found = True
         from handlers.bgremove import set_model_path
         set_model_path(bgremove_dir)
-        log.info(f"  BGRemove model: {bgremove_dir}")
+        log.debug(f"  BGRemove model: {bgremove_dir}")
     else:
         bgremove_path = discover_model_file(models_dir, os.path.join("other", "bgremove"),
                                             [".safetensors", ".pth", ".onnx"])
@@ -715,7 +715,7 @@ def main() -> None:
             bgremove_found = True
             from handlers.bgremove import set_model_path
             set_model_path(bgremove_path)
-            log.info(f"  BGRemove model: {bgremove_path}")
+            log.debug(f"  BGRemove model: {bgremove_path}")
     if bgremove_found:
         available_capabilities.add("bgremove")
 
@@ -793,7 +793,7 @@ def main() -> None:
             # Headless: override uvicorn's SIGINT handler — first Ctrl+C kills immediately.
             import signal
             def _force_exit(signum, frame):
-                log.info("  SIGINT — exiting")
+                log.debug("  SIGINT — exiting")
                 os._exit(0)
             signal.signal(signal.SIGINT, _force_exit)
             signal.signal(signal.SIGTERM, _force_exit)

@@ -30,13 +30,13 @@ class ProgressStreamer:
         await ws.accept()
         async with self._lock:
             self._connections.append(ws)
-        log.info(f"  WebSocket: Client connected ({len(self._connections)} total)")
+        log.debug(f"  WebSocket: Client connected ({len(self._connections)} total)")
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             if ws in self._connections:
                 self._connections.remove(ws)
-        log.info(f"  WebSocket: Client disconnected ({len(self._connections)} total)")
+        log.debug(f"  WebSocket: Client disconnected ({len(self._connections)} total)")
 
     async def broadcast_progress(self, job: "InferenceJob") -> None:
         """Broadcast denoise progress for a job."""

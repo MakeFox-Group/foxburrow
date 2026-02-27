@@ -36,7 +36,7 @@ def _fix_from_pretrained(model: torch.nn.Module, label: str) -> None:
     repair_accelerate_leak()
     n = fix_meta_tensors(model)
     if n:
-        log.info(f"  SDXL: Fixed {n} meta tensor(s) in {label}")
+        log.debug(f"  SDXL: Fixed {n} meta tensor(s) in {label}")
 
 
 # Constants
@@ -141,7 +141,7 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
 
     # We're the extractor — heavy work runs lock-free (parallel with other checkpoints)
     try:
-        log.info(f"  SDXL: Extracting components from "
+        log.debug(f"  SDXL: Extracting components from "
                  f"{os.path.basename(checkpoint_path)} (this may take a moment)...")
 
         from diffusers import StableDiffusionXLPipeline
@@ -164,9 +164,9 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         # some diffusers versions require the model on a CUDA device for this call)
         try:
             components["sdxl_unet"].enable_xformers_memory_efficient_attention()
-            log.info("  SDXL: xformers enabled on UNet")
+            log.debug("  SDXL: xformers enabled on UNet")
         except Exception as ex:
-            log.info(f"  SDXL: xformers not available, using default attention ({ex})")
+            log.debug(f"  SDXL: xformers not available, using default attention ({ex})")
 
         # Fix any meta tensors left by from_pretrained/accelerate, then
         # move neural-net components to CPU and set eval mode
@@ -181,7 +181,7 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         with _extraction_lock:
             _checkpoint_cache[checkpoint_path] = components
 
-        log.info(f"  SDXL: All components extracted to CPU cache")
+        log.debug(f"  SDXL: All components extracted to CPU cache")
         return components
     finally:
         # Wake any threads waiting on this checkpoint (success or failure)
@@ -205,7 +205,7 @@ def init_tokenizers(model_path: str) -> None:
         _tokenizer_1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         _tokenizer_2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2")
 
-    log.info("  SDXL: Tokenizers loaded")
+    log.debug("  SDXL: Tokenizers loaded")
 
 
 def load_component(category: str, model_dir: str | None, device: torch.device) -> object:
@@ -228,7 +228,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "text_encoder (CLIP-L)")
         model.to(device)
         model.eval()
-        log.info(f"  SDXL: Loaded text_encoder (CLIP-L) to {device}")
+        log.debug(f"  SDXL: Loaded text_encoder (CLIP-L) to {device}")
         return model
 
     elif category == "sdxl_te2":
@@ -237,7 +237,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "text_encoder_2 (CLIP-bigG)")
         model.to(device)
         model.eval()
-        log.info(f"  SDXL: Loaded text_encoder_2 (CLIP-bigG) to {device}")
+        log.debug(f"  SDXL: Loaded text_encoder_2 (CLIP-bigG) to {device}")
         return model
 
     elif category == "sdxl_unet":
@@ -249,9 +249,9 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         model.eval()
         try:
             model.enable_xformers_memory_efficient_attention()
-            log.info(f"  SDXL: Loaded UNet with xformers to {device}")
+            log.debug(f"  SDXL: Loaded UNet with xformers to {device}")
         except Exception:
-            log.info(f"  SDXL: Loaded UNet (no xformers) to {device}")
+            log.debug(f"  SDXL: Loaded UNet (no xformers) to {device}")
         return model
 
     elif category in ("sdxl_vae", "sdxl_vae_enc"):
@@ -262,7 +262,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "VAE")
         model.to(device)
         model.eval()
-        log.info(f"  SDXL: Loaded VAE (float32) to {device}")
+        log.debug(f"  SDXL: Loaded VAE (float32) to {device}")
         return model
 
     else:
@@ -298,7 +298,7 @@ def _load_component_from_single_file(
     else:
         model.to(device)
 
-    log.info(f"  SDXL: Moved {category} to {device} (from checkpoint cache)")
+    log.debug(f"  SDXL: Moved {category} to {device} (from checkpoint cache)")
     return model
 
 
@@ -326,7 +326,7 @@ def tokenize(job: InferenceJob) -> None:
     if inp.regional_prompting and detect_regional_keywords(inp.prompt):
         regional = parse_regional_prompt(inp.prompt, inp.negative_prompt)
         job.regional_info = regional
-        log.info(f"  SDXL: Regional prompting detected — {len(regional.regions)} regions"
+        log.debug(f"  SDXL: Regional prompting detected — {len(regional.regions)} regions"
                  + (f" + base" if regional.base_prompt else ""))
 
         # Tokenize each region's prompt + shared negative
@@ -406,7 +406,7 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         _text_encode_regional(job, gpu)
         return
 
-    log.info("  SDXL: Running text encoders...")
+    log.debug("  SDXL: Running text encoders...")
 
     # Get models from GPU cache
     te1 = _get_cached_model(gpu, "sdxl_te1", job)
@@ -438,11 +438,11 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
 
     # Forge: zero out all negative embeddings when negative prompt is empty
     if not inp.negative_prompt or not inp.negative_prompt.strip():
-        log.info("  SDXL: Empty negative prompt — zeroing embeddings (Forge behavior)")
+        log.debug("  SDXL: Empty negative prompt — zeroing embeddings (Forge behavior)")
         neg_prompt_embeds.zero_()
         neg_pooled_prompt_embeds.zero_()
 
-    log.info(f"  SDXL: Text encoding complete. embeds={list(prompt_embeds.shape)} "
+    log.debug(f"  SDXL: Text encoding complete. embeds={list(prompt_embeds.shape)} "
              f"pooled={list(pooled_prompt_embeds.shape)}")
 
     job.encode_result = SdxlEncodeResult(
@@ -459,7 +459,7 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     region_toks = job.regional_tokenize_results
     inp = job.sdxl_input
 
-    log.info(f"  SDXL: Running regional text encoders ({len(region_toks)} regions)...")
+    log.debug(f"  SDXL: Running regional text encoders ({len(region_toks)} regions)...")
 
     te1 = _get_cached_model(gpu, "sdxl_te1", job)
     te2 = _get_cached_model(gpu, "sdxl_te2", job)
@@ -502,7 +502,7 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
             _apply_token_weights(nr_h1, tok.neg_weights_1)
             _apply_token_weights(nr_h2, tok.neg_weights_2)
             neg_region_embeds.append(torch.cat([nr_h1, nr_h2], dim=2))
-        log.info(f"  SDXL: Encoded {len(neg_region_embeds)} per-region negatives")
+        log.debug(f"  SDXL: Encoded {len(neg_region_embeds)} per-region negatives")
 
     # Encode base prompt if present
     base_embeds = None
@@ -522,14 +522,14 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     # Forge: zero out negative embeddings when negative prompt is empty
     neg_text = regional.negative_prompt
     if not neg_text or not neg_text.strip():
-        log.info("  SDXL: Empty negative prompt — zeroing embeddings (Forge behavior)")
+        log.debug("  SDXL: Empty negative prompt — zeroing embeddings (Forge behavior)")
         neg_embeds.zero_()
         n_pooled.zero_()
         if neg_region_embeds is not None:
             for nre in neg_region_embeds:
                 nre.zero_()
 
-    log.info(f"  SDXL: Regional text encoding complete. "
+    log.debug(f"  SDXL: Regional text encoding complete. "
              f"{len(region_embeds)} region embeds"
              f"{', per-region negatives' if neg_region_embeds else ''}"
              f", pooled={list(pooled.shape)}")
@@ -693,7 +693,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         start_step = max(steps - init_timestep, 0)
 
         if start_step >= len(timesteps):
-            log.info(f"  SDXL: Hires denoising skipped (strength={strength:.2f}, no active steps)")
+            log.debug(f"  SDXL: Hires denoising skipped (strength={strength:.2f}, no active steps)")
             return
 
         # Add noise at the start timestep
@@ -704,7 +704,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                                       timesteps[start_step:start_step+1])
 
         active_count = len(timesteps) - start_step
-        log.info(f"  SDXL: Hires denoising (strength={strength:.2f}, {active_count} active steps "
+        log.debug(f"  SDXL: Hires denoising (strength={strength:.2f}, {active_count} active steps "
                  f"of {len(timesteps)} total, startStep={start_step})")
     else:
         # Base pass: start from pure noise
@@ -714,7 +714,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         ) * scheduler.init_noise_sigma
         start_step = 0
 
-        log.info(f"  SDXL: Denoising ({len(timesteps)} steps, "
+        log.debug(f"  SDXL: Denoising ({len(timesteps)} steps, "
                  f"latent=[1,4,{latent_h},{latent_w}])...")
 
     # Time conditioning: [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
@@ -747,7 +747,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _stride_y = unet_tile_h - UNET_TILE_OVERLAP
         _tiles_y = max(1, math.ceil((latent_h - UNET_TILE_OVERLAP) / _stride_y))
         _tiles_x = max(1, math.ceil((latent_w - UNET_TILE_OVERLAP) / _stride_x))
-        log.info(f"  SDXL: MultiDiffusion enabled — "
+        log.debug(f"  SDXL: MultiDiffusion enabled — "
                  f"{_tiles_x}x{_tiles_y} tiles "
                  f"({unet_tile_w*8}x{unet_tile_h*8}px, "
                  f"{UNET_TILE_OVERLAP*8}px overlap)")
@@ -792,7 +792,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         log.warning(f"  SDXL: Denoise — BAD latents after denoising: "
                     f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
     else:
-        log.info(f"  SDXL: Denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
+        log.debug(f"  SDXL: Denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
 
     job.latents = latents
 
@@ -937,7 +937,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         start_step = max(steps - init_timestep, 0)
 
         if start_step >= len(timesteps):
-            log.info(f"  SDXL: Regional hires denoising skipped (strength={strength:.2f}, no active steps)")
+            log.debug(f"  SDXL: Regional hires denoising skipped (strength={strength:.2f}, no active steps)")
             return
 
         upscaled_latents = upscaled_latents.to(device=device, dtype=torch.float16)
@@ -947,7 +947,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
                                       timesteps[start_step:start_step+1])
 
         active_count = len(timesteps) - start_step
-        log.info(f"  SDXL: Regional hires denoising (strength={strength:.2f}, {active_count} active steps "
+        log.debug(f"  SDXL: Regional hires denoising (strength={strength:.2f}, {active_count} active steps "
                  f"of {len(timesteps)} total, startStep={start_step})")
     else:
         latents = torch.randn(
@@ -956,7 +956,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         ) * scheduler.init_noise_sigma
         start_step = 0
 
-        log.info(f"  SDXL: Regional denoising ({len(timesteps)} steps, "
+        log.debug(f"  SDXL: Regional denoising ({len(timesteps)} steps, "
                  f"{len(regional.regions)} regions, latent=[1,4,{latent_h},{latent_w}])...")
 
     # Time conditioning
@@ -1022,7 +1022,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         _stride_y = unet_tile_h - UNET_TILE_OVERLAP
         _tiles_y = max(1, math.ceil((latent_h - UNET_TILE_OVERLAP) / _stride_y))
         _tiles_x = max(1, math.ceil((latent_w - UNET_TILE_OVERLAP) / _stride_x))
-        log.info(f"  SDXL: Regional MultiDiffusion enabled — "
+        log.debug(f"  SDXL: Regional MultiDiffusion enabled — "
                  f"{_tiles_x}x{_tiles_y} tiles "
                  f"({unet_tile_w*8}x{unet_tile_h*8}px, "
                  f"{UNET_TILE_OVERLAP*8}px overlap)")
@@ -1091,7 +1091,7 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         log.warning(f"  SDXL: Regional denoise — BAD latents: "
                     f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
     else:
-        log.info(f"  SDXL: Regional denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
+        log.debug(f"  SDXL: Regional denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
 
     job.latents = latents
 
@@ -1162,7 +1162,7 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
                     f"latent_range=[{lat_min:.4f}, {lat_max:.4f}] "
                     f"has_nan={lat_has_nan}")
 
-    log.info(f"  SDXL: VAE decode complete. Image={image.width}x{image.height} "
+    log.debug(f"  SDXL: VAE decode complete. Image={image.width}x{image.height} "
              f"mean_px={mean_pixel:.1f}")
     return image
 
@@ -1179,7 +1179,7 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
     latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
     job.latents = latents
-    log.info(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
+    log.debug(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
 
 
 def latent_upscale(job: InferenceJob) -> None:
@@ -1194,7 +1194,7 @@ def latent_upscale(job: InferenceJob) -> None:
     dst_h = hires.hires_height // 8
     dst_w = hires.hires_width // 8
 
-    log.info(f"  SDXL: Latent upscale (Lanczos3) "
+    log.debug(f"  SDXL: Latent upscale (Lanczos3) "
              f"{list(latents.shape)} → [1,4,{dst_h},{dst_w}]")
 
     # Use torch interpolation (bicubic is closest to Lanczos for latents)
@@ -1236,30 +1236,30 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
     # Clear tile progress before upscale phase
     job.stage_step = 0
     job.stage_total_steps = 0
-    log.info(f"  HiresTransform: VAE decode → {intermediate.width}x{intermediate.height} "
+    log.debug(f"  HiresTransform: VAE decode → {intermediate.width}x{intermediate.height} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
     from handlers.upscale import upscale_image
     upscaled = upscale_image(intermediate, gpu)
-    log.info(f"  HiresTransform: RealESRGAN 2x → {upscaled.width}x{upscaled.height} "
+    log.debug(f"  HiresTransform: RealESRGAN 2x → {upscaled.width}x{upscaled.height} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
     intermediate.close()
 
     if upscaled.width != target_w or upscaled.height != target_h:
         upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
-        log.info(f"  HiresTransform: Resize → {target_w}x{target_h} "
+        log.debug(f"  HiresTransform: Resize → {target_w}x{target_h} "
                  f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
     tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
     tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
     encoded = _vae_encode(upscaled, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
-    log.info(f"  HiresTransform: VAE encode → {list(encoded.shape)} "
+    log.debug(f"  HiresTransform: VAE encode → {list(encoded.shape)} "
              f"({(time.monotonic()-t0)*1000:.0f}ms)")
     upscaled.close()
 
     job.latents = encoded
     job.is_hires_pass = True
-    log.info(f"  HiresTransform: Complete ({(time.monotonic()-t0)*1000:.0f}ms total)")
+    log.debug(f"  HiresTransform: Complete ({(time.monotonic()-t0)*1000:.0f}ms total)")
 
 
 def calculate_base_resolution(target_w: int, target_h: int) -> tuple[int, int]:
@@ -1380,7 +1380,7 @@ def _tokenize_weighted(
         tokens[i] = pad_token_id
         weights[i] = 1.0
 
-    log.info(f"    Tokenized: {count} content tokens, pad={pad_token_id}, total={limit}")
+    log.debug(f"    Tokenized: {count} content tokens, pad={pad_token_id}, total={limit}")
 
     return tokens, weights, mask
 
@@ -1501,7 +1501,7 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
     tiles_x = max(1, (img_w - overlap_px + stride_w_px - 1) // stride_w_px)
 
     total_tiles = tiles_x * tiles_y
-    log.info(f"  SDXL: Tiled VAE encode {img_w}x{img_h} — "
+    log.debug(f"  SDXL: Tiled VAE encode {img_w}x{img_h} — "
              f"{tiles_x}x{tiles_y} grid ({total_tiles} tiles, "
              f"tile={tile_w_px}x{tile_h_px})")
 
@@ -1560,10 +1560,10 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
             if job is not None:
                 job.stage_step = tile_count
 
-        log.info(f"  SDXL: Tiled VAE encode row {ty+1}/{tiles_y}")
+        log.debug(f"  SDXL: Tiled VAE encode row {ty+1}/{tiles_y}")
 
     latents = torch.from_numpy(lat_sum / weights).to(dtype=torch.float16, device=device)
-    log.info(f"  SDXL: Tiled VAE encode complete. shape={list(latents.shape)}")
+    log.debug(f"  SDXL: Tiled VAE encode complete. shape={list(latents.shape)}")
     return latents
 
 
@@ -1592,7 +1592,7 @@ def _vae_decode_tiled(
     tiles_x = max(1, (lat_w - LATENT_TILE_OVERLAP + stride_w - 1) // stride_w)
 
     total_tiles = tiles_x * tiles_y
-    log.info(f"  SDXL: Tiled VAE decode {img_w}x{img_h} — "
+    log.debug(f"  SDXL: Tiled VAE decode {img_w}x{img_h} — "
              f"{tiles_x}x{tiles_y} grid ({total_tiles} tiles, "
              f"tile={lat_tile_w*8}x{lat_tile_h*8})")
 
@@ -1652,7 +1652,7 @@ def _vae_decode_tiled(
     rgb_out = np.clip(rgb_sum / w_safe[np.newaxis] * 255, 0, 255).astype(np.uint8)  # [3, H, W]
     image = Image.fromarray(rgb_out.transpose(1, 2, 0), "RGB")
 
-    log.info(f"  SDXL: Tiled VAE decode complete. Image={img_w}x{img_h} ({tile_count} tiles)")
+    log.debug(f"  SDXL: Tiled VAE decode complete. Image={img_w}x{img_h} ({tile_count} tiles)")
     return image
 
 
@@ -1700,7 +1700,7 @@ def _ensure_loras(unet, lora_specs: list, gpu: GpuInstance, lora_index: dict) ->
 
     if adapter_names:
         unet.set_adapters(adapter_names, adapter_weights)
-        log.info(f"  LoRA: Activated {len(adapter_names)} adapter(s): "
+        log.debug(f"  LoRA: Activated {len(adapter_names)} adapter(s): "
                  f"{', '.join(f'{n}={w:.2f}' for n, w in zip(adapter_names, adapter_weights))}")
     elif hasattr(unet, 'peft_config') and unet.peft_config:
         unet.disable_adapters()
@@ -1823,7 +1823,7 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     n_unet_keys = sum(1 for k in converted_sd if k.startswith("unet."))
-    log.info(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
+    log.debug(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
              f"({n_unet_keys} unet params, {lora_size // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
 
 

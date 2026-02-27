@@ -50,7 +50,7 @@ class JobQueue:
     def enqueue(self, job: InferenceJob) -> None:
         with self._lock:
             self._jobs.append(job)
-        log.info(f"  Queue: Enqueued {job} (queue depth: {self.count})")
+        log.debug(f"  Queue: Enqueued {job} (queue depth: {self.count})")
         self._wake_scheduler()
 
     def get_work_groups(self) -> list[WorkGroup]:

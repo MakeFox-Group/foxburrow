@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -397,7 +397,7 @@ async def rescan_models():
         "total": len(state.sdxl_models) + len(added),
     }
 
-    log.info(f"  Model rescan: +{summary['added']} -{summary['removed']} "
+    log.debug(f"  Model rescan: +{summary['added']} -{summary['removed']} "
              f"={summary['unchanged']} (total: {summary['total']})")
 
     return summary
@@ -523,7 +523,7 @@ async def add_gpu(uuid: str):
         worker = GpuWorker(gpu, state.queue, scheduler._wake)
         scheduler.workers.append(worker)
         worker.start()
-        log.info(f"  GPU [{gpu.uuid}] re-added with worker")
+        log.debug(f"  GPU [{gpu.uuid}] re-added with worker")
 
     return {
         "added": True,
@@ -568,7 +568,7 @@ async def generate(req: GenerateRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Generate request: {orig_w}x{orig_h} steps={req.steps} "
+    log.debug(f"Generate request: {orig_w}x{orig_h} steps={req.steps} "
              f"cfg={req.cfg_scale} seed={seed} model={model_short}"
              + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
@@ -601,7 +601,7 @@ async def generate(req: GenerateRequest):
         return _error(500, result.error or "Unknown error")
 
     output = _resize_if_needed(result.output_image, orig_w, orig_h)
-    log.info(f"Generate complete: {result.output_image.width}x{result.output_image.height}"
+    log.debug(f"Generate complete: {result.output_image.width}x{result.output_image.height}"
              + (f" → {orig_w}x{orig_h}" if (gen_w, gen_h) != (orig_w, orig_h) else ""))
     return _image_response(output)
 
@@ -659,7 +659,7 @@ async def generate_hires(req: GenerateHiresRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"GenerateHires request: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
+    log.debug(f"GenerateHires request: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
              f"steps={req.steps} hires_steps={req.hires_steps} "
              f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
              f"seed={seed} model={model_short}"
@@ -702,7 +702,7 @@ async def generate_hires(req: GenerateHiresRequest):
         return _error(500, result.error or "Unknown error")
 
     output = _resize_if_needed(result.output_image, orig_w, orig_h)
-    log.info(f"GenerateHires complete: {result.output_image.width}x{result.output_image.height}"
+    log.debug(f"GenerateHires complete: {result.output_image.width}x{result.output_image.height}"
              + (f" → {orig_w}x{orig_h}" if (gen_w, gen_h) != (orig_w, orig_h) else ""))
     return _image_response(output)
 
@@ -738,7 +738,7 @@ async def generate_latents(req: GenerateRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"GenerateLatents request: {req.width}x{req.height} steps={req.steps} "
+    log.debug(f"GenerateLatents request: {req.width}x{req.height} steps={req.steps} "
              f"cfg={req.cfg_scale} seed={seed} model={model_short}"
              + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
@@ -793,7 +793,7 @@ async def generate_latents(req: GenerateRequest):
     buf.write(float_data)
 
     buf.seek(0)
-    log.info(f"GenerateLatents complete: shape={shape} "
+    log.debug(f"GenerateLatents complete: shape={shape} "
              f"({len(float_data)} bytes latent, {len(metadata)} bytes meta)")
 
     return Response(content=buf.getvalue(), media_type="application/x-fox-latent")
@@ -862,7 +862,7 @@ async def decode_latents(request: Request):
         return _error(400, err)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"DecodeLatents request: shape={shape} model={model_short}")
+    log.debug(f"DecodeLatents request: shape={shape} model={model_short}")
 
     qp = request.query_params
     try:
@@ -893,7 +893,7 @@ async def decode_latents(request: Request):
     if not result.success:
         return _error(500, result.error or "Unknown error")
 
-    log.info(f"DecodeLatents complete: {result.output_image.width}x{result.output_image.height}")
+    log.debug(f"DecodeLatents complete: {result.output_image.width}x{result.output_image.height}")
     return _image_response(result.output_image)
 
 
@@ -932,7 +932,7 @@ async def encode_latents(request: Request):
     vae_tile_h = int(qp.get("vae_tile_height", "0"))
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"EncodeLatents request: {input_image.width}x{input_image.height} model={model_short}"
+    log.debug(f"EncodeLatents request: {input_image.width}x{input_image.height} model={model_short}"
              + (f" vae_tile={vae_tile_w}x{vae_tile_h}" if vae_tile_w or vae_tile_h else ""))
 
     factory = state.pipeline_factory
@@ -973,7 +973,7 @@ async def encode_latents(request: Request):
     buf.write(metadata)
     buf.write(float_data)
 
-    log.info(f"EncodeLatents complete: shape={shape}")
+    log.debug(f"EncodeLatents complete: shape={shape}")
     buf.seek(0)
     return Response(content=buf.getvalue(), media_type="application/x-fox-latent")
 
@@ -1101,7 +1101,7 @@ async def hires_latents(request: Request):
         prompt, negative_prompt, None)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"HiresLatents request: base={base_w}x{base_h} hires={hires_width}x{hires_height} "
+    log.debug(f"HiresLatents request: base={base_w}x{base_h} hires={hires_width}x{hires_height} "
              f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
              f"cfg={cfg_scale} seed={seed} model={model_short}"
              + (" [skip_transform]" if skip_transform else "")
@@ -1174,7 +1174,7 @@ async def hires_latents(request: Request):
     out.write(metadata)
     out.write(float_data)
 
-    log.info(f"HiresLatents complete: shape={shape_out}")
+    log.debug(f"HiresLatents complete: shape={shape_out}")
     out.seek(0)
     return Response(content=out.getvalue(), media_type="application/x-fox-latent")
 
@@ -1194,7 +1194,7 @@ async def upscale(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"Upscale request: {input_image.width}x{input_image.height}")
+    log.debug(f"Upscale request: {input_image.width}x{input_image.height}")
 
     factory = state.pipeline_factory
     queue = state.queue
@@ -1211,7 +1211,7 @@ async def upscale(request: Request):
     if not result.success:
         return _error(500, result.error or "Unknown error")
 
-    log.info(f"Upscale complete: {result.output_image.width}x{result.output_image.height}")
+    log.debug(f"Upscale complete: {result.output_image.width}x{result.output_image.height}")
     return _image_response(result.output_image, mode="RGBA")
 
 
@@ -1230,7 +1230,7 @@ async def bgremove(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"BGRemove request: {input_image.width}x{input_image.height}")
+    log.debug(f"BGRemove request: {input_image.width}x{input_image.height}")
 
     factory = state.pipeline_factory
     queue = state.queue
@@ -1247,7 +1247,7 @@ async def bgremove(request: Request):
     if not result.success:
         return _error(500, result.error or "Unknown error")
 
-    log.info(f"BGRemove complete: {result.output_image.width}x{result.output_image.height}")
+    log.debug(f"BGRemove complete: {result.output_image.width}x{result.output_image.height}")
     return _image_response(result.output_image, mode="RGBA")
 
 
@@ -1266,11 +1266,11 @@ async def tag(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"Tag request: {input_image.width}x{input_image.height} on GPU [{gpu.uuid}]")
+    log.debug(f"Tag request: {input_image.width}x{input_image.height} on GPU [{gpu.uuid}]")
 
     try:
         tags = process_image(input_image, gpu)
-        log.info(f"Tag complete: {len(tags)} tags")
+        log.debug(f"Tag complete: {len(tags)} tags")
         return {"tags": tags}
     except Exception as ex:
         log.log_exception(ex, "Tag failed")
@@ -1319,7 +1319,7 @@ async def enqueue_generate(req: GenerateRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue generate: {orig_w}x{orig_h} steps={req.steps} "
+    log.debug(f"Enqueue generate: {orig_w}x{orig_h} steps={req.steps} "
              f"cfg={req.cfg_scale} seed={seed} model={model_short}"
              + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
 
@@ -1404,7 +1404,7 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
         req.prompt, req.negative_prompt, req.loras)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue generate-hires: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
+    log.debug(f"Enqueue generate-hires: base={base_w}x{base_h} hires={orig_w}x{orig_h} "
              f"steps={req.steps} hires_steps={req.hires_steps} "
              f"strength={req.hires_denoising_strength:.2f} cfg={req.cfg_scale} "
              f"seed={seed} model={model_short}"
@@ -1462,7 +1462,7 @@ async def enqueue_upscale(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"Enqueue upscale: {input_image.width}x{input_image.height}")
+    log.debug(f"Enqueue upscale: {input_image.width}x{input_image.height}")
 
     factory = state.pipeline_factory
     queue = state.queue
@@ -1493,7 +1493,7 @@ async def enqueue_bgremove(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"Enqueue bgremove: {input_image.width}x{input_image.height}")
+    log.debug(f"Enqueue bgremove: {input_image.width}x{input_image.height}")
 
     factory = state.pipeline_factory
     queue = state.queue
@@ -1524,7 +1524,7 @@ async def enqueue_tag(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.info(f"Enqueue tag: {input_image.width}x{input_image.height}")
+    log.debug(f"Enqueue tag: {input_image.width}x{input_image.height}")
 
     from scheduling.job import InferenceJob, JobType, JobResult
     job = InferenceJob(
@@ -1543,7 +1543,7 @@ async def enqueue_tag(request: Request):
         state.job_results[job.job_id] = (tag_bytes, "application/json")
         job.completed_at = datetime.utcnow()
         job.set_result(JobResult(success=True))
-        log.info(f"Enqueue tag complete: {len(tags)} tags, job_id={job.job_id}")
+        log.debug(f"Enqueue tag complete: {len(tags)} tags, job_id={job.job_id}")
     except Exception as ex:
         job.completed_at = datetime.utcnow()
         job.set_result(JobResult(success=False, error=str(ex)))
@@ -1643,7 +1643,7 @@ async def enqueue_enhance(request: Request):
         # Image is already large enough — just resize to target dimensions
         if base_w != gen_hires_w or base_h != gen_hires_h:
             input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
-            log.info(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
+            log.debug(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
                      f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
 
     # Parse LoRA tags from prompt
@@ -1651,7 +1651,7 @@ async def enqueue_enhance(request: Request):
         prompt, negative_prompt, None)
 
     model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-    log.info(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
+    log.debug(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
              f"upscale={'yes' if needs_upscale else 'no'} "
              f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
              f"cfg={cfg_scale} seed={seed} model={model_short}"
@@ -1824,6 +1824,7 @@ async def get_logs(
     search: str | None = None,
     before: str | None = None,
     after: str | None = None,
+    output_format: str = Query("text", alias="format"),
 ):
     """Return recent log lines with optional filtering.
 
@@ -1834,6 +1835,7 @@ async def get_logs(
         search:  Case-insensitive substring search across log lines
         before:  Only lines before this timestamp (ISO 8601 or HH:MM:SS)
         after:   Only lines after this timestamp (ISO 8601 or HH:MM:SS)
+        format:  Response format: "text" (default, human-readable) or "jsonl" (raw JSONL)
     """
     log_path = log.get_log_path()
     if log_path is None or not os.path.isfile(log_path):
@@ -1843,39 +1845,66 @@ async def get_logs(
 
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+            raw_lines = f.readlines()
     except OSError as ex:
         return _error(500, f"Failed to read log file: {ex}")
 
-    # Apply filters
-    filtered = all_lines
+    # Parse each line as JSON, with fallback for malformed lines
+    records: list[dict] = []
+    for raw in raw_lines:
+        raw = raw.rstrip("\n")
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            # Fallback for malformed or legacy plain-text lines
+            rec = {"ts": "", "level": "INFO", "msg": raw}
+        records.append(rec)
 
+    # Apply filters on parsed records
     if level:
-        level_tag = f"[{level.upper()}]"
-        filtered = [ln for ln in filtered if level_tag in ln]
+        level_upper = level.upper()
+        records = [r for r in records if r.get("level", "").upper() == level_upper]
 
     if search:
         search_lower = search.lower()
-        filtered = [ln for ln in filtered if search_lower in ln.lower()]
+        records = [r for r in records if search_lower in r.get("msg", "").lower()]
 
     if after or before:
-        filtered = _filter_by_time(filtered, after=after, before=before)
+        records = _filter_by_time(records, after=after, before=before)
 
     # Apply offset + limit from the tail
-    total = len(filtered)
+    total = len(records)
     if offset > 0:
-        filtered = filtered[:max(0, total - offset)]
-    filtered = filtered[-lines:]
+        records = records[:max(0, total - offset)]
+    records = records[-lines:]
+
+    headers = {"X-Total-Lines": str(total), "X-Returned-Lines": str(len(records))}
+
+    if output_format == "jsonl":
+        content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+        return Response(content=content, media_type="application/x-ndjson", headers=headers)
+
+    # Default: human-readable text
+    text_lines = []
+    for r in records:
+        ts = r.get("ts", "")
+        # Convert ISO-T format to space-separated for display
+        ts_display = ts.replace("T", " ") if ts else "?"
+        lvl = r.get("level", "?")
+        msg = r.get("msg", "")
+        text_lines.append(f"[{ts_display}] [{lvl}] {msg}\n")
 
     return Response(
-        content="".join(filtered),
+        content="".join(text_lines),
         media_type="text/plain; charset=utf-8",
-        headers={"X-Total-Lines": str(total), "X-Returned-Lines": str(len(filtered))},
+        headers=headers,
     )
 
 
-def _filter_by_time(lines: list[str], after: str | None, before: str | None) -> list[str]:
-    """Filter log lines by timestamp range."""
+def _filter_by_time(records: list[dict], after: str | None, before: str | None) -> list[dict]:
+    """Filter parsed log records by timestamp range."""
     from datetime import datetime as _dt
 
     def _parse_ts(s: str) -> _dt | None:
@@ -1896,20 +1925,17 @@ def _filter_by_time(lines: list[str], after: str | None, before: str | None) -> 
     after_dt = _parse_ts(after) if after else None
     before_dt = _parse_ts(before) if before else None
     if after_dt is None and before_dt is None:
-        return lines
+        return records
 
     result = []
-    for ln in lines:
-        # Extract timestamp: [2026-02-26 10:14:24.918]
-        if len(ln) > 25 and ln[0] == "[":
-            ts_str = ln[1:24]
+    for rec in records:
+        ts_str = rec.get("ts", "")
+        if ts_str:
             ts = _parse_ts(ts_str)
-            if ts is None:
-                result.append(ln)
-                continue
-            if after_dt and ts < after_dt:
-                continue
-            if before_dt and ts > before_dt:
-                continue
-        result.append(ln)
+            if ts is not None:
+                if after_dt and ts < after_dt:
+                    continue
+                if before_dt and ts > before_dt:
+                    continue
+        result.append(rec)
     return result

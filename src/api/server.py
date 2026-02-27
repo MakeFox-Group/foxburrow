@@ -47,7 +47,7 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
             await on_startup()
         yield
         # Graceful shutdown
-        log.info("  Shutting down...")
+        log.debug("  Shutting down...")
         cleanup_task.cancel()
         if app_state.fs_watcher:
             await app_state.fs_watcher.stop()
@@ -58,7 +58,7 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
             for w in scheduler.workers:
                 if w._task:
                     w._task.cancel()
-        log.info("  Shutdown complete.")
+        log.debug("  Shutdown complete.")
 
     app = FastAPI(title="foxburrow", version="2.0.0", lifespan=lifespan)
 

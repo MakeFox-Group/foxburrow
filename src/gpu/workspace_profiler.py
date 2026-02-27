@@ -153,7 +153,7 @@ def _save_cache(
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
-    log.info(f"  WorkspaceProfiler: Saved cache → {path}")
+    log.debug(f"  WorkspaceProfiler: Saved cache → {path}")
 
 
 # ── Dummy input creation ─────────────────────────────────────────
@@ -382,7 +382,7 @@ def profile_component(
     conv_ws: dict[str, int] = {}
 
     t_start = time.monotonic()
-    log.info(f"  WorkspaceProfiler: Profiling {component_type} on {gpu_model} "
+    log.debug(f"  WorkspaceProfiler: Profiling {component_type} on {gpu_model} "
              f"({len(grid)} resolutions)...")
 
     for w, h in grid:
@@ -392,7 +392,7 @@ def profile_component(
                 component_type, model, w, h, device)
             results[key] = working_mem
             conv_ws[key] = max_workspace
-            log.info(f"    {key}: working={working_mem // (1024**2)}MB, "
+            log.debug(f"    {key}: working={working_mem // (1024**2)}MB, "
                      f"conv_ws={max_workspace // (1024**2)}MB")
         except torch.cuda.OutOfMemoryError:
             log.warning(f"    {key}: OOM — stopping grid (will extrapolate)")
@@ -408,7 +408,7 @@ def profile_component(
                 torch.cuda.empty_cache()
 
     elapsed = time.monotonic() - t_start
-    log.info(f"  WorkspaceProfiler: Done — {component_type}: "
+    log.debug(f"  WorkspaceProfiler: Done — {component_type}: "
              f"{len(results)} resolutions in {elapsed:.1f}s")
 
     _save_cache(component_type, gpu_model, results, conv_ws)
@@ -458,7 +458,7 @@ def ensure_profiled(
     if cached is not None:
         with _lock:
             _working_mem_caches[cache_key] = cached
-        log.info(f"  WorkspaceProfiler: Loaded {component_type} cache for {gpu_model} "
+        log.debug(f"  WorkspaceProfiler: Loaded {component_type} cache for {gpu_model} "
                  f"({len(cached)} resolutions from disk)")
         return cached
 
@@ -557,4 +557,4 @@ def invalidate_cache(component_type: str, gpu_model: str) -> None:
     path = _cache_path(component_type, gpu_model)
     if path.exists():
         path.unlink()
-        log.info(f"  WorkspaceProfiler: Invalidated cache {path}")
+        log.debug(f"  WorkspaceProfiler: Invalidated cache {path}")

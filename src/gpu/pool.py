@@ -395,7 +395,7 @@ class GpuInstance:
                             model_entry.evict_callback()
                         self._safe_to_cpu(model_entry)
                         torch.cuda.empty_cache()
-                        log.info(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
+                        log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                                  f"(~{model_entry.estimated_vram // (1024*1024)}MB, "
                                  f"non-current group)")
                         return model_entry
@@ -410,7 +410,7 @@ class GpuInstance:
                     model_entry.evict_callback()
                 self._safe_to_cpu(model_entry)
                 torch.cuda.empty_cache()
-                log.info(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
+                log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                          f"(~{model_entry.estimated_vram // (1024*1024)}MB)")
                 return model_entry
             return None
@@ -433,7 +433,7 @@ class GpuInstance:
         is needed (via ensure_free_vram/evict_lru, which prefers evicting
         non-current-group models first)."""
         if self._current_group != group:
-            log.info(f"  GPU [{self.uuid}]: Session group → {group}")
+            log.debug(f"  GPU [{self.uuid}]: Session group → {group}")
         self._current_group = group
 
     @property
@@ -454,9 +454,9 @@ class GpuPool:
         nvml.init()
         devices = nvml.get_devices()
 
-        log.info(f"  GpuPool: Found {len(devices)} GPU(s) via NVML")
+        log.debug(f"  GpuPool: Found {len(devices)} GPU(s) via NVML")
         for dev in devices:
-            log.info(f"    NVML[{dev.index}]: {dev.name} UUID={dev.uuid} "
+            log.debug(f"    NVML[{dev.index}]: {dev.name} UUID={dev.uuid} "
                      f"PCI={dev.pci_bus_id}")
 
         # Build UUID lookup
@@ -466,7 +466,7 @@ class GpuPool:
 
         for cfg in gpu_configs:
             if not cfg.enabled:
-                log.info(f"  GpuPool: GPU [{cfg.uuid}] ({cfg.name}) is disabled — skipping")
+                log.debug(f"  GpuPool: GPU [{cfg.uuid}] ({cfg.name}) is disabled — skipping")
                 continue
 
             # Config UUID is like "GPU-caaaa9d0-..." — match against NVML UUID
@@ -509,11 +509,11 @@ class GpuPool:
             try:
                 torch.cuda.set_per_process_memory_fraction(0.98, gpu.device)
                 cap_mb = int(nvml_dev.total_memory * 0.98 / (1024 * 1024))
-                log.info(f"  GpuPool: VRAM cap set to 98% ({cap_mb}MB) on CUDA:{cuda_idx}")
+                log.debug(f"  GpuPool: VRAM cap set to 98% ({cap_mb}MB) on CUDA:{cuda_idx}")
             except Exception as e:
                 log.warning(f"  GpuPool: Could not set VRAM cap on CUDA:{cuda_idx}: {e}")
 
-            log.info(f"  GpuPool: Registered GPU [{cfg.uuid}] = {nvml_dev.name} "
+            log.debug(f"  GpuPool: Registered GPU [{cfg.uuid}] = {nvml_dev.name} "
                      f"(CUDA:{cuda_idx}, PCI={nvml_dev.pci_bus_id}, "
                      f"{nvml_dev.total_memory // (1024*1024)}MB, "
                      f"caps={cfg.capabilities})")
@@ -539,7 +539,7 @@ class GpuPool:
         for i, gpu in enumerate(self.gpus):
             if gpu.uuid.lower() == uuid.lower():
                 self.gpus.pop(i)
-                log.info(f"  GpuPool: Removed GPU [{gpu.uuid}] ({gpu.name})")
+                log.debug(f"  GpuPool: Removed GPU [{gpu.uuid}] ({gpu.name})")
                 streamer.fire_event("gpu_removed", {
                     "uuid": gpu.uuid,
                     "name": gpu.name,

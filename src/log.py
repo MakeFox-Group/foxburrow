@@ -1,10 +1,12 @@
 """Thread-safe timestamped logging to stdout + file.
 
 Supports an optional TUI callback: when registered, log lines at or above
-a configurable level are routed to the callback instead of stdout.  The
-file sink always receives ALL levels (including DEBUG).
+a configurable level are routed to the callback instead of stdout.  Once
+init_file() is called, the file sink receives ALL levels (including DEBUG)
+in JSONL format.
 """
 
+import json
 import os
 import sys
 import threading
@@ -41,7 +43,9 @@ _suppress_stdout: bool = False
 def init_file(path: str) -> None:
     """Open the log file for appending. Creates parent directories if needed."""
     global _log_file, _log_path
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dir_part = os.path.dirname(path)
+    if dir_part:
+        os.makedirs(dir_part, exist_ok=True)
     _log_file = open(path, "a", encoding="utf-8")
     _log_path = path
 
@@ -73,7 +77,9 @@ def clear_tui_callback() -> None:
 
 
 def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] [{level.value}] {message}"
     # Snapshot callback under lock, then call it OUTSIDE the lock to avoid
     # deadlock if the callback (or anything it calls) re-enters log.*.
@@ -82,7 +88,9 @@ def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
         if not _suppress_stdout:
             print(line, flush=True)
         if _log_file is not None:
-            _log_file.write(line + "\n")
+            record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
+                                ensure_ascii=False)
+            _log_file.write(record + "\n")
             _log_file.flush()
         if _tui_callback is not None and _LEVEL_ORDER.get(level, 0) >= _LEVEL_ORDER.get(_tui_min_level, 1):
             cb = _tui_callback
@@ -91,14 +99,18 @@ def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
 
 
 def write(message: str, level: LogLevel = LogLevel.INFO) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] [{level.value}] {message}"
     cb = None
     with _lock:
         if not _suppress_stdout:
             print(line, end="", flush=True)
         if _log_file is not None:
-            _log_file.write(line)
+            record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
+                                ensure_ascii=False)
+            _log_file.write(record + "\n")
             _log_file.flush()
         if _tui_callback is not None and _LEVEL_ORDER.get(level, 0) >= _LEVEL_ORDER.get(_tui_min_level, 1):
             cb = _tui_callback

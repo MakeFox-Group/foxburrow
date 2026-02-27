@@ -58,7 +58,7 @@ class ModelScanner:
         Returns the background daemon thread (already started).
         """
         if not discovered_models:
-            log.info("  ModelScanner: No models to register")
+            log.debug("  ModelScanner: No models to register")
             return _make_noop_thread()
 
         # Classify for logging / event payloads
@@ -78,7 +78,7 @@ class ModelScanner:
         def _background():
             sf_count = sum(1 for f in model_formats.values() if f == "single_file")
             df_count = grand_total - sf_count
-            log.info(f"  ModelScanner: Registering {grand_total} model(s) "
+            log.debug(f"  ModelScanner: Registering {grand_total} model(s) "
                      f"({sf_count} single-file, {df_count} diffusers, "
                      f"{self._max_workers} workers)")
             start_time = time.monotonic()
@@ -110,7 +110,7 @@ class ModelScanner:
                         total = self._total
 
                     if success:
-                        log.info(f"  ModelScanner: Model available: {name} ({done}/{total})")
+                        log.debug(f"  ModelScanner: Model available: {name} ({done}/{total})")
                         streamer.fire_event("model_discovered", {
                             "model_type": "sdxl", "name": name, "path": path,
                             "format": fmt})
@@ -127,7 +127,7 @@ class ModelScanner:
             elapsed = time.monotonic() - start_time
             with self._lock:
                 self._scanning = False
-            log.info(f"  ModelScanner: Background scan complete "
+            log.debug(f"  ModelScanner: Background scan complete "
                      f"({self._completed}/{self._total} in {elapsed:.1f}s)")
 
         t = threading.Thread(target=_background, name="model-scanner", daemon=True)

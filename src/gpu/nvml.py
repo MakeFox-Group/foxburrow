@@ -26,7 +26,7 @@ def init() -> None:
         return
     pynvml.nvmlInit()
     _initialized = True
-    log.info(f"NVML initialized: driver {pynvml.nvmlSystemGetDriverVersion()}")
+    log.debug(f"NVML initialized: driver {pynvml.nvmlSystemGetDriverVersion()}")
 
 
 def shutdown() -> None:

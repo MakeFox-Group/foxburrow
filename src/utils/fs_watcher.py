@@ -87,12 +87,12 @@ class FileSystemWatcher:
         sdxl_dir = os.path.join(models_dir, "sdxl")
         if os.path.isdir(sdxl_dir):
             self._tasks.append(loop.create_task(self._watch_sdxl(sdxl_dir)))
-            log.info(f"  FileWatcher: Monitoring {sdxl_dir}")
+            log.debug(f"  FileWatcher: Monitoring {sdxl_dir}")
 
         loras_dir = state.loras_dir
         if loras_dir and os.path.isdir(loras_dir):
             self._tasks.append(loop.create_task(self._watch_loras(loras_dir)))
-            log.info(f"  FileWatcher: Monitoring {loras_dir}")
+            log.debug(f"  FileWatcher: Monitoring {loras_dir}")
 
         if not self._tasks:
             log.warning("  FileWatcher: No directories to watch")
@@ -123,8 +123,8 @@ class FileSystemWatcher:
                 if not relevant:
                     continue
 
-                log.info(f"  FileWatcher: LoRA changes detected "
-                         f"({_summarize_changes(relevant)})")
+                log.debug(f"  FileWatcher: LoRA changes detected "
+                          f"({_summarize_changes(relevant)})")
 
                 try:
                     from utils.lora_index import rescan_loras
@@ -136,7 +136,7 @@ class FileSystemWatcher:
                     log.log_exception(ex, "FileWatcher: LoRA rescan failed")
 
         except asyncio.CancelledError:
-            log.info("  FileWatcher: LoRA watcher stopped")
+            log.debug("  FileWatcher: LoRA watcher stopped")
         except Exception as ex:
             log.log_exception(ex, "FileWatcher: LoRA watcher crashed")
 
@@ -158,8 +158,8 @@ class FileSystemWatcher:
                 if not relevant:
                     continue
 
-                log.info(f"  FileWatcher: SDXL changes detected "
-                         f"({_summarize_changes(relevant)})")
+                log.debug(f"  FileWatcher: SDXL changes detected "
+                          f"({_summarize_changes(relevant)})")
 
                 try:
                     await self._rescan_sdxl()
@@ -167,7 +167,7 @@ class FileSystemWatcher:
                     log.log_exception(ex, "FileWatcher: SDXL rescan failed")
 
         except asyncio.CancelledError:
-            log.info("  FileWatcher: SDXL watcher stopped")
+            log.debug("  FileWatcher: SDXL watcher stopped")
         except Exception as ex:
             log.log_exception(ex, "FileWatcher: SDXL watcher crashed")
 

@@ -155,11 +155,11 @@ def load_model(device: torch.device) -> nn.Module:
     # Fix any meta tensors left by accelerate's init_empty_weights() leak.
     n = fix_meta_tensors(model)
     if n:
-        log.info(f"  Upscale: Fixed {n} meta tensor(s)")
+        log.debug(f"  Upscale: Fixed {n} meta tensor(s)")
     model.load_state_dict(state, strict=True)
     model.to(device).half().eval()
 
-    log.info(f"  Upscale: Loaded RealESRGAN x2plus to {device}")
+    log.debug(f"  Upscale: Loaded RealESRGAN x2plus to {device}")
     return model
 
 

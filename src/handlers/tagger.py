@@ -167,7 +167,7 @@ def init_tagger(device: torch.device) -> None:
     # Fix any meta tensors left by timm/accelerate in the model.
     n = fix_meta_tensors(model)
     if n:
-        log.info(f"  Tagger: Fixed {n} meta tensor(s)")
+        log.debug(f"  Tagger: Fixed {n} meta tensor(s)")
 
     safetensors.torch.load_model(model, safetensors_path)
     model.to(device=device, dtype=torch.float16).eval()
@@ -179,7 +179,7 @@ def init_tagger(device: torch.device) -> None:
         if _transform is None:
             _transform = _build_transform()
 
-    log.info(f"  Tagger: Loaded JTP PILOT2 SigLIP ({num_tags} tags) to {device}")
+    log.debug(f"  Tagger: Loaded JTP PILOT2 SigLIP ({num_tags} tags) to {device}")
 
 
 def is_loaded_on(device: torch.device) -> bool:
@@ -192,7 +192,7 @@ def unload_tagger(device: torch.device) -> None:
     with _tagger_lock:
         if device in _tagger_instances:
             del _tagger_instances[device]
-            log.info(f"  Tagger: Unloaded from {device}")
+            log.debug(f"  Tagger: Unloaded from {device}")
 
 
 def process_image(image: Image.Image, gpu: "GpuInstance",

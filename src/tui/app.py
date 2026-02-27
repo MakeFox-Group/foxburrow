@@ -58,6 +58,10 @@ class FoxburrowApp(App):
         Binding("q", "queue_detail", "Queue"),
         Binding("g", "gpu_detail", "GPU Detail"),
         Binding("space", "toggle_scroll", "Pause/Resume", show=False),
+        Binding("d", "toggle_debug", "Debug", show=False),
+        Binding("i", "toggle_info", "Info", show=False),
+        Binding("w", "toggle_warning", "Warning", show=False),
+        Binding("e", "toggle_error", "Error", show=False),
         Binding("question_mark", "help", "Help (?)"),
     ]
 
@@ -77,7 +81,9 @@ class FoxburrowApp(App):
 
     def on_mount(self) -> None:
         """Called when the app is mounted — register timers and log callback."""
-        # Register log callback (suppresses stdout, routes INFO+ to our buffer)
+        # Register log callback (suppresses stdout, routes to our buffer).
+        # Start at INFO to match LogPanel's default _active_levels.
+        # Toggling DEBUG on/off via 'd' key re-registers at the appropriate level.
         log.set_tui_callback(self._log_callback, min_level=LogLevel.INFO)
 
         # Dashboard refresh timer (500ms)
@@ -165,6 +171,26 @@ class FoxburrowApp(App):
     def action_help(self) -> None:
         """Show help modal."""
         self.push_screen(HelpScreen())
+
+    def action_toggle_debug(self) -> None:
+        """Toggle DEBUG log level in display."""
+        panel = self.query_one("#log-panel", LogPanel)
+        panel.toggle_level(LogLevel.DEBUG)
+        # Adjust callback min_level so we don't buffer DEBUG when it's hidden
+        min_lvl = LogLevel.DEBUG if LogLevel.DEBUG in panel._active_levels else LogLevel.INFO
+        log.set_tui_callback(self._log_callback, min_level=min_lvl)
+
+    def action_toggle_info(self) -> None:
+        """Toggle INFO log level in display."""
+        self.query_one("#log-panel", LogPanel).toggle_level(LogLevel.INFO)
+
+    def action_toggle_warning(self) -> None:
+        """Toggle WARNING log level in display."""
+        self.query_one("#log-panel", LogPanel).toggle_level(LogLevel.WARNING)
+
+    def action_toggle_error(self) -> None:
+        """Toggle ERROR log level in display."""
+        self.query_one("#log-panel", LogPanel).toggle_level(LogLevel.ERROR)
 
     # ── Background workers ─────────────────────────────────────────
 

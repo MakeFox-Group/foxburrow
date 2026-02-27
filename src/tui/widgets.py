@@ -6,7 +6,7 @@ from datetime import datetime
 
 from rich.text import Text
 from textual.widgets import RichLog, Static
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 
 from log import LogLevel
 
@@ -260,11 +260,20 @@ class LogPanel(Vertical):
         border-top: solid $accent;
     }
 
-    LogPanel #tui-paused-label {
+    LogPanel #tui-status-bar {
         dock: bottom;
-        text-align: right;
-        padding: 0 1;
         height: 1;
+        padding: 0 1;
+        layout: horizontal;
+    }
+
+    LogPanel #tui-filter-label {
+        width: auto;
+    }
+
+    LogPanel #tui-paused-label {
+        width: 1fr;
+        text-align: right;
     }
     """
 
@@ -273,15 +282,21 @@ class LogPanel(Vertical):
         self._auto_scroll = True
         self._rich_log: RichLog | None = None
         self._paused_label: Static | None = None
+        self._filter_label: Static | None = None
+        self._active_levels: set[LogLevel] = {LogLevel.INFO, LogLevel.WARNING, LogLevel.ERROR}
 
     def compose(self):
         yield RichLog(id="tui-rich-log", max_lines=5000, wrap=True, auto_scroll=True)
-        yield Static("", id="tui-paused-label")
+        with Horizontal(id="tui-status-bar"):
+            yield Static("", id="tui-filter-label")
+            yield Static("", id="tui-paused-label")
 
     def on_mount(self) -> None:
         """Resolve widget references after compose is complete."""
         self._rich_log = self.query_one("#tui-rich-log", RichLog)
         self._paused_label = self.query_one("#tui-paused-label", Static)
+        self._filter_label = self.query_one("#tui-filter-label", Static)
+        self._update_filter_label()
 
     def _is_at_bottom(self) -> bool:
         """Check if the RichLog is scrolled to (or near) the bottom."""
@@ -320,6 +335,8 @@ class LogPanel(Vertical):
             self._set_paused(True)
 
         for line, level in items:
+            if level not in self._active_levels:
+                continue
             style = _LEVEL_STYLES.get(level, "")
             text = Text(line, style=style)
             self._rich_log.write(text)
@@ -338,3 +355,32 @@ class LogPanel(Vertical):
     @property
     def is_paused(self) -> bool:
         return not self._auto_scroll
+
+    def toggle_level(self, level: LogLevel) -> None:
+        """Toggle a log level on/off in the display filter."""
+        if level in self._active_levels:
+            self._active_levels.discard(level)
+        else:
+            self._active_levels.add(level)
+        self._update_filter_label()
+
+    def _update_filter_label(self) -> None:
+        """Update the filter indicator showing active/inactive levels."""
+        if self._filter_label is None:
+            return
+        labels = [
+            ("D", LogLevel.DEBUG),
+            ("I", LogLevel.INFO),
+            ("W", LogLevel.WARNING),
+            ("E", LogLevel.ERROR),
+        ]
+        text = Text("Filter: [")
+        for i, (short, lvl) in enumerate(labels):
+            if i > 0:
+                text.append(" ")
+            if lvl in self._active_levels:
+                text.append(short, style="bold white")
+            else:
+                text.append(short, style="dim")
+        text.append("]")
+        self._filter_label.update(text)

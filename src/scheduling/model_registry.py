@@ -117,7 +117,7 @@ class ModelRegistry:
             if checkpoint_path in self._sdxl_checkpoints:
                 return  # another thread registered it while we were hashing
             self._sdxl_checkpoints[checkpoint_path] = components
-        log.info(f"  ModelRegistry: Registered single-file SDXL checkpoint "
+        log.debug(f"  ModelRegistry: Registered single-file SDXL checkpoint "
                  f"{os.path.basename(checkpoint_path)} ({len(components)} components)")
 
     def _register_diffusers_dir(self, model_dir: str) -> None:
@@ -164,18 +164,18 @@ class ModelRegistry:
                         shared_count += 1
                         break
 
-        log.info(f"  ModelRegistry: Registered SDXL checkpoint {os.path.basename(model_dir)} "
+        log.debug(f"  ModelRegistry: Registered SDXL checkpoint {os.path.basename(model_dir)} "
                  f"({len(components)} components, {shared_count} shared)")
 
     def register_upscale_model(self, model_path: str) -> None:
         self._upscale_component = self._get_or_create(
             model_path, "upscale", VramEstimates.UPSCALE)
-        log.info(f"  ModelRegistry: Registered upscale model {model_path}")
+        log.debug(f"  ModelRegistry: Registered upscale model {model_path}")
 
     def register_bgremove_model(self, model_path: str) -> None:
         self._bgremove_component = self._get_or_create(
             model_path, "bgremove", VramEstimates.BGREMOVE)
-        log.info(f"  ModelRegistry: Registered BGRemove model {model_path}")
+        log.debug(f"  ModelRegistry: Registered BGRemove model {model_path}")
 
     def is_sdxl_registered(self, model_path: str) -> bool:
         """Check if an SDXL checkpoint is already registered."""
@@ -235,7 +235,7 @@ class ModelRegistry:
         with self._lock:
             if fingerprint in self._components:
                 existing = self._components[fingerprint]
-                log.info(f"    ModelRegistry: {category} shares content with "
+                log.debug(f"    ModelRegistry: {category} shares content with "
                          f"existing {existing.category} (fingerprint match)")
                 return existing
             comp = ModelComponentId(

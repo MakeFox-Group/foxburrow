@@ -88,7 +88,7 @@ class GpuScheduler:
                 except Exception as ex:
                     log.log_exception(ex, "GpuScheduler: Error in scheduling round")
         except asyncio.CancelledError:
-            log.info("  GpuScheduler: Stopped")
+            log.debug("  GpuScheduler: Stopped")
 
     def _run_scheduling_round(self) -> None:
         groups = self._queue.get_work_groups()
@@ -129,9 +129,9 @@ class GpuScheduler:
             job = best_group.jobs.pop(0)
             self._queue.remove([job])
 
-            log.info(f"  GpuScheduler: Dispatching 1 job [{best_group.stage}] "
-                     f"to GPU [{best_worker.gpu.uuid}] "
-                     f"(score={best_score}, active={best_worker.active_count})")
+            log.debug(f"  GpuScheduler: Dispatching 1 job [{best_group.stage}] "
+                      f"to GPU [{best_worker.gpu.uuid}] "
+                      f"(score={best_score}, active={best_worker.active_count})")
 
             best_worker.dispatch(best_group.stage, job)
             dispatched = True

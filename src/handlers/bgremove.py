@@ -44,13 +44,13 @@ def load_model(device: torch.device) -> torch.nn.Module:
         # Fix any meta tensors left by accelerate's init_empty_weights() leak.
         n = fix_meta_tensors(model)
         if n:
-            log.info(f"  BGRemove: Fixed {n} meta tensor(s)")
+            log.debug(f"  BGRemove: Fixed {n} meta tensor(s)")
 
         weights_path = os.path.join(_model_path, "model.safetensors")
         state_dict = load_file(weights_path)
         model.load_state_dict(state_dict, strict=False)
         model.to(device=device, dtype=torch.float16).eval()
-        log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
+        log.debug(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
     except Exception as e:
         log.warning(f"  BGRemove: Failed to load RMBG-2.0: {e}")

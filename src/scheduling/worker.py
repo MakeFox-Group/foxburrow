@@ -149,7 +149,7 @@ def _update_working_memory(stage_type: StageType, working_bytes: int,
         prev_ratio = _measured_bpp.get(stage_type, 0.0)
         if ratio > prev_ratio:
             _measured_bpp[stage_type] = ratio
-            log.info(f"  Working memory: new peak for {stage_type.value}: "
+            log.debug(f"  Working memory: new peak for {stage_type.value}: "
                      f"{working_bytes // (1024**2)}MB @ {pixels} px "
                      f"({ratio:.1f} B/px, prev {prev_ratio:.1f} B/px)")
 
@@ -427,7 +427,7 @@ class GpuWorker:
 
         fits = available >= total_needed
 
-        log.info(f"  VRAM budget [{gpu.uuid}]: "
+        log.debug(f"  VRAM budget [{gpu.uuid}]: "
                  f"need {total_needed // (1024**2)}MB "
                  f"(models={model_cost // (1024**2)}MB, "
                  f"working={working_cost // (1024**2)}MB) | "
@@ -455,7 +455,7 @@ class GpuWorker:
             tag_info = (f" | Tags: model={stats['model_vram'] // (1024**2)}MB, "
                         f"activation={stats['activation_vram'] // (1024**2)}MB")
 
-        log.info(
+        log.debug(
             f"  VRAM [{gpu.uuid}] ({context}): "
             f"NVML {stats['used'] // (1024**2)}MB used / "
             f"{stats['free'] // (1024**2)}MB free / "
@@ -468,14 +468,14 @@ class GpuWorker:
         for m in models:
             vram = m['actual_vram'] if m['actual_vram'] > 0 else m['vram']
             source = f" ({m['source']})" if m.get('source') else ""
-            log.info(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
+            log.debug(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
 
         if torch_ext.HAS_HISTOGRAM:
             hist = torch.cuda.allocation_histogram(gpu.device)
             large_bins = {k: v for k, v in hist.items()
                           if v["count"] > 0 and v["total_bytes"] > 10 * 1024**2}
             if large_bins:
-                log.info(f"    Histogram [{gpu.uuid}]: {large_bins}")
+                log.debug(f"    Histogram [{gpu.uuid}]: {large_bins}")
 
     def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
         """Dispatch a work item to this worker."""
@@ -494,18 +494,18 @@ class GpuWorker:
         self._work_queue.put_nowait((stage, job))
 
     async def _run_loop(self) -> None:
-        log.info(f"  GpuWorker[{self._gpu.uuid}]: Started")
+        log.debug(f"  GpuWorker[{self._gpu.uuid}]: Started")
         try:
             while True:
                 stage, job = await self._work_queue.get()
                 # Spawn concurrent — don't await
                 self._loop.create_task(self._process_work_item(stage, job))
         except asyncio.CancelledError:
-            log.info(f"  GpuWorker[{self._gpu.uuid}]: Stopped")
+            log.debug(f"  GpuWorker[{self._gpu.uuid}]: Stopped")
 
     async def _process_work_item(self, stage: WorkStage, job: InferenceJob) -> None:
         try:
-            log.info(f"  GpuWorker[{self._gpu.uuid}]: Processing {job} at {stage} "
+            log.debug(f"  GpuWorker[{self._gpu.uuid}]: Processing {job} at {stage} "
                      f"(active={self._active_count})")
             self.log_vram_state(f"pre-load {stage.type.value}")
 
@@ -603,7 +603,7 @@ class GpuWorker:
                 is_solo = active_at_start <= 1
                 if is_solo:
                     _update_working_memory(stage.type, working_mem, stage_pixels)
-                log.info(f"  Stage {stage.type.value}: working memory "
+                log.debug(f"  Stage {stage.type.value}: working memory "
                          f"{working_mem // (1024**2)}MB"
                          f"{' (scoped)' if peak_scope is not None else ''}"
                          f"{'' if is_solo else ' CONCURRENT — BPP update skipped'}")
@@ -639,7 +639,7 @@ class GpuWorker:
                             from PIL import Image as _PILImage
                             job.input_image = job.input_image.resize(
                                 (tw, th), _PILImage.LANCZOS)
-                            log.info(f"  GpuWorker[{self._gpu.uuid}]: Resized intermediate "
+                            log.debug(f"  GpuWorker[{self._gpu.uuid}]: Resized intermediate "
                                      f"output to {tw}x{th}")
 
                 job.current_stage_index += 1
@@ -662,7 +662,7 @@ class GpuWorker:
                     job.set_result(result)
                     self._broadcast_complete(job, success=True)
                     self._gpu.record_success()
-                    log.info(f"  GpuWorker[{self._gpu.uuid}]: {job} completed")
+                    log.debug(f"  GpuWorker[{self._gpu.uuid}]: {job} completed")
                 else:
                     job.stage_status = ""
                     job.active_gpus = []
@@ -857,7 +857,7 @@ class GpuWorker:
                 model = load_component(component.category, model_dir, self._gpu.device)
             after = torch.cuda.memory_allocated(self._gpu.device)
             actual_vram = after - before
-            log.info(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
+            log.debug(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
                      f"(estimated {component.estimated_vram_bytes // (1024*1024)}MB)")
             # Feed actual VRAM measurement back to the registry so future
             # ensure_free_vram() calls use the real value instead of the estimate
@@ -912,7 +912,7 @@ class GpuWorker:
             model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
         actual_vram = after - before
-        log.info(f"  Loaded upscale: {actual_vram // (1024*1024)}MB actual"
+        log.debug(f"  Loaded upscale: {actual_vram // (1024*1024)}MB actual"
                  + (f" (estimated {comp.estimated_vram_bytes // (1024*1024)}MB)" if comp else ""))
         if comp:
             if actual_vram > 0:
@@ -948,7 +948,7 @@ class GpuWorker:
             model = load_model(self._gpu.device)
         after = torch.cuda.memory_allocated(self._gpu.device)
         actual_vram = after - before
-        log.info(f"  Loaded bgremove: {actual_vram // (1024*1024)}MB actual"
+        log.debug(f"  Loaded bgremove: {actual_vram // (1024*1024)}MB actual"
                  + (f" (estimated {comp.estimated_vram_bytes // (1024*1024)}MB)" if comp else ""))
         if comp:
             if actual_vram > 0:
