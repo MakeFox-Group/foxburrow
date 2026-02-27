@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 import log
+from gpu.pool import fix_meta_tensors
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -151,14 +152,10 @@ def load_model(device: torch.device) -> nn.Module:
     elif "params" in state:
         state = state["params"]
 
-    # If a leaked accelerate init_empty_weights() context left parameters
-    # on meta device, to_empty() materializes them via _parameters dict
-    # (bypassing any monkey-patched register_parameter).
-    has_meta = any(p.is_meta for p in model.parameters()) or \
-               any(b.is_meta for b in model.buffers())
-    if has_meta:
-        log.warning("  Upscale: meta tensors detected (accelerate leak), materializing")
-        model.to_empty(device="cpu")
+    # Fix any meta tensors left by accelerate's init_empty_weights() leak.
+    n = fix_meta_tensors(model)
+    if n:
+        log.info(f"  Upscale: Fixed {n} meta tensor(s)")
     model.load_state_dict(state, strict=True)
     model.to(device).half().eval()
 

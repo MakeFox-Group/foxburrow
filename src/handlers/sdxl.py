@@ -21,10 +21,18 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 
 import log
 from gpu import nvml
+from gpu.pool import fix_meta_tensors
 from scheduling.job import InferenceJob, SdxlTokenizeResult, SdxlEncodeResult, SdxlRegionalEncodeResult
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
+
+def _fix_from_pretrained(model: torch.nn.Module, label: str) -> None:
+    """Fix meta tensors left behind by from_pretrained()/accelerate."""
+    n = fix_meta_tensors(model)
+    if n:
+        log.info(f"  SDXL: Fixed {n} meta tensor(s) in {label}")
+
 
 # Constants
 VAE_SCALE_FACTOR = 0.13025
@@ -155,8 +163,10 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         except Exception as ex:
             log.info(f"  SDXL: xformers not available, using default attention ({ex})")
 
-        # Move neural-net components to CPU and set eval mode
+        # Fix any meta tensors left by from_pretrained/accelerate, then
+        # move neural-net components to CPU and set eval mode
         for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
+            _fix_from_pretrained(components[key], key)
             components[key].to("cpu")
             components[key].eval()
 
@@ -210,6 +220,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
     if category == "sdxl_te1":
         model = CLIPTextModel.from_pretrained(
             model_dir, subfolder="text_encoder", torch_dtype=dtype)
+        _fix_from_pretrained(model, "text_encoder (CLIP-L)")
         model.to(device)
         model.eval()
         log.info(f"  SDXL: Loaded text_encoder (CLIP-L) to {device}")
@@ -218,6 +229,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
     elif category == "sdxl_te2":
         model = CLIPTextModelWithProjection.from_pretrained(
             model_dir, subfolder="text_encoder_2", torch_dtype=dtype)
+        _fix_from_pretrained(model, "text_encoder_2 (CLIP-bigG)")
         model.to(device)
         model.eval()
         log.info(f"  SDXL: Loaded text_encoder_2 (CLIP-bigG) to {device}")
@@ -227,6 +239,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         from diffusers import UNet2DConditionModel
         model = UNet2DConditionModel.from_pretrained(
             model_dir, subfolder="unet", torch_dtype=dtype)
+        _fix_from_pretrained(model, "UNet")
         model.to(device)
         model.eval()
         try:
@@ -241,6 +254,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         # for certain latent distributions (a well-known SDXL VAE issue).
         model = AutoencoderKL.from_pretrained(
             model_dir, subfolder="vae", torch_dtype=torch.float32)
+        _fix_from_pretrained(model, "VAE")
         model.to(device)
         model.eval()
         log.info(f"  SDXL: Loaded VAE (float32) to {device}")

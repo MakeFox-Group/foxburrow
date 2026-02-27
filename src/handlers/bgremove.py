@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 
 import log
+from gpu.pool import fix_meta_tensors
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -40,12 +41,10 @@ def load_model(device: torch.device) -> torch.nn.Module:
         # Construct model directly, load safetensors weights manually.
         model = BiRefNet(bb_pretrained=False)
 
-        # If a leaked accelerate context left meta tensors, materialize them.
-        has_meta = any(p.is_meta for p in model.parameters()) or \
-                   any(b.is_meta for b in model.buffers())
-        if has_meta:
-            log.warning("  BGRemove: meta tensors detected (accelerate leak), materializing")
-            model.to_empty(device="cpu")
+        # Fix any meta tensors left by accelerate's init_empty_weights() leak.
+        n = fix_meta_tensors(model)
+        if n:
+            log.info(f"  BGRemove: Fixed {n} meta tensor(s)")
 
         weights_path = os.path.join(_model_path, "model.safetensors")
         state_dict = load_file(weights_path)

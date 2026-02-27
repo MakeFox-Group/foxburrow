@@ -12,11 +12,58 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+import torch.nn as nn
 
 import log
 from api.websocket import streamer
 from config import GpuConfig
 from gpu import nvml
+
+
+def fix_meta_tensors(model: nn.Module) -> int:
+    """Replace any remaining meta tensors in a model with zero-filled tensors.
+
+    ``from_pretrained()`` uses accelerate's ``init_empty_weights()`` internally
+    to create the model skeleton on the ``meta`` device, then loads the state
+    dict.  But some registered buffers (e.g. ``position_ids``, ``causal_mask``)
+    aren't in the state dict and remain as meta tensors.  Inference works fine
+    because these buffers are recomputed at runtime, but ``.to(device)`` walks
+    ALL tensors and raises ``NotImplementedError: Cannot copy out of meta
+    tensor``.
+
+    This function surgically replaces only the meta tensors, leaving all
+    properly loaded parameters/buffers intact.
+
+    Returns the number of tensors fixed.
+    """
+    fixed = 0
+
+    for name, param in list(model.named_parameters()):
+        if not param.is_meta:
+            continue
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        new_param = nn.Parameter(
+            torch.zeros(param.shape, dtype=param.dtype, device="cpu"),
+            requires_grad=param.requires_grad,
+        )
+        setattr(parent, parts[-1], new_param)
+        fixed += 1
+
+    for name, buf in list(model.named_buffers()):
+        if not buf.is_meta:
+            continue
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+        parent.register_buffer(parts[-1], new_buf)
+        fixed += 1
+
+    return fixed
 
 
 def _cuda_index_from_pci_bus_id(pci_bus_id: str) -> int | None:
@@ -280,6 +327,17 @@ class GpuInstance:
             return False
         return True
 
+    def _safe_to_cpu(self, model_entry: CachedModel) -> None:
+        """Move a model to CPU, fixing any meta tensors first."""
+        if not hasattr(model_entry.model, "to"):
+            return
+        if isinstance(model_entry.model, nn.Module):
+            n = fix_meta_tensors(model_entry.model)
+            if n:
+                log.warning(f"  GPU [{self.uuid}]: Fixed {n} meta tensor(s) "
+                            f"in {model_entry.category} before eviction")
+        model_entry.model.to("cpu")
+
     def evict_lru(self, protect: set[str] | None = None) -> CachedModel | None:
         """Evict the least-recently-used cached model not in the protected,
         unevictable, or actively-in-use sets. Prefers evicting models from
@@ -304,8 +362,7 @@ class GpuInstance:
                         model_entry = self._cache.pop(fp)
                         if model_entry.evict_callback:
                             model_entry.evict_callback()
-                        if hasattr(model_entry.model, "to"):
-                            model_entry.model.to("cpu")
+                        self._safe_to_cpu(model_entry)
                         torch.cuda.empty_cache()
                         log.info(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                                  f"(~{model_entry.estimated_vram // (1024*1024)}MB, "
@@ -320,8 +377,7 @@ class GpuInstance:
                 model_entry = self._cache.pop(fp)
                 if model_entry.evict_callback:
                     model_entry.evict_callback()
-                if hasattr(model_entry.model, "to"):
-                    model_entry.model.to("cpu")
+                self._safe_to_cpu(model_entry)
                 torch.cuda.empty_cache()
                 log.info(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                          f"(~{model_entry.estimated_vram // (1024*1024)}MB)")

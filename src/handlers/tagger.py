@@ -14,6 +14,7 @@ from torchvision.transforms import transforms, InterpolationMode
 import torchvision.transforms.functional as TF
 
 import log
+from gpu.pool import fix_meta_tensors
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -191,14 +192,10 @@ def init_tagger(device: torch.device) -> None:
     # and repair this BEFORE doing anything else with nn.Module.
     _repair_accelerate_leak()
 
-    # If timm left meta tensors in the model, materialize them on CPU.
-    # to_empty() uses _parameters/_buffers dicts directly (bypasses any
-    # remaining monkey-patches on register_parameter/register_buffer).
-    has_meta = any(p.is_meta for p in model.parameters()) or \
-               any(b.is_meta for b in model.buffers())
-    if has_meta:
-        log.info("  Tagger: Materializing meta tensors via to_empty()")
-        model.to_empty(device="cpu")
+    # Fix any meta tensors left by timm/accelerate in the model.
+    n = fix_meta_tensors(model)
+    if n:
+        log.info(f"  Tagger: Fixed {n} meta tensor(s)")
 
     safetensors.torch.load_model(model, safetensors_path)
     model.to(device=device, dtype=torch.float16).eval()
