@@ -21,7 +21,10 @@ from scheduling.job import (
     InferenceJob, JobResult, JobType, StageType, WorkStage,
 )
 from scheduling.queue import JobQueue
-from scheduling.scheduler import get_session_key, get_session_group, get_session_group_from_key
+from scheduling.scheduler import (
+    get_session_key, get_session_group, get_session_group_from_key,
+    _COMPATIBLE_WITH_ALL,
+)
 
 if TYPE_CHECKING:
     pass
@@ -282,14 +285,16 @@ class GpuWorker:
             max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
             if self._active_session_counts.get(session_key, 0) >= max_for_session:
                 return False, self._active_count
-            # Session group conflict — e.g. can't run SDXL if upscale is active
+            # Session group conflict — skip for lightweight compatible-with-all groups
             if self._active_count > 0:
-                for key, count in self._active_session_counts.items():
-                    if count <= 0:
-                        continue
-                    active_group = get_session_group_from_key(key)
-                    if active_group and active_group != group:
-                        return False, self._active_count
+                if group not in _COMPATIBLE_WITH_ALL:
+                    for key, count in self._active_session_counts.items():
+                        if count <= 0:
+                            continue
+                        active_group = get_session_group_from_key(key)
+                        if active_group and active_group != group:
+                            if active_group not in _COMPATIBLE_WITH_ALL:
+                                return False, self._active_count
             return True, self._active_count
 
     @property
@@ -352,15 +357,18 @@ class GpuWorker:
             if self._active_session_counts[session_key] >= max_for_session:
                 return False
 
-            # Session group must match all active items
+            # Session group must match all active items — unless either
+            # side is a lightweight group that can coexist with anything.
             if self._active_count > 0:
                 new_group = get_session_group(stage.type)
-                for key, count in self._active_session_counts.items():
-                    if count <= 0:
-                        continue
-                    active_group = get_session_group_from_key(key)
-                    if active_group and active_group != new_group:
-                        return False
+                if new_group not in _COMPATIBLE_WITH_ALL:
+                    for key, count in self._active_session_counts.items():
+                        if count <= 0:
+                            continue
+                        active_group = get_session_group_from_key(key)
+                        if active_group and active_group != new_group:
+                            if active_group not in _COMPATIBLE_WITH_ALL:
+                                return False
 
             return True
 

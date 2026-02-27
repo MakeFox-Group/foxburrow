@@ -28,6 +28,9 @@ _SESSION_MAP: dict[StageType, tuple[str, str]] = {
 
 _KEY_TO_GROUP: dict[str, str] = {v[0]: v[1] for v in _SESSION_MAP.values()}
 
+# Lightweight groups that can coexist with any other group on the same GPU.
+_COMPATIBLE_WITH_ALL: frozenset[str] = frozenset({"bgremove", "upscale"})
+
 
 def get_session_key(stage_type: StageType) -> str | None:
     entry = _SESSION_MAP.get(stage_type)
@@ -171,21 +174,33 @@ class GpuScheduler:
 
         # Cross-group penalty — only when busy. An idle GPU has zero
         # context-switch cost so switching session groups is free.
+        # Skip penalty when either side is a lightweight compatible-with-all group.
         if required_group and not is_idle:
             for cat in loaded_cats:
                 cat_group = get_session_group_from_key(cat)
                 if cat_group and cat_group != required_group:
+                    if required_group in _COMPATIBLE_WITH_ALL or cat_group in _COMPATIBLE_WITH_ALL:
+                        continue
                     score -= 300
 
         # Batch size bonus
         score += 50 * len(group.jobs)
 
-        # Starvation prevention — boosted on idle GPUs so that lightweight
-        # tasks (bgremove, upscale) don't starve behind a constant stream
-        # of SDXL jobs.  With a 25x multiplier an idle GPU will pick up a
-        # 60-second-old bgremove job over a fresh SDXL job.
-        starvation_mult = 25 if is_idle else 10
-        score += int(starvation_mult * group.oldest_age_seconds)
+        # Starvation prevention — 3-phase ramp targeting 2-minute dispatch:
+        #   0-30s:   linear (normal scheduling priority)
+        #   30-120s: quadratic acceleration (dominates affinity by ~60s)
+        #   >=120s:  hard override (+50000, guarantees dispatch)
+        age = group.oldest_age_seconds
+        base_mult = 25 if is_idle else 10
+        if age <= 30:
+            starvation = int(base_mult * age)
+        elif age <= 120:
+            linear_base = base_mult * 30
+            excess = age - 30
+            starvation = int(linear_base + base_mult * excess + 0.5 * excess * excess)
+        else:
+            starvation = 50000
+        score += starvation
 
         # Prefer less-loaded GPUs — spread work across devices
         if is_idle:
@@ -193,13 +208,13 @@ class GpuScheduler:
         else:
             score -= 300 * worker.active_count
 
-        # OOM avoidance: heavily penalize GPUs where this job already OOM'd.
-        # This prevents the scheduler from sending the job right back to the
-        # same GPU that couldn't fit it.
+        # OOM avoidance: hard-reject GPUs where this job already OOM'd.
+        # Must be a hard reject (not just a penalty) because the starvation
+        # hard override at 120s (+50000) would overwhelm any penalty.
         if group.jobs:
             job = group.jobs[0]
             if worker.gpu.uuid in job.oom_gpu_ids:
-                score -= 5000
+                return -2**31
 
         return score
 

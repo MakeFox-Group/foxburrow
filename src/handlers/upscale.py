@@ -170,10 +170,11 @@ def execute(job: "InferenceJob", gpu: "GpuInstance") -> Image.Image:
     """Pipeline adapter: execute upscale job."""
     if job.input_image is None:
         raise RuntimeError("InputImage is required for upscaling.")
-    return upscale_image(job.input_image, gpu)
+    return upscale_image(job.input_image, gpu, job=job)
 
 
-def upscale_image(image: Image.Image, gpu: "GpuInstance") -> Image.Image:
+def upscale_image(image: Image.Image, gpu: "GpuInstance", *,
+                   job: "InferenceJob | None" = None) -> Image.Image:
     """2x upscale a PIL image using the cached RealESRGAN model."""
     # Get model from cache
     model = None
@@ -216,7 +217,7 @@ def upscale_image(image: Image.Image, gpu: "GpuInstance") -> Image.Image:
     # Use tiling for large images to avoid OOM
     h, w = t.shape[2], t.shape[3]
     if TILE_SIZE > 0 and (h > TILE_SIZE or w > TILE_SIZE):
-        output = _tile_forward(model, t, device)
+        output = _tile_forward(model, t, device, job=job)
     else:
         with torch.no_grad():
             output = model(t)
@@ -236,7 +237,8 @@ def upscale_image(image: Image.Image, gpu: "GpuInstance") -> Image.Image:
 
 
 def _tile_forward(model: nn.Module, img: torch.Tensor,
-                  device: torch.device) -> torch.Tensor:
+                  device: torch.device, *,
+                  job: "InferenceJob | None" = None) -> torch.Tensor:
     """Process image in tiles to manage VRAM for large images."""
     scale = 2
     batch, channel, height, width = img.shape
@@ -246,6 +248,10 @@ def _tile_forward(model: nn.Module, img: torch.Tensor,
 
     tiles_x = math.ceil(width / TILE_SIZE)
     tiles_y = math.ceil(height / TILE_SIZE)
+
+    if job is not None:
+        job.stage_total_steps = tiles_x * tiles_y
+        job.stage_step = 0
 
     for y in range(tiles_y):
         for x in range(tiles_x):
@@ -278,5 +284,8 @@ def _tile_forward(model: nn.Module, img: torch.Tensor,
                    ofs_x * scale:min((ofs_x + TILE_SIZE) * scale, output_w)] = \
                 output_tile[:, :, output_start_y_tile:output_end_y_tile,
                             output_start_x_tile:output_end_x_tile]
+
+            if job is not None:
+                job.stage_step += 1
 
     return output

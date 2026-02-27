@@ -93,9 +93,14 @@ _profiling_events: dict[tuple[str, str], threading.Event] = {}
 # ── GPU model name ────────────────────────────────────────────────
 
 def get_gpu_model_name(device: torch.device) -> str:
-    """Get a filesystem-safe GPU model name for cache directory naming."""
-    name = torch.cuda.get_device_name(device)
-    return name.replace(" ", "_").replace("/", "_")
+    """Get a filesystem-safe GPU identifier for cache directory naming.
+
+    Uses the compute capability (SM architecture) since cuDNN algorithm
+    selection — which determines workspace sizes — is architecture-dependent.
+    All GPUs with the same SM version produce identical profiles.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"sm_{major}{minor}"
 
 
 # ── Cache I/O ─────────────────────────────────────────────────────

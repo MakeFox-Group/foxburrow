@@ -1805,7 +1805,7 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
     elapsed_ms = (time.monotonic() - t0) * 1000
     n_unet_keys = sum(1 for k in converted_sd if k.startswith("unet."))
     log.info(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
-             f"({n_unet_keys} unet params, {lora_bytes // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
+             f"({n_unet_keys} unet params, {lora_size // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
 
 
 def _get_cached_model(gpu: GpuInstance, category: str,
