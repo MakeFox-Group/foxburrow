@@ -14,13 +14,11 @@ import threading
 # Must be set BEFORE importing torch or any CUDA library.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-# Enable expandable memory segments in PyTorch's CUDA caching allocator.
-# Without this, the allocator creates fixed-size blocks that can't be merged,
-# causing fragmentation: OOM errors even when total free VRAM appears sufficient
-# (e.g. "437 MiB reserved but unallocated" yet can't allocate 26 MiB).
-# expandable_segments lets PyTorch grow/shrink allocations dynamically, virtually
-# eliminating fragmentation on multi-model GPU workloads.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+# Use CUDA's native async memory allocator instead of PyTorch's caching allocator.
+# This bypasses PyTorch's virtual-memory segment management entirely, letting the
+# CUDA driver handle page table mappings directly.  Matches Forge's --cuda-malloc.
+# (Previously used expandable_segments:True which manages segments in Python-land.)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
 
 # Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
 # instead of ~/.cache/huggingface/. Must be set before any HF imports.
