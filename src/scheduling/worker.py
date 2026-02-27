@@ -59,7 +59,7 @@ _STAGE_TO_PROFILER_COMPONENT: dict[StageType, str] = {
     StageType.GPU_VAE_ENCODE: "sdxl_vae_enc",
     StageType.GPU_UPSCALE: "upscale",
     StageType.GPU_BGREMOVE: "bgremove",
-    # GPU_HIRES_TRANSFORM is composite — handled specially
+    # GPU_HIRES_TRANSFORM is no longer used (split into VaeDecode+Upscale+VaeEncode)
 }
 
 _VRAM_FALLBACK_BYTES: dict[StageType, int] = {
@@ -726,12 +726,9 @@ class GpuWorker:
         model_dir = job.sdxl_input.model_dir if job.sdxl_input else None
 
         if stage.type in (StageType.GPU_TEXT_ENCODE, StageType.GPU_DENOISE,
-                          StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE,
-                          StageType.GPU_HIRES_TRANSFORM):
+                          StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
             self._gpu.ensure_session_group("sdxl")
             self._load_sdxl_components(stage, model_dir)
-            if stage.type == StageType.GPU_HIRES_TRANSFORM:
-                self._load_upscale_model()
         elif stage.type == StageType.GPU_UPSCALE:
             self._gpu.ensure_session_group("upscale")
             self._load_upscale_model()
@@ -943,11 +940,10 @@ class GpuWorker:
         elif stage.type == StageType.GPU_VAE_ENCODE:
             from handlers.sdxl import vae_encode
             vae_encode(job, self._gpu)
-            return None
-
-        elif stage.type == StageType.GPU_HIRES_TRANSFORM:
-            from handlers.sdxl import hires_transform
-            hires_transform(job, self._gpu)
+            # After encoding upscaled image back to latents, mark as hires pass
+            # so the subsequent denoise uses hires parameters (strength, steps).
+            if job.hires_input is not None:
+                job.is_hires_pass = True
             return None
 
         elif stage.type == StageType.GPU_UPSCALE:

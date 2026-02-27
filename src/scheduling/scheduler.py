@@ -22,7 +22,6 @@ _SESSION_MAP: dict[StageType, tuple[str, str]] = {
     StageType.GPU_DENOISE:        ("sdxl_unet",        "sdxl"),
     StageType.GPU_VAE_DECODE:     ("sdxl_vae",         "sdxl"),
     StageType.GPU_VAE_ENCODE:     ("sdxl_vae",         "sdxl"),
-    StageType.GPU_HIRES_TRANSFORM:("sdxl_hires_xform", "sdxl"),
     StageType.GPU_UPSCALE:        ("upscale",          "upscale"),
     StageType.GPU_BGREMOVE:       ("bgremove",         "bgremove"),
 }

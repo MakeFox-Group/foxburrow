@@ -32,12 +32,14 @@ class PipelineFactory:
         ]
 
     def create_sdxl_hires_pipeline(self, model_dir: str) -> list[WorkStage]:
-        """6-stage SDXL hires fix:
-        Tokenize → TextEncode → Denoise(base) → HiresTransform → Denoise(hires) → VaeDecode."""
+        """8-stage SDXL hires fix:
+        Tokenize → TextEncode → Denoise(base) → VaeDecode → Upscale → VaeEncode
+        → Denoise(hires) → VaeDecode."""
         te_comps = self._registry.get_sdxl_te_components(model_dir)
         unet_comp = self._registry.get_sdxl_unet_component(model_dir)
         vae_comp = self._registry.get_sdxl_vae_component(model_dir)
         vae_enc_comp = self._registry.get_sdxl_vae_encoder_component(model_dir)
+        upscale_comp = self._registry.get_upscale_component()
 
         return [
             WorkStage(type=StageType.CPU_TOKENIZE),
@@ -47,8 +49,15 @@ class PipelineFactory:
             WorkStage(type=StageType.GPU_DENOISE,
                       required_components=[unet_comp],
                       required_capability="sdxl"),
-            WorkStage(type=StageType.GPU_HIRES_TRANSFORM,
-                      required_components=[vae_comp, vae_enc_comp],
+            # Hires transform split into 3 stages (can run on different GPUs):
+            WorkStage(type=StageType.GPU_VAE_DECODE,
+                      required_components=[vae_comp],
+                      required_capability="sdxl"),
+            WorkStage(type=StageType.GPU_UPSCALE,
+                      required_components=[upscale_comp],
+                      required_capability="upscale"),
+            WorkStage(type=StageType.GPU_VAE_ENCODE,
+                      required_components=[vae_enc_comp],
                       required_capability="sdxl"),
             WorkStage(type=StageType.GPU_DENOISE,
                       required_components=[unet_comp],
@@ -99,20 +108,27 @@ class PipelineFactory:
         ]
 
     def create_sdxl_hires_latents_pipeline(self, model_dir: str) -> list[WorkStage]:
-        """4-stage hires fix starting from latents, outputting latents:
-        Tokenize → TextEncode → HiresTransform → Denoise(hires)."""
+        """6-stage hires fix starting from latents, outputting latents:
+        Tokenize → TextEncode → VaeDecode → Upscale → VaeEncode → Denoise(hires)."""
         te_comps = self._registry.get_sdxl_te_components(model_dir)
         unet_comp = self._registry.get_sdxl_unet_component(model_dir)
         vae_comp = self._registry.get_sdxl_vae_component(model_dir)
         vae_enc_comp = self._registry.get_sdxl_vae_encoder_component(model_dir)
+        upscale_comp = self._registry.get_upscale_component()
 
         return [
             WorkStage(type=StageType.CPU_TOKENIZE),
             WorkStage(type=StageType.GPU_TEXT_ENCODE,
                       required_components=te_comps,
                       required_capability="sdxl"),
-            WorkStage(type=StageType.GPU_HIRES_TRANSFORM,
-                      required_components=[vae_comp, vae_enc_comp],
+            WorkStage(type=StageType.GPU_VAE_DECODE,
+                      required_components=[vae_comp],
+                      required_capability="sdxl"),
+            WorkStage(type=StageType.GPU_UPSCALE,
+                      required_components=[upscale_comp],
+                      required_capability="upscale"),
+            WorkStage(type=StageType.GPU_VAE_ENCODE,
+                      required_components=[vae_enc_comp],
                       required_capability="sdxl"),
             WorkStage(type=StageType.GPU_DENOISE,
                       required_components=[unet_comp],
