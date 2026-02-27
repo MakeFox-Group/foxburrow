@@ -89,13 +89,18 @@ def _resolve_model(model_name: str | None) -> tuple[str | None, str | None]:
 
 
 def _find_gpu_with_tagger(state) -> "GpuInstance | None":
-    """Find a GPU with the tagger loaded, preferring non-busy GPUs."""
+    """Find a GPU with the tagger loaded.
+
+    Taggers can always run regardless of other GPU work (tiny VRAM footprint,
+    fast inference), so we don't filter by busyness — just pick the first
+    loaded tagger, preferring idle GPUs for best latency.
+    """
     from handlers.tagger import is_loaded_on
     best = None
     for g in state.gpu_pool.gpus:
         if g.supports_capability("tag") and is_loaded_on(g.device):
             if not g.is_busy:
-                return g  # prefer idle GPU
+                return g  # prefer idle for best latency
             if best is None:
                 best = g
     return best
@@ -257,6 +262,25 @@ async def status():
         except Exception as ex:
             log.log_exception(ex, "Failed to estimate available slots")
 
+    # Tag slots: count GPUs with the tagger model actually loaded.
+    # Taggers run immediately (bypass the scheduler queue) and can always
+    # execute regardless of other GPU work, so the count = loaded models.
+    from handlers.tagger import is_loaded_on
+    tag_count = sum(1 for g in pool.gpus
+                    if g.supports_capability("tag") and is_loaded_on(g.device))
+    available_slots["tag"] = tag_count
+
+    # Max concurrent tasks this foxburrow instance can handle.
+    # Hard cap: (num_active_gpus * 2) + 2  (2 overlapping pipeline stages per GPU + buffer)
+    # Further constrained by VRAM: if fewer GPUs can actually accept SDXL work,
+    # reduce proportionally.
+    num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
+    hard_cap = num_active_gpus * 2 + 2
+    sdxl_capable = available_slots.get("sdxl", num_active_gpus)
+    # VRAM-based cap: GPUs with available SDXL VRAM × 2 stages + 2 buffer
+    vram_cap = sdxl_capable * 2 + 2
+    max_concurrent = min(hard_cap, vram_cap)
+
     # Model scan progress
     model_scan = None
     scanner = state.model_scanner
@@ -272,6 +296,7 @@ async def status():
         "gpus": gpus,
         "available": available,
         "available_slots": available_slots,
+        "max_concurrent": max_concurrent,
         "total": len(pool.gpus),
         "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
         "model_scan": model_scan,
