@@ -29,9 +29,8 @@ if TYPE_CHECKING:
 # Per-session concurrency limits
 _SESSION_MAX_CONCURRENCY: dict[str, int] = {
     "sdxl_unet": 1,
-    "sdxl_vae": 2,
+    "sdxl_vae": 1,
     "sdxl_te": 1,
-    "sdxl_hires_xform": 1,
     "upscale": 1,
     "bgremove": 1,
 }
@@ -696,6 +695,11 @@ class GpuWorker:
 
         except Exception as ex:
             # Outer handler catches model-loading failures and other setup errors.
+            # Clear display state so TUI doesn't show stale GPU assignments.
+            job.stage_status = ""
+            job.active_gpus = []
+            with self._state_lock:
+                self._active_jobs.pop(job.job_id, None)
             if _is_cuda_fatal(ex):
                 log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")
                 log.error(f"  FATAL: Unrecoverable CUDA error — all GPUs unusable. "

@@ -20,6 +20,7 @@ from PIL import Image
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
 import log
+from gpu import nvml
 from scheduling.job import InferenceJob, SdxlTokenizeResult, SdxlEncodeResult, SdxlRegionalEncodeResult
 
 if TYPE_CHECKING:
@@ -1649,6 +1650,7 @@ def _ensure_loras(unet, lora_specs: list, gpu: GpuInstance, lora_index: dict) ->
 
     Uses PEFT adapter mode: adapters are injected as separate matrices
     without modifying base weights, so the base UNet stays clean on GPU.
+    Incompatible LoRAs (e.g. SD1.5 on SDXL) are silently skipped.
     """
     adapter_names = []
     adapter_weights = []
@@ -1666,7 +1668,13 @@ def _ensure_loras(unet, lora_specs: list, gpu: GpuInstance, lora_index: dict) ->
             # Already loaded — just activate
             pass
         else:
-            _load_lora_adapter(unet, entry.path, adapter_name, gpu)
+            try:
+                _load_lora_adapter(unet, entry.path, adapter_name, gpu)
+            except _LoraSkipped:
+                continue
+            except Exception as ex:
+                log.warning(f"  LoRA: Failed to load '{adapter_name}': {ex}")
+                continue
 
         adapter_names.append(adapter_name)
         adapter_weights.append(spec.weight)
@@ -1679,24 +1687,94 @@ def _ensure_loras(unet, lora_specs: list, gpu: GpuInstance, lora_index: dict) ->
         unet.disable_adapters()
 
 
+class _LoraSkipped(Exception):
+    """Raised when a LoRA is intentionally skipped (incompatible, too large, etc.)."""
+    pass
+
+
+def _detect_lora_arch(state_dict: dict) -> str:
+    """Detect LoRA architecture from weight shapes.
+
+    Checks cross-attention key projection dimensions:
+      - SD 1.5: text encoder dim = 768
+      - SDXL:   text encoder dim = 2048
+
+    Returns ``"sd15"``, ``"sdxl"``, or ``"unknown"``.
+    """
+    for key, tensor in state_dict.items():
+        # Cross-attention to_k captures text encoder dimension.
+        # Works for both A1111 keys (attn2_to_k.lora_down) and
+        # diffusers keys (attn2.to_k.lora_A).
+        is_cross_attn_key = ("attn2" in key and "to_k" in key)
+        is_down_weight = ("lora_down" in key or "lora_A" in key or "lora_a" in key)
+        if is_cross_attn_key and is_down_weight and tensor.dim() == 2:
+            in_dim = tensor.shape[1]  # [rank, in_features]
+            if in_dim == 768:
+                return "sd15"
+            elif in_dim == 2048:
+                return "sdxl"
+    return "unknown"
+
+
+# The UNet architecture that foxburrow serves (SDXL).
+_EXPECTED_LORA_ARCH = "sdxl"
+
+
 def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance) -> None:
     """Load a LoRA safetensors/pt file as a PEFT adapter on the UNet.
 
     Uses diffusers' built-in LoRA conversion to handle A1111/Forge/Kohya
     key naming conventions, then loads via UNet's native load_lora_adapter.
+
+    Raises ``_LoraSkipped`` if the LoRA is incompatible or won't fit in VRAM.
     """
     from safetensors.torch import load_file as load_safetensors
     from diffusers.loaders.lora_pipeline import _convert_non_diffusers_lora_to_diffusers
     from diffusers.loaders.lora_conversion_utils import _maybe_map_sgm_blocks_to_diffusers
+    from utils import fingerprint as fp_cache
 
     t0 = time.monotonic()
 
-    # Load raw state dict
-    if lora_path.endswith(".safetensors"):
-        raw_sd = load_safetensors(lora_path, device=str(gpu.device))
-    else:
-        raw_sd = torch.load(lora_path, map_location=gpu.device, weights_only=True)
+    # ── Quick architecture check from cache ─────────────────────────
+    cached_arch = fp_cache.get_extra(lora_path, "lora_arch")
+    if cached_arch is not None and cached_arch != _EXPECTED_LORA_ARCH and cached_arch != "unknown":
+        log.warning(f"  LoRA: Skipping '{adapter_name}' — architecture mismatch "
+                    f"(LoRA is {cached_arch}, model expects {_EXPECTED_LORA_ARCH})")
+        raise _LoraSkipped(f"Architecture mismatch: {cached_arch}")
 
+    # ── VRAM pre-check (file size as upper bound) ─────────────────
+    lora_size = os.path.getsize(lora_path)
+    _, _, free = nvml.get_memory_info(gpu.nvml_handle)
+    if lora_size > free:
+        log.warning(f"  LoRA: Skipping '{adapter_name}' — insufficient VRAM "
+                    f"(file {lora_size // (1024*1024)}MB, free {free // (1024*1024)}MB)")
+        raise _LoraSkipped(f"Insufficient VRAM: {lora_size} > {free}")
+
+    # ── Load raw state dict ─────────────────────────────────────────
+    # Load to CPU first when arch detection is needed (avoids wasting GPU
+    # VRAM on incompatible LoRAs). Load directly to GPU when cache confirms
+    # compatibility — saves the CPU→GPU transfer overhead.
+    need_detect = cached_arch is None
+    load_device = "cpu" if need_detect else str(gpu.device)
+
+    if lora_path.endswith(".safetensors"):
+        raw_sd = load_safetensors(lora_path, device=load_device)
+    else:
+        raw_sd = torch.load(lora_path, map_location=load_device, weights_only=True)
+
+    # ── Detect and cache architecture if not yet cached ─────────────
+    if need_detect:
+        detected_arch = _detect_lora_arch(raw_sd)
+        fp_cache.set_extra(lora_path, lora_arch=detected_arch)
+        if detected_arch != _EXPECTED_LORA_ARCH and detected_arch != "unknown":
+            log.warning(f"  LoRA: Skipping '{adapter_name}' — architecture mismatch "
+                        f"(LoRA is {detected_arch}, model expects {_EXPECTED_LORA_ARCH})")
+            del raw_sd
+            raise _LoraSkipped(f"Architecture mismatch: {detected_arch}")
+        # Arch OK — move tensors to GPU
+        raw_sd = {k: v.to(gpu.device) for k, v in raw_sd.items()}
+
+    # ── Convert key format ──────────────────────────────────────────
     # Detect format: A1111/Kohya keys start with "lora_unet_" / "lora_te_",
     # diffusers keys contain "lora_A" / "lora_B" already
     is_a1111 = any(k.startswith("lora_unet_") or k.startswith("lora_te") for k in raw_sd)
@@ -1727,7 +1805,7 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
     elapsed_ms = (time.monotonic() - t0) * 1000
     n_unet_keys = sum(1 for k in converted_sd if k.startswith("unet."))
     log.info(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
-             f"({n_unet_keys} unet params, {elapsed_ms:.0f}ms)")
+             f"({n_unet_keys} unet params, {lora_bytes // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
 
 
 def _get_cached_model(gpu: GpuInstance, category: str,

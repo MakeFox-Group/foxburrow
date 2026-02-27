@@ -541,9 +541,9 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
         for action in actions:
             try:
                 if action["type"] == "tag":
-                    # Tagger isn't in the GPU model cache (it's managed separately),
-                    # so it's inherently unevictable. Nothing to do.
-                    pass
+                    fp = f"tagger:{gpu.uuid}"
+                    gpu.mark_unevictable(fp)
+                    log.info(f"  GPU [{gpu.uuid}]: Marked tagger as unevictable")
 
                 elif action["type"] == "upscale":
                     comp = app_state.registry.get_upscale_component()

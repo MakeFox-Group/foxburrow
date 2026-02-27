@@ -152,6 +152,7 @@ class GpuScheduler:
             return -2**31
 
         score = 0
+        is_idle = worker.is_idle
         loaded_cats = worker.get_loaded_categories()
         required_group = get_session_group(stage.type)
 
@@ -168,8 +169,9 @@ class GpuScheduler:
             else:
                 score -= 500
 
-        # Cross-group penalty
-        if required_group:
+        # Cross-group penalty — only when busy. An idle GPU has zero
+        # context-switch cost so switching session groups is free.
+        if required_group and not is_idle:
             for cat in loaded_cats:
                 cat_group = get_session_group_from_key(cat)
                 if cat_group and cat_group != required_group:
@@ -178,11 +180,15 @@ class GpuScheduler:
         # Batch size bonus
         score += 50 * len(group.jobs)
 
-        # Starvation prevention
-        score += int(10 * group.oldest_age_seconds)
+        # Starvation prevention — boosted on idle GPUs so that lightweight
+        # tasks (bgremove, upscale) don't starve behind a constant stream
+        # of SDXL jobs.  With a 25x multiplier an idle GPU will pick up a
+        # 60-second-old bgremove job over a fresh SDXL job.
+        starvation_mult = 25 if is_idle else 10
+        score += int(starvation_mult * group.oldest_age_seconds)
 
         # Prefer less-loaded GPUs — spread work across devices
-        if worker.is_idle:
+        if is_idle:
             score += 200
         else:
             score -= 300 * worker.active_count
