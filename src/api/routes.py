@@ -286,10 +286,10 @@ async def status():
                     if g.supports_capability("tag") and is_loaded_on(g.device))
     available_slots["tag"] = tag_count
 
-    # Max concurrent tasks: GPUCount * floor(GPUCount / 2)
+    # Max concurrent tasks: GPUCount + floor(GPUCount / 2)
     # Scales naturally with GPU count while preventing oversubscription.
     num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
-    max_concurrent = num_active_gpus * (num_active_gpus // 2)
+    max_concurrent = num_active_gpus + (num_active_gpus // 2)
 
     # Model scan progress
     model_scan = None
