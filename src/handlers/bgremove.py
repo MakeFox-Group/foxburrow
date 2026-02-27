@@ -27,18 +27,21 @@ def set_model_path(path: str) -> None:
 
 def load_model(device: torch.device) -> torch.nn.Module:
     """Load the RMBG-2.0 background removal model."""
+    import os
     if _model_path is None:
         raise RuntimeError("BGRemove model path not configured.")
 
     try:
         from handlers.birefnet_model import BiRefNet
+        from safetensors.torch import load_file
 
-        # Import BiRefNet directly — no trust_remote_code needed since the
-        # model code lives in src/handlers/ alongside this file, not in the
-        # model weights directory.  low_cpu_mem_usage=False avoids accelerate's
-        # init_empty_weights() meta-device context which can leak on failure.
-        model = BiRefNet.from_pretrained(
-            _model_path, low_cpu_mem_usage=False)
+        # Bypass from_pretrained entirely to avoid HuggingFace's
+        # _is_hf_initialized / meta-tensor / accelerate context leak issues.
+        # Construct model directly, load safetensors weights manually.
+        model = BiRefNet(bb_pretrained=False)
+        weights_path = os.path.join(_model_path, "model.safetensors")
+        state_dict = load_file(weights_path)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device=device, dtype=torch.float16).eval()
         log.info(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model
