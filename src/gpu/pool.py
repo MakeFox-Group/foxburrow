@@ -438,6 +438,12 @@ class GpuPool:
                 "capabilities": sorted(cfg.capabilities),
             })
 
+        # Probe fork features against the actual CUDA allocator backend.
+        # Must run after at least one GPU is registered (CUDA context ready).
+        if self.gpus:
+            from gpu.torch_ext import check_runtime_support
+            check_runtime_support(self.gpus[0].device)
+
     def remove_gpu(self, uuid: str) -> bool:
         """Remove a GPU by UUID and fire a ``gpu_removed`` event.
 
