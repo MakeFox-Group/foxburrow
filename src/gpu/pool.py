@@ -6,6 +6,7 @@ Tracks loaded models, VRAM usage, and provides model cache with LRU eviction.
 from __future__ import annotations
 
 import ctypes
+import itertools
 import threading
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
@@ -130,10 +131,20 @@ def fix_meta_tensors(model: nn.Module) -> int:
     tensor``.
 
     This function surgically replaces only the meta tensors, leaving all
-    properly loaded parameters/buffers intact.
+    properly loaded parameters/buffers intact.  Replacement tensors are created
+    on the same device as the model's existing non-meta tensors (so LoRA
+    parameters injected while the model is on CUDA land on the correct GPU).
 
     Returns the number of tensors fixed.
     """
+    # Detect target device from the first non-meta parameter or buffer.
+    # If the model is already on a CUDA device, replacements must go there too.
+    target_device = torch.device("cpu")
+    for t in itertools.chain(model.parameters(), model.buffers()):
+        if not t.is_meta:
+            target_device = t.device
+            break
+
     fixed = 0
 
     for name, param in list(model.named_parameters()):
@@ -144,7 +155,7 @@ def fix_meta_tensors(model: nn.Module) -> int:
         for part in parts[:-1]:
             parent = getattr(parent, part)
         new_param = nn.Parameter(
-            torch.zeros(param.shape, dtype=param.dtype, device="cpu"),
+            torch.zeros(param.shape, dtype=param.dtype, device=target_device),
             requires_grad=param.requires_grad,
         )
         setattr(parent, parts[-1], new_param)
@@ -157,7 +168,7 @@ def fix_meta_tensors(model: nn.Module) -> int:
         parent = model
         for part in parts[:-1]:
             parent = getattr(parent, part)
-        new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+        new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=target_device)
         parent.register_buffer(parts[-1], new_buf)
         fixed += 1
 
