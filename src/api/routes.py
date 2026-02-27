@@ -286,16 +286,10 @@ async def status():
                     if g.supports_capability("tag") and is_loaded_on(g.device))
     available_slots["tag"] = tag_count
 
-    # Max concurrent tasks this foxburrow instance can handle.
-    # Hard cap: (num_active_gpus * 2) + 2  (2 overlapping pipeline stages per GPU + buffer)
-    # Further constrained by VRAM: if fewer GPUs can actually accept SDXL work,
-    # reduce proportionally.
+    # Max concurrent tasks: GPUCount * floor(GPUCount / 2)
+    # Scales naturally with GPU count while preventing oversubscription.
     num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
-    hard_cap = num_active_gpus * 2 + 2
-    sdxl_capable = available_slots.get("sdxl", num_active_gpus)
-    # VRAM-based cap: GPUs with available SDXL VRAM × 2 stages + 2 buffer
-    vram_cap = sdxl_capable * 2 + 2
-    max_concurrent = min(hard_cap, vram_cap)
+    max_concurrent = num_active_gpus * (num_active_gpus // 2)
 
     # Model scan progress
     model_scan = None
