@@ -200,8 +200,9 @@ class InferenceJob:
         self.regional_base_tokenize: SdxlTokenizeResult | None = None
         self.regional_shared_neg_tokenize: SdxlTokenizeResult | None = None  # global negative
 
-        # OOM retry tracking — re-enqueue instead of failing
+        # OOM handling — always re-enqueue, never fail on OOM
         self.oom_retries: int = 0
+        self.oom_gpu_ids: set[str] = set()  # GPUs that OOM'd this job
 
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
         self.unet_tile_width: int = 0   # UNet / MultiDiffusion tile width (pixels)

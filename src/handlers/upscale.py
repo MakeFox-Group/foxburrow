@@ -152,10 +152,14 @@ def load_model(device: torch.device) -> nn.Module:
         state = state["params"]
 
     # If a leaked accelerate init_empty_weights() context left parameters
-    # on meta device, assign=True replaces them with the loaded tensors
-    # instead of trying to copy into meta (which raises NotImplementedError).
-    has_meta = any(p.is_meta for p in model.parameters())
-    model.load_state_dict(state, strict=True, assign=has_meta)
+    # on meta device, to_empty() materializes them via _parameters dict
+    # (bypassing any monkey-patched register_parameter).
+    has_meta = any(p.is_meta for p in model.parameters()) or \
+               any(b.is_meta for b in model.buffers())
+    if has_meta:
+        log.warning("  Upscale: meta tensors detected (accelerate leak), materializing")
+        model.to_empty(device="cpu")
+    model.load_state_dict(state, strict=True)
     model.to(device).half().eval()
 
     log.info(f"  Upscale: Loaded RealESRGAN x2plus to {device}")

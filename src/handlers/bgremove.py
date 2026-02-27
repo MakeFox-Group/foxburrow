@@ -39,6 +39,14 @@ def load_model(device: torch.device) -> torch.nn.Module:
         # _is_hf_initialized / meta-tensor / accelerate context leak issues.
         # Construct model directly, load safetensors weights manually.
         model = BiRefNet(bb_pretrained=False)
+
+        # If a leaked accelerate context left meta tensors, materialize them.
+        has_meta = any(p.is_meta for p in model.parameters()) or \
+                   any(b.is_meta for b in model.buffers())
+        if has_meta:
+            log.warning("  BGRemove: meta tensors detected (accelerate leak), materializing")
+            model.to_empty(device="cpu")
+
         weights_path = os.path.join(_model_path, "model.safetensors")
         state_dict = load_file(weights_path)
         model.load_state_dict(state_dict, strict=False)

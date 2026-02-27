@@ -678,17 +678,18 @@ class GpuWorker:
                     job.completed_at = datetime.utcnow()
                     job.set_result(JobResult(success=False, error=str(ex)))
                     self._broadcast_complete(job, success=False, error=str(ex))
-                elif isinstance(ex, torch.cuda.OutOfMemoryError) and job.oom_retries < 2:
-                    # OOM during execution — re-enqueue so scheduler picks a
-                    # different GPU (or waits until VRAM frees up).
+                elif isinstance(ex, torch.cuda.OutOfMemoryError):
+                    # OOM during execution — always re-enqueue, never fail.
+                    # Free cached memory first so the GPU can accept other work.
+                    torch.cuda.empty_cache()
                     job.oom_retries += 1
+                    job.oom_gpu_ids.add(self._gpu.uuid)
                     log.warning(f"  GpuWorker[{self._gpu.uuid}]: {job} OOM at {stage} "
-                                f"— re-enqueuing (retry {job.oom_retries}/2)")
+                                f"— re-enqueuing (retry {job.oom_retries})")
                     self._queue.re_enqueue(job)
                 else:
                     log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: {job} failed at {stage}")
-                    if not isinstance(ex, torch.cuda.OutOfMemoryError):
-                        self._gpu.record_failure()
+                    self._gpu.record_failure()
                     job.completed_at = datetime.utcnow()
                     job.set_result(JobResult(success=False, error=str(ex)))
                     self._broadcast_complete(job, success=False, error=str(ex))
@@ -704,10 +705,13 @@ class GpuWorker:
                 job.completed_at = datetime.utcnow()
                 job.set_result(JobResult(success=False, error=str(ex)))
                 self._broadcast_complete(job, success=False, error=str(ex))
-            elif isinstance(ex, torch.cuda.OutOfMemoryError) and job.oom_retries < 2:
+            elif isinstance(ex, torch.cuda.OutOfMemoryError):
+                # OOM during model loading — always re-enqueue, never fail.
+                torch.cuda.empty_cache()
                 job.oom_retries += 1
+                job.oom_gpu_ids.add(self._gpu.uuid)
                 log.warning(f"  GpuWorker[{self._gpu.uuid}]: {job} OOM loading models for {stage} "
-                            f"— re-enqueuing (retry {job.oom_retries}/2)")
+                            f"— re-enqueuing (retry {job.oom_retries})")
                 self._queue.re_enqueue(job)
             else:
                 log.log_exception(ex, f"GpuWorker[{self._gpu.uuid}]: Batch failed at {stage}")

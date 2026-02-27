@@ -187,6 +187,14 @@ class GpuScheduler:
         else:
             score -= 300 * worker.active_count
 
+        # OOM avoidance: heavily penalize GPUs where this job already OOM'd.
+        # This prevents the scheduler from sending the job right back to the
+        # same GPU that couldn't fit it.
+        if group.jobs:
+            job = group.jobs[0]
+            if worker.gpu.uuid in job.oom_gpu_ids:
+                score -= 5000
+
         return score
 
     def estimate_available_slots(self) -> dict[str, int]:
