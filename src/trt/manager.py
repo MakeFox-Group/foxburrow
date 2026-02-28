@@ -70,6 +70,7 @@ class TrtBuildManager:
         self._export_pool = ThreadPoolExecutor(
             max_workers=export_threads, thread_name_prefix="trt-export")
         self._export_threads = export_threads
+        self._startup_mode = True  # Use all GPUs in parallel for first batch
 
     def start(self) -> None:
         """Start the background build loop as an asyncio task."""
@@ -181,6 +182,39 @@ class TrtBuildManager:
         else:
             log.info(f"  TRT: All engines up to date")
 
+    async def _build_chunk_on_gpu(
+        self,
+        models: list[_BuildRequest],
+        arch_key: str,
+        device_id: int,
+    ) -> None:
+        """Build engines for a chunk of models on a single GPU.
+
+        Used by both startup (parallel across GPUs) and runtime (single GPU)
+        build paths.
+        """
+        loop = asyncio.get_running_loop()
+        for i, req in enumerate(models):
+            short_hash = req.model_hash[:16]
+            log.info(f"  TRT: [GPU {device_id}] Building {short_hash} "
+                     f"[{i + 1}/{len(models)}]...")
+            try:
+                results = await loop.run_in_executor(
+                    None,
+                    build_all_engines,
+                    req.model_hash,
+                    self._cache_dir,
+                    arch_key,
+                    device_id,
+                )
+                built_unet = results.get("unet", [])
+                built_vae = results.get("vae", [])
+                log.info(f"  TRT: {short_hash}: UNet [{', '.join(built_unet)}] + "
+                         f"VAE [{', '.join(built_vae)}]")
+            except Exception as ex:
+                log.log_exception(
+                    ex, f"TRT: Engine build failed for {short_hash}")
+
     async def _process_batch(self, batch: list[_BuildRequest]) -> None:
         """Process a batch of models: parallel ONNX export, then batched engine build."""
         log.info(f"  TRT: Processing batch of {len(batch)} model(s)...")
@@ -230,7 +264,7 @@ class TrtBuildManager:
             if ak not in arch_workers:
                 arch_workers[ak] = w
 
-        for arch_key, worker in arch_workers.items():
+        for arch_key in arch_workers:
             # Find models that need engines for this arch
             needs_build = []
             for req in buildable:
@@ -250,40 +284,53 @@ class TrtBuildManager:
                 log.debug(f"  TRT: All {arch_key} engines exist — no build needed")
                 continue
 
-            # Drain the GPU once for the entire batch
-            log.info(f"  TRT: Requesting drain on GPU [{worker.gpu.uuid}] "
-                     f"for {arch_key} engine build ({len(needs_build)} models)...")
+            if self._startup_mode:
+                # ── Startup: drain ALL GPUs of this arch, build in parallel ──
+                arch_group = [w for w in self._workers
+                              if not w.gpu.is_failed
+                              and get_arch_key(w.gpu.device_id) == arch_key]
 
-            try:
-                await worker.request_drain()
-                log.info(f"  TRT: GPU [{worker.gpu.uuid}] drained — building "
-                         f"{len(needs_build)} model(s)")
+                log.info(f"  TRT: Startup mode — draining {len(arch_group)} GPU(s) "
+                         f"for {arch_key} engine build ({len(needs_build)} models)...")
 
-                loop = asyncio.get_running_loop()
-                for i, req in enumerate(needs_build):
-                    short_hash = req.model_hash[:16]
-                    log.info(f"  TRT: Building engines for {short_hash} "
-                             f"[{i + 1}/{len(needs_build)}]...")
-                    try:
-                        results = await loop.run_in_executor(
-                            None,
-                            build_all_engines,
-                            req.model_hash,
-                            self._cache_dir,
-                            arch_key,
-                            worker.gpu.device_id,
-                        )
-                        built_unet = results.get("unet", [])
-                        built_vae = results.get("vae", [])
-                        log.info(f"  TRT: {short_hash}: UNet [{', '.join(built_unet)}] + "
-                                 f"VAE [{', '.join(built_vae)}]")
-                    except Exception as ex:
-                        log.log_exception(
-                            ex, f"TRT: Engine build failed for {short_hash}")
+                for w in arch_group:
+                    await w.request_drain()
 
-            finally:
-                await worker.release_drain()
-                log.info(f"  TRT: GPU [{worker.gpu.uuid}] released from drain")
+                try:
+                    log.info(f"  TRT: All {len(arch_group)} GPU(s) drained — "
+                             f"building {len(needs_build)} model(s) in parallel")
+
+                    # Round-robin split across GPUs
+                    chunks: list[list[_BuildRequest]] = [[] for _ in arch_group]
+                    for i, req in enumerate(needs_build):
+                        chunks[i % len(arch_group)].append(req)
+
+                    await asyncio.gather(*[
+                        self._build_chunk_on_gpu(chunk, arch_key, w.gpu.device_id)
+                        for w, chunk in zip(arch_group, chunks) if chunk
+                    ])
+                finally:
+                    for w in arch_group:
+                        await w.release_drain()
+                    log.info(f"  TRT: All {len(arch_group)} GPU(s) released from drain")
+
+                self._startup_mode = False
+            else:
+                # ── Runtime: drain a single GPU, build sequentially ──────────
+                worker = arch_workers[arch_key]
+                log.info(f"  TRT: Requesting drain on GPU [{worker.gpu.uuid}] "
+                         f"for {arch_key} engine build ({len(needs_build)} models)...")
+
+                try:
+                    await worker.request_drain()
+                    log.info(f"  TRT: GPU [{worker.gpu.uuid}] drained — building "
+                             f"{len(needs_build)} model(s)")
+
+                    await self._build_chunk_on_gpu(
+                        needs_build, arch_key, worker.gpu.device_id)
+                finally:
+                    await worker.release_drain()
+                    log.info(f"  TRT: GPU [{worker.gpu.uuid}] released from drain")
 
         # ── Mark ready models ─────────────────────────────────────────────
         for req in buildable:
