@@ -92,7 +92,15 @@ _VRAM_HEADROOM = 1.20
 
 
 def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, int]:
-    """Return (width, height) for the profiler lookup."""
+    """Return (width, height) for the profiler lookup.
+
+    For tiled stages (VAE encode/decode, UNet denoise), returns the effective
+    tile size rather than the full image size — VRAM usage is bounded by the
+    tile, not the total image.
+    """
+    from handlers.sdxl import (VAE_TILE_THRESHOLD, VAE_TILE_MAX,
+                                UNET_TILE_THRESHOLD, UNET_TILE_MAX)
+
     w, h = 768, 768  # safe default
     if job.sdxl_input:
         w, h = job.sdxl_input.width, job.sdxl_input.height
@@ -105,24 +113,37 @@ def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, 
             StageType.GPU_UPSCALE, StageType.GPU_BGREMOVE):
         return job.input_image.width, job.input_image.height
 
+    # VAE encode/decode: tiled when any dimension >= threshold.
+    # Working memory is per-tile, so cap to max tile size.
+    if stage_type in (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
+        img_w, img_h = w, h
+        if stage_type == StageType.GPU_VAE_ENCODE and job.input_image is not None:
+            img_w, img_h = job.input_image.width, job.input_image.height
+        if img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
+            w = min(w, VAE_TILE_MAX)
+            h = min(h, VAE_TILE_MAX)
+
+    # UNet denoise: tiled (MultiDiffusion) when latent dim > threshold.
+    if stage_type == StageType.GPU_DENOISE:
+        lat_h, lat_w = h // 8, w // 8
+        if lat_h > UNET_TILE_THRESHOLD or lat_w > UNET_TILE_THRESHOLD:
+            w = min(w, UNET_TILE_MAX)
+            h = min(h, UNET_TILE_MAX)
+
     return w, h
 
 
 def _get_stage_pixels(stage_type: StageType, job: InferenceJob) -> int:
     """Return the pixel count that drives working-memory scaling for a stage.
 
-    - Text encode: constant (77 tokens, resolution-independent) → returns 1
-    - Denoise: scales with latent area = (W/8)×(H/8)
-    - VAE decode/encode, bgremove: scales with output pixel area = W×H
-    - Hires transform: scales with hires output area
-    - Upscale: scales with input pixel area (model processes input)
+    For tiled stages, returns the tile pixel count (not total image),
+    since VRAM usage is bounded by the tile size.
     """
     if stage_type == StageType.GPU_TEXT_ENCODE:
         return 1  # absolute measurement, not per-pixel
 
-    w, h = 768, 768  # safe default
-    if job.sdxl_input:
-        w, h = job.sdxl_input.width, job.sdxl_input.height
+    # Use _get_job_resolution which already handles tile capping
+    w, h = _get_job_resolution(stage_type, job)
 
     if stage_type == StageType.GPU_DENOISE:
         return (w // 8) * (h // 8)  # latent dimensions
