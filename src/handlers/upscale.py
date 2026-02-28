@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 import log
-from gpu.pool import fix_meta_tensors
+from gpu.pool import fix_meta_tensors, repair_accelerate_leak
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -140,6 +140,10 @@ def load_model(device: torch.device) -> nn.Module:
     """Load RealESRGAN model weights."""
     if _model_path is None:
         raise RuntimeError("Upscale model path not configured.")
+
+    # Repair any leaked accelerate init_empty_weights() context from concurrent
+    # SDXL extractions — otherwise RRDBNet() params land on the meta device.
+    repair_accelerate_leak()
 
     model = RRDBNet(
         num_in_ch=3, num_out_ch=3, num_feat=64,

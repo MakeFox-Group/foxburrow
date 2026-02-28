@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 import log
-from gpu.pool import fix_meta_tensors
+from gpu.pool import fix_meta_tensors, repair_accelerate_leak
 
 if TYPE_CHECKING:
     from gpu.pool import GpuInstance
@@ -39,6 +39,7 @@ def load_model(device: torch.device) -> torch.nn.Module:
         # Bypass from_pretrained entirely to avoid HuggingFace's
         # _is_hf_initialized / meta-tensor / accelerate context leak issues.
         # Construct model directly, load safetensors weights manually.
+        repair_accelerate_leak()
         model = BiRefNet(bb_pretrained=False)
 
         # Fix any meta tensors left by accelerate's init_empty_weights() leak.
