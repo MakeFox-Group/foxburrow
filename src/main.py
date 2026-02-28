@@ -877,7 +877,8 @@ def main() -> None:
             from trt.manager import TrtBuildManager
             trt_cache = os.path.abspath(config.server.tensorrt_cache)
             os.makedirs(trt_cache, exist_ok=True)
-            trt_mgr = TrtBuildManager(trt_cache, workers)
+            export_threads = _auto_threads(config.threads.fingerprint, 8)
+            trt_mgr = TrtBuildManager(trt_cache, workers, export_threads=export_threads)
             trt_mgr.start()
             app_state.trt_manager = trt_mgr
         except ImportError:
