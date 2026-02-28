@@ -177,7 +177,7 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         # Log the attention processor type for diagnostics
         _attn_procs = components["sdxl_unet"].attn_processors
         _proc_types = set(type(p).__name__ for p in _attn_procs.values())
-        log.info(f"  SDXL: UNet attention processors: {_proc_types}")
+        log.debug(f"  SDXL: UNet attention processors: {_proc_types}")
 
         # Capture scheduler config before deleting pipeline — this contains
         # the prediction_type (epsilon vs v_prediction) inferred from the

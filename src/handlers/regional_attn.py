@@ -77,12 +77,21 @@ class RegionalAttnState:
             return masks
 
         # SDXL UNet attention layers use power-of-2 downscale factors: 1, 2, 4
-        # Try each to find exact match for seq_len
+        # Strided convolutions in the UNet may use ceiling division for odd
+        # dimensions, so we try both floor and ceiling for each factor.
         layer_h, layer_w = full_h, full_w
         found = False
         for k in (1, 2, 4, 8):
+            # Floor division (typical for even dimensions)
             lh = full_h // k
             lw = full_w // k
+            if lh >= 1 and lw >= 1 and lh * lw == seq_len:
+                layer_h, layer_w = lh, lw
+                found = True
+                break
+            # Ceiling division (strided conv on odd dimensions rounds up)
+            lh = math.ceil(full_h / k)
+            lw = math.ceil(full_w / k)
             if lh >= 1 and lw >= 1 and lh * lw == seq_len:
                 layer_h, layer_w = lh, lw
                 found = True
@@ -92,7 +101,7 @@ class RegionalAttnState:
             raise RuntimeError(
                 f"Regional attention: cannot determine layer dimensions for seq_len={seq_len} "
                 f"from mask shape ({full_h}, {full_w}). "
-                f"Tried downscale factors 1, 2, 4, 8."
+                f"Tried downscale factors 1, 2, 4, 8 with floor and ceiling division."
             )
 
         result = F.interpolate(masks, size=(layer_h, layer_w), mode='nearest')
