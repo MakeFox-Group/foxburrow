@@ -36,6 +36,7 @@ PyYAML>=6.0
 # TensorRT inference (ONNX export + engine compilation)
 tensorrt-cu13>=10.15
 onnx>=1.16
+onnxscript>=0.1
 
 # Image / numeric
 Pillow>=10.0
