@@ -39,12 +39,11 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 # doesn't persist when models are constantly swapped. Not worth it until
 # models stay resident longer.
 
-# TorchInductor tuning for SDXL convolution patterns.
-# These improve kernel selection for 1x1 convolutions (used heavily in UNet).
+# TorchInductor tuning: conv_1x1_as_mm treats 1x1 convolutions (heavy in UNet)
+# as matrix multiplies for better kernel selection.  The coordinate_descent and
+# epilogue_fusion flags were tested but add massive compile time on sm_120
+# (Blackwell) due to immature autotuning — disabled until Triton matures.
 torch._inductor.config.conv_1x1_as_mm = True
-torch._inductor.config.coordinate_descent_tuning = True
-torch._inductor.config.epilogue_fusion = False
-torch._inductor.config.coordinate_descent_check_all_directions = True
 
 
 def _setup_compile_cache() -> None:

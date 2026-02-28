@@ -956,12 +956,20 @@ class GpuWorker:
 
             # Profile workspace for this component type (one-time per GPU model).
             # Uses cached JSON after the first load — near-zero cost on subsequent loads.
-            try:
-                from gpu.workspace_profiler import ensure_profiled
-                ensure_profiled(component.category, model,
-                                self._gpu.device, self._gpu_model_name)
-            except Exception as ex:
-                log.warning(f"  WorkspaceProfiler: Failed to profile {component.category}: {ex}")
+            # Skip profiling for torch.compile'd models — the profiler runs 17
+            # resolution forward passes, each triggering a full Triton compilation
+            # on cold cache.  VRAM prediction falls back to BPP/hardcoded tiers.
+            is_compiled = hasattr(model, '_orig_mod')
+            if is_compiled:
+                log.debug(f"  Skipping workspace profiling for compiled {component.category} "
+                         f"(would trigger 17 cold compilations)")
+            else:
+                try:
+                    from gpu.workspace_profiler import ensure_profiled
+                    ensure_profiled(component.category, model,
+                                    self._gpu.device, self._gpu_model_name)
+                except Exception as ex:
+                    log.warning(f"  WorkspaceProfiler: Failed to profile {component.category}: {ex}")
 
     def _load_upscale_model(self) -> None:
         """Load the upscale model if not already cached."""
