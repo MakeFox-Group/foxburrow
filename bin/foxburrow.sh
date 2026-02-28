@@ -79,7 +79,7 @@ fi
 # separately from requirements.txt to avoid pip resolver conflicts.
 TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu130"
 TORCH_STAMP="$VENV_DIR/.torch.stamp"
-TORCH_WANT="torch torchvision xformers"
+TORCH_WANT="torch torchvision"
 TORCH_HASH="$(echo "$TORCH_WANT $TORCH_INDEX" | sha256sum | cut -d' ' -f1)"
 old_torch_hash=""
 [ -f "$TORCH_STAMP" ] && old_torch_hash="$(cat "$TORCH_STAMP")"
