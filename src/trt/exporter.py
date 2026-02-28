@@ -3,16 +3,25 @@
 Exports PyTorch models to ONNX format with dynamic spatial axes,
 enabling a single ONNX graph to serve multiple resolutions via
 TensorRT optimization profiles.
+
+torch.onnx.export() is NOT thread-safe — it uses a global flag
+(GLOBALS.in_onnx_export) that asserts False on entry.  All exports
+must be serialized via _onnx_lock.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 
 import torch
 import torch.nn as nn
 
 import log
+
+# Serializes all torch.onnx.export() calls — the TorchScript exporter
+# uses a module-global GLOBALS.in_onnx_export flag that is not thread-safe.
+_onnx_lock = threading.Lock()
 
 
 class _UNetOnnxWrapper(nn.Module):
@@ -121,7 +130,7 @@ def export_unet_onnx(
 
     log.info(f"  TRT: Exporting UNet to ONNX (opset {opset})...")
 
-    with torch.no_grad():
+    with _onnx_lock, torch.no_grad():
         torch.onnx.export(
             wrapper,
             dummy_args,
@@ -174,7 +183,7 @@ def export_vae_onnx(
 
     log.info(f"  TRT: Exporting VAE decoder to ONNX (opset {opset})...")
 
-    with torch.no_grad():
+    with _onnx_lock, torch.no_grad():
         torch.onnx.export(
             wrapper,
             (dummy_latents,),
