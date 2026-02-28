@@ -30,6 +30,9 @@ kornia>=0.7
 # TUI console
 textual>=0.50
 
+# Checkpoint metadata (companion YAML sidecar detection)
+PyYAML>=6.0
+
 # Image / numeric
 Pillow>=10.0
 numpy>=1.24

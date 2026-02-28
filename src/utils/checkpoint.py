@@ -44,6 +44,8 @@ def read_safetensors_header(path: str) -> dict | None:
     try:
         with open(path, 'rb') as f:
             header_len = struct.unpack('<Q', f.read(8))[0]
+            if header_len > 100 * 1024 * 1024:  # sanity limit: 100 MB
+                return None
             return json.loads(f.read(header_len))
     except Exception:
         return None
