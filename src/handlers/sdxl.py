@@ -92,6 +92,8 @@ _extraction_events: dict[str, threading.Event] = {}
 _RE_ATTENTION = re.compile(
     r"\\\(|\\\)|\\\[|\\]|\\\\|\\|\(|\[|:\s*([+-]?[\d.]+)\s*\)|\)|]|[^\\()\[\]:]+|:"
 )
+# BREAK keyword regex — word-boundary match to avoid matching BREAKFAST, BREAKDOWN, etc.
+_RE_BREAK = re.compile(r'\bBREAK\b')
 
 
 # ====================================================================
@@ -329,7 +331,7 @@ def tokenize(job: InferenceJob) -> None:
         log.debug(f"  SDXL: Regional prompting detected — {len(regional.regions)} regions"
                  + (f" + base" if regional.base_prompt else ""))
 
-        # Tokenize each region's prompt + shared negative
+        # Tokenize each region's prompt + per-region negative
         region_toks: list[SdxlTokenizeResult] = []
         for i, region in enumerate(regional.regions):
             p1_ids, p1_weights, p1_mask = _tokenize_weighted(_tokenizer_1, region.prompt, CLIP_L_PAD)
@@ -344,11 +346,40 @@ def tokenize(job: InferenceJob) -> None:
                 prompt_mask_1=p1_mask, neg_mask_1=n1_mask,
                 prompt_mask_2=p2_mask, neg_mask_2=n2_mask,
             ))
-        job.regional_tokenize_results = region_toks
 
         # Tokenize the global/shared negative (used for pooled, ADDBASE neg, and fallback)
         gn1_ids, gn1_weights, gn1_mask = _tokenize_weighted(_tokenizer_1, regional.negative_prompt, CLIP_L_PAD)
         gn2_ids, gn2_weights, gn2_mask = _tokenize_weighted(_tokenizer_2, regional.negative_prompt, CLIP_G_PAD)
+
+        # Tokenize base prompt if present
+        bp1_ids, bp1_weights, bp1_mask = None, None, None
+        bp2_ids, bp2_weights, bp2_mask = None, None, None
+        if regional.base_prompt:
+            bp1_ids, bp1_weights, bp1_mask = _tokenize_weighted(_tokenizer_1, regional.base_prompt, CLIP_L_PAD)
+            bp2_ids, bp2_weights, bp2_mask = _tokenize_weighted(_tokenizer_2, regional.base_prompt, CLIP_G_PAD)
+
+        # Align all chunk counts: all regions + shared negative + base must match per encoder
+        max_1 = max(len(gn1_ids), *(len(rt.prompt_tokens_1) for rt in region_toks),
+                    *(len(rt.neg_tokens_1) for rt in region_toks))
+        max_2 = max(len(gn2_ids), *(len(rt.prompt_tokens_2) for rt in region_toks),
+                    *(len(rt.neg_tokens_2) for rt in region_toks))
+        if bp1_ids is not None:
+            max_1 = max(max_1, len(bp1_ids))
+            max_2 = max(max_2, len(bp2_ids))
+
+        _pad_to_chunk_count(gn1_ids, gn1_weights, gn1_mask, max_1, CLIP_L_PAD)
+        _pad_to_chunk_count(gn2_ids, gn2_weights, gn2_mask, max_2, CLIP_G_PAD)
+        for rt in region_toks:
+            _pad_to_chunk_count(rt.prompt_tokens_1, rt.prompt_weights_1, rt.prompt_mask_1, max_1, CLIP_L_PAD)
+            _pad_to_chunk_count(rt.neg_tokens_1, rt.neg_weights_1, rt.neg_mask_1, max_1, CLIP_L_PAD)
+            _pad_to_chunk_count(rt.prompt_tokens_2, rt.prompt_weights_2, rt.prompt_mask_2, max_2, CLIP_G_PAD)
+            _pad_to_chunk_count(rt.neg_tokens_2, rt.neg_weights_2, rt.neg_mask_2, max_2, CLIP_G_PAD)
+        if bp1_ids is not None:
+            _pad_to_chunk_count(bp1_ids, bp1_weights, bp1_mask, max_1, CLIP_L_PAD)
+            _pad_to_chunk_count(bp2_ids, bp2_weights, bp2_mask, max_2, CLIP_G_PAD)
+
+        job.regional_tokenize_results = region_toks
+
         job.regional_shared_neg_tokenize = SdxlTokenizeResult(
             prompt_tokens_1=[], prompt_weights_1=[],
             neg_tokens_1=gn1_ids, neg_weights_1=gn1_weights,
@@ -358,10 +389,7 @@ def tokenize(job: InferenceJob) -> None:
             prompt_mask_2=[], neg_mask_2=gn2_mask,
         )
 
-        # Tokenize base prompt if present
         if regional.base_prompt:
-            bp1_ids, bp1_weights, bp1_mask = _tokenize_weighted(_tokenizer_1, regional.base_prompt, CLIP_L_PAD)
-            bp2_ids, bp2_weights, bp2_mask = _tokenize_weighted(_tokenizer_2, regional.base_prompt, CLIP_G_PAD)
             job.regional_base_tokenize = SdxlTokenizeResult(
                 prompt_tokens_1=bp1_ids, prompt_weights_1=bp1_weights,
                 neg_tokens_1=gn1_ids, neg_weights_1=gn1_weights,
@@ -381,6 +409,14 @@ def tokenize(job: InferenceJob) -> None:
     n1_ids, n1_weights, n1_mask = _tokenize_weighted(_tokenizer_1, inp.negative_prompt, CLIP_L_PAD)
     p2_ids, p2_weights, p2_mask = _tokenize_weighted(_tokenizer_2, inp.prompt, CLIP_G_PAD)
     n2_ids, n2_weights, n2_mask = _tokenize_weighted(_tokenizer_2, inp.negative_prompt, CLIP_G_PAD)
+
+    # Align chunk counts: prompt and negative must have same number per encoder
+    max_chunks_1 = max(len(p1_ids), len(n1_ids))
+    _pad_to_chunk_count(p1_ids, p1_weights, p1_mask, max_chunks_1, CLIP_L_PAD)
+    _pad_to_chunk_count(n1_ids, n1_weights, n1_mask, max_chunks_1, CLIP_L_PAD)
+    max_chunks_2 = max(len(p2_ids), len(n2_ids))
+    _pad_to_chunk_count(p2_ids, p2_weights, p2_mask, max_chunks_2, CLIP_G_PAD)
+    _pad_to_chunk_count(n2_ids, n2_weights, n2_mask, max_chunks_2, CLIP_G_PAD)
 
     job.tokenize_result = SdxlTokenizeResult(
         prompt_tokens_1=p1_ids, prompt_weights_1=p1_weights,
@@ -414,21 +450,21 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
 
     device = gpu.device
 
-    # TextEncoder1: hidden states [1, 77, 768]
+    # TextEncoder1: hidden states [1, 77*N, 768]
     p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
     n_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
 
-    # TextEncoder2: hidden states [1, 77, 1280] + pooled [1, 1280]
+    # TextEncoder2: hidden states [1, 77*N, 1280] + pooled [1, 1280]
     p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
     n_h2, n_pooled = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
 
-    # Apply emphasis weights to hidden states (not pooled)
-    _apply_token_weights(p_h1, tok.prompt_weights_1)
-    _apply_token_weights(n_h1, tok.neg_weights_1)
-    _apply_token_weights(p_h2, tok.prompt_weights_2)
-    _apply_token_weights(n_h2, tok.neg_weights_2)
+    # Apply emphasis weights to hidden states (not pooled) — flatten chunk weights
+    _apply_token_weights(p_h1, _flatten_chunks(tok.prompt_weights_1))
+    _apply_token_weights(n_h1, _flatten_chunks(tok.neg_weights_1))
+    _apply_token_weights(p_h2, _flatten_chunks(tok.prompt_weights_2))
+    _apply_token_weights(n_h2, _flatten_chunks(tok.neg_weights_2))
 
-    # Concatenate hidden states along dim 2: [1,77,768]+[1,77,1280] = [1,77,2048]
+    # Concatenate hidden states along dim 2: [1,77*N,768]+[1,77*N,1280] = [1,77*N,2048]
     prompt_embeds = torch.cat([p_h1, p_h2], dim=2)
     neg_prompt_embeds = torch.cat([n_h1, n_h2], dim=2)
 
@@ -473,10 +509,10 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
         p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
 
-        _apply_token_weights(p_h1, tok.prompt_weights_1)
-        _apply_token_weights(p_h2, tok.prompt_weights_2)
+        _apply_token_weights(p_h1, _flatten_chunks(tok.prompt_weights_1))
+        _apply_token_weights(p_h2, _flatten_chunks(tok.prompt_weights_2))
 
-        embeds = torch.cat([p_h1, p_h2], dim=2)  # [1, 77, 2048]
+        embeds = torch.cat([p_h1, p_h2], dim=2)  # [1, 77*N, 2048]
         region_embeds.append(embeds)
 
         if i == 0:
@@ -488,8 +524,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         raise RuntimeError("regional_shared_neg_tokenize is required for regional text encoding.")
     n_h1 = _run_text_encoder_1(te1, shared_neg_tok.neg_tokens_1, shared_neg_tok.neg_mask_1, device)
     n_h2, n_pooled = _run_text_encoder_2(te2, shared_neg_tok.neg_tokens_2, shared_neg_tok.neg_mask_2, device)
-    _apply_token_weights(n_h1, shared_neg_tok.neg_weights_1)
-    _apply_token_weights(n_h2, shared_neg_tok.neg_weights_2)
+    _apply_token_weights(n_h1, _flatten_chunks(shared_neg_tok.neg_weights_1))
+    _apply_token_weights(n_h2, _flatten_chunks(shared_neg_tok.neg_weights_2))
     neg_embeds = torch.cat([n_h1, n_h2], dim=2)
 
     # Encode per-region negatives if they differ across regions
@@ -499,8 +535,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         for tok in region_toks:
             nr_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
             nr_h2, _ = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
-            _apply_token_weights(nr_h1, tok.neg_weights_1)
-            _apply_token_weights(nr_h2, tok.neg_weights_2)
+            _apply_token_weights(nr_h1, _flatten_chunks(tok.neg_weights_1))
+            _apply_token_weights(nr_h2, _flatten_chunks(tok.neg_weights_2))
             neg_region_embeds.append(torch.cat([nr_h1, nr_h2], dim=2))
         log.debug(f"  SDXL: Encoded {len(neg_region_embeds)} per-region negatives")
 
@@ -511,8 +547,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         bt = job.regional_base_tokenize
         b_h1 = _run_text_encoder_1(te1, bt.prompt_tokens_1, bt.prompt_mask_1, device)
         b_h2, b_pooled = _run_text_encoder_2(te2, bt.prompt_tokens_2, bt.prompt_mask_2, device)
-        _apply_token_weights(b_h1, bt.prompt_weights_1)
-        _apply_token_weights(b_h2, bt.prompt_weights_2)
+        _apply_token_weights(b_h1, _flatten_chunks(bt.prompt_weights_1))
+        _apply_token_weights(b_h2, _flatten_chunks(bt.prompt_weights_2))
         base_embeds = torch.cat([b_h1, b_h2], dim=2)
         base_pooled = b_pooled
 
@@ -805,8 +841,8 @@ def _unet_tiled_regional(
     tile_w: int, tile_h: int, tile_overlap: int,
     state,  # RegionalAttnState
     full_masks: torch.Tensor,  # [N, 1, latent_h, latent_w]
-    pos_stacked: torch.Tensor,  # [N, 77, dim] — positive region embeds
-    neg_stacked: torch.Tensor | None = None,  # [N, 77, dim] — per-region neg embeds, or None
+    pos_stacked: torch.Tensor,  # [N, 77*C, dim] — positive region embeds
+    neg_stacked: torch.Tensor | None = None,  # [N, 77*C, dim] — per-region neg embeds, or None
 ) -> torch.Tensor:
     """MultiDiffusion with regional prompting: tile the UNet and blend noise predictions.
 
@@ -972,13 +1008,13 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         regional.regions, latent_h, latent_w, device, torch.float16,
     )
 
-    # Stack region embeddings: [N, 77, 2048]
-    all_embeds = torch.cat(rer.region_embeds, dim=0)  # each is [1, 77, 2048] → [N, 77, 2048]
+    # Stack region embeddings: [N, 77*C, 2048]
+    all_embeds = torch.cat(rer.region_embeds, dim=0)  # each is [1, 77*C, 2048] → [N, 77*C, 2048]
 
     # Build per-region negative stack if negatives differ across regions
     neg_stacked: torch.Tensor | None = None
     if rer.neg_region_embeds is not None:
-        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0)  # [N, 77, 2048]
+        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0)  # [N, 77*C, 2048]
 
     # If ADDBASE: prepend base_embeds and full-coverage mask, then renormalize
     if rer.base_embeds is not None:
@@ -1306,7 +1342,13 @@ def _parse_prompt_attention(text: str) -> list[tuple[str, float]]:
         elif token == "]" and square_brackets:
             _multiply_range(result, square_brackets.pop(), SQUARE_MUL)
         else:
-            result.append((token, 1.0))
+            # Split on BREAK keyword (word-boundary) to emit chunk-boundary sentinels
+            parts = _RE_BREAK.split(token)
+            for j, part in enumerate(parts):
+                if part:
+                    result.append((part, 1.0))
+                if j < len(parts) - 1:
+                    result.append(("BREAK", -1.0))  # sentinel
 
     # Handle unbalanced brackets
     while round_brackets:
@@ -1317,10 +1359,11 @@ def _parse_prompt_attention(text: str) -> list[tuple[str, float]]:
     if not result:
         result.append(("", 1.0))
 
-    # Merge consecutive items with same weight
+    # Merge consecutive items with same weight (skip BREAK sentinels)
     i = 0
     while i < len(result) - 1:
-        if abs(result[i][1] - result[i + 1][1]) < 1e-6:
+        if (result[i][0] != "BREAK" and result[i + 1][0] != "BREAK"
+                and abs(result[i][1] - result[i + 1][1]) < 1e-6):
             result[i] = (result[i][0] + result[i + 1][0], result[i][1])
             result.pop(i + 1)
         else:
@@ -1331,58 +1374,106 @@ def _parse_prompt_attention(text: str) -> list[tuple[str, float]]:
 
 def _multiply_range(lst: list[tuple[str, float]], start_idx: int, multiplier: float) -> None:
     for i in range(start_idx, len(lst)):
+        if lst[i][0] == "BREAK":
+            continue  # don't mutate BREAK sentinels
         lst[i] = (lst[i][0], lst[i][1] * multiplier)
 
 
 def _tokenize_weighted(
     tokenizer: CLIPTokenizer, text: str, pad_token_id: int = 49407
-) -> tuple[list[int], list[float], list[int]]:
-    """Tokenize with emphasis weights. Returns (token_ids, weights, attention_mask)."""
-    chunks = _parse_prompt_attention(text)
-    limit = 77  # CLIP sequence length
+) -> tuple[list[list[int]], list[list[float]], list[list[int]]]:
+    """Tokenize with emphasis weights + multi-chunk support.
+    Returns (chunks_of_token_ids, chunks_of_weights, chunks_of_masks).
+    Each chunk is a 77-element list: [BOS] + 75 content + [EOS]."""
+    BOS = 49406
+    EOS = 49407
+    CHUNK_SIZE = 77
+    CONTENT_SLOTS = 75
 
-    # Tokenize each chunk, strip BOS/EOS
+    fragments = _parse_prompt_attention(text)
+
+    # Tokenize all fragments into a flat (token_id, weight) list
     all_tokens: list[tuple[int, float]] = []
-    for chunk_text, weight in chunks:
-        if not chunk_text.strip():
+    for frag_text, weight in fragments:
+        if frag_text == "BREAK":
+            all_tokens.append((-1, -1.0))  # BREAK sentinel
             continue
-        encoded = tokenizer(chunk_text, add_special_tokens=True, return_tensors=None)
-        input_ids = encoded["input_ids"]
-        # Strip BOS (first) and EOS (last)
-        for tid in input_ids[1:-1]:
+        if not frag_text.strip():
+            continue
+        encoded = tokenizer(frag_text, add_special_tokens=False, return_tensors=None)
+        for tid in encoded["input_ids"]:
             all_tokens.append((tid, weight))
 
-    # Build 77-token sequence: BOS + up to 75 content + EOS + padding
-    content_slots = limit - 2  # 75
-    tokens = [0] * limit
-    weights = [1.0] * limit
-    mask = [0] * limit
+    # Split into 75-token content chunks
+    chunks_ids: list[list[int]] = []
+    chunks_weights: list[list[float]] = []
+    chunks_masks: list[list[int]] = []
 
-    # BOS
-    tokens[0] = 49406
-    weights[0] = 1.0
-    mask[0] = 1
+    current_ids: list[int] = []
+    current_weights: list[float] = []
 
-    # Content tokens (truncate if needed)
-    count = min(len(all_tokens), content_slots)
-    for i in range(count):
-        tokens[i + 1] = all_tokens[i][0]
-        weights[i + 1] = all_tokens[i][1]
-        mask[i + 1] = 1
+    def _finalize_chunk() -> None:
+        """Pad current content to 75 tokens, wrap with BOS/EOS -> 77-token chunk."""
+        ids = [BOS] + current_ids[:CONTENT_SLOTS]
+        wts = [1.0] + current_weights[:CONTENT_SLOTS]
+        msk = [1] * (1 + len(current_ids[:CONTENT_SLOTS]))
+        # EOS
+        ids.append(EOS)
+        wts.append(1.0)
+        msk.append(1)
+        # Pad to 77
+        while len(ids) < CHUNK_SIZE:
+            ids.append(pad_token_id)
+            wts.append(1.0)
+            msk.append(0)
+        chunks_ids.append(ids)
+        chunks_weights.append(wts)
+        chunks_masks.append(msk)
 
-    # EOS
-    tokens[count + 1] = 49407
-    weights[count + 1] = 1.0
-    mask[count + 1] = 1
+    for tid, weight in all_tokens:
+        if tid == -1 and weight == -1.0:
+            # BREAK: finalize current chunk (even if partially filled)
+            _finalize_chunk()
+            current_ids = []
+            current_weights = []
+            continue
+        current_ids.append(tid)
+        current_weights.append(weight)
+        if len(current_ids) >= CONTENT_SLOTS:
+            _finalize_chunk()
+            current_ids = []
+            current_weights = []
 
-    # Pad remaining with specified pad token
-    for i in range(count + 2, limit):
-        tokens[i] = pad_token_id
-        weights[i] = 1.0
+    # Finalize remaining tokens, or ensure at least one chunk for empty prompts
+    if current_ids or not chunks_ids:
+        _finalize_chunk()
 
-    log.debug(f"    Tokenized: {count} content tokens, pad={pad_token_id}, total={limit}")
+    # Each chunk's mask has 1s for BOS + content + EOS; subtract 2 per chunk for BOS/EOS
+    content_count = sum(sum(mask) - 2 for mask in chunks_masks)
+    log.debug(f"    Tokenized: {content_count} content tokens across {len(chunks_ids)} chunk(s), "
+              f"pad={pad_token_id}")
 
-    return tokens, weights, mask
+    return chunks_ids, chunks_weights, chunks_masks
+
+
+def _pad_to_chunk_count(
+    chunks_ids: list[list[int]], chunks_weights: list[list[float]],
+    chunks_masks: list[list[int]], target_count: int, pad_token_id: int,
+) -> None:
+    """Pad chunk lists in-place to reach target_count with empty chunks."""
+    BOS, EOS, CHUNK_SIZE = 49406, 49407, 77
+    while len(chunks_ids) < target_count:
+        ids = [BOS, EOS] + [pad_token_id] * (CHUNK_SIZE - 2)
+        wts = [1.0] * CHUNK_SIZE
+        msk = [1, 1] + [0] * (CHUNK_SIZE - 2)
+        chunks_ids.append(ids)
+        chunks_weights.append(wts)
+        chunks_masks.append(msk)
+
+
+def _flatten_chunks(chunks: list[list[float]]) -> list[float]:
+    """Flatten list of chunk weights into a single flat list."""
+    return [w for chunk in chunks for w in chunk]
 
 
 # ====================================================================
@@ -1390,36 +1481,40 @@ def _tokenize_weighted(
 # ====================================================================
 
 def _run_text_encoder_1(
-    model: CLIPTextModel, token_ids: list[int], mask: list[int], device: torch.device
+    model: CLIPTextModel, chunks_ids: list[list[int]], chunks_masks: list[list[int]],
+    device: torch.device
 ) -> torch.Tensor:
-    """Run CLIP-L text encoder. Returns hidden states [1, 77, 768]."""
-    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
-
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                        output_hidden_states=True)
-        # Use penultimate hidden state (SDXL standard)
-        hidden = outputs.hidden_states[-2]
-
-    return hidden
+    """Run CLIP-L text encoder over multiple chunks.
+    Returns hidden states [1, 77*N, 768]."""
+    all_hidden = []
+    for ids, mask in zip(chunks_ids, chunks_masks):
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+        attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                            output_hidden_states=True)
+            all_hidden.append(outputs.hidden_states[-2])
+    return torch.cat(all_hidden, dim=1)  # [1, 77*N, 768]
 
 
 def _run_text_encoder_2(
-    model: CLIPTextModelWithProjection, token_ids: list[int], mask: list[int],
-    device: torch.device
+    model: CLIPTextModelWithProjection, chunks_ids: list[list[int]],
+    chunks_masks: list[list[int]], device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run CLIP-bigG text encoder. Returns (hidden_states [1,77,1280], pooled [1,1280])."""
-    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
-
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                        output_hidden_states=True)
-        hidden = outputs.hidden_states[-2]
-        pooled = outputs.text_embeds
-
-    return hidden, pooled
+    """Run CLIP-bigG text encoder over multiple chunks.
+    Returns (hidden_states [1,77*N,1280], pooled [1,1280] from first chunk)."""
+    all_hidden = []
+    pooled = None
+    for i, (ids, mask) in enumerate(zip(chunks_ids, chunks_masks)):
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+        attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                            output_hidden_states=True)
+            all_hidden.append(outputs.hidden_states[-2])
+            if i == 0:
+                pooled = outputs.text_embeds
+    return torch.cat(all_hidden, dim=1), pooled  # [1, 77*N, 1280], [1, 1280]
 
 
 def _apply_token_weights(hidden_states: torch.Tensor, weights: list[float]) -> None:

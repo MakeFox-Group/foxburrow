@@ -543,7 +543,7 @@ class GpuWorker:
                     protect = self._gpu.get_active_fingerprints()
                     self._gpu.ensure_free_vram(min_free, protect)
             load_duration = _time.monotonic() - load_start
-            job.gpu_time_s += load_duration
+            job.model_load_time_s += load_duration
 
             # Execute stage
             try:

@@ -99,36 +99,36 @@ class SdxlHiresInput:
 
 @dataclass
 class SdxlTokenizeResult:
-    prompt_tokens_1: list[int] = field(default_factory=list)
-    prompt_weights_1: list[float] = field(default_factory=list)
-    neg_tokens_1: list[int] = field(default_factory=list)
-    neg_weights_1: list[float] = field(default_factory=list)
-    prompt_tokens_2: list[int] = field(default_factory=list)
-    prompt_weights_2: list[float] = field(default_factory=list)
-    neg_tokens_2: list[int] = field(default_factory=list)
-    neg_weights_2: list[float] = field(default_factory=list)
-    prompt_mask_1: list[int] = field(default_factory=list)
-    neg_mask_1: list[int] = field(default_factory=list)
-    prompt_mask_2: list[int] = field(default_factory=list)
-    neg_mask_2: list[int] = field(default_factory=list)
+    prompt_tokens_1: list[list[int]] = field(default_factory=list)
+    prompt_weights_1: list[list[float]] = field(default_factory=list)
+    neg_tokens_1: list[list[int]] = field(default_factory=list)
+    neg_weights_1: list[list[float]] = field(default_factory=list)
+    prompt_tokens_2: list[list[int]] = field(default_factory=list)
+    prompt_weights_2: list[list[float]] = field(default_factory=list)
+    neg_tokens_2: list[list[int]] = field(default_factory=list)
+    neg_weights_2: list[list[float]] = field(default_factory=list)
+    prompt_mask_1: list[list[int]] = field(default_factory=list)
+    neg_mask_1: list[list[int]] = field(default_factory=list)
+    prompt_mask_2: list[list[int]] = field(default_factory=list)
+    neg_mask_2: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
 class SdxlEncodeResult:
-    prompt_embeds: torch.Tensor | None = None       # [1, 77, 2048]
-    neg_prompt_embeds: torch.Tensor | None = None    # [1, 77, 2048]
+    prompt_embeds: torch.Tensor | None = None       # [1, 77*N, 2048]
+    neg_prompt_embeds: torch.Tensor | None = None    # [1, 77*N, 2048]
     pooled_prompt_embeds: torch.Tensor | None = None # [1, 1280]
     neg_pooled_prompt_embeds: torch.Tensor | None = None  # [1, 1280]
 
 
 @dataclass
 class SdxlRegionalEncodeResult:
-    region_embeds: list[torch.Tensor] = field(default_factory=list)  # N × [1, 77, 2048]
-    neg_prompt_embeds: torch.Tensor | None = None    # [1, 77, 2048] shared
-    neg_region_embeds: list[torch.Tensor] | None = None  # N × [1, 77, 2048] per-region neg, or None if shared
+    region_embeds: list[torch.Tensor] = field(default_factory=list)  # N × [1, 77*C, 2048]
+    neg_prompt_embeds: torch.Tensor | None = None    # [1, 77*C, 2048] shared
+    neg_region_embeds: list[torch.Tensor] | None = None  # N × [1, 77*C, 2048] per-region neg, or None if shared
     pooled_prompt_embeds: torch.Tensor | None = None  # [1, 1280] from base or first region
     neg_pooled_prompt_embeds: torch.Tensor | None = None  # [1, 1280]
-    base_embeds: torch.Tensor | None = None          # [1, 77, 2048] if ADDBASE
+    base_embeds: torch.Tensor | None = None          # [1, 77*C, 2048] if ADDBASE
     base_ratio: float = 0.2
 
 
@@ -184,7 +184,8 @@ class InferenceJob:
         self.active_gpus: list[dict] = []  # [{"uuid": "GPU-...", "name": "RTX 4090", "stage": "GpuDenoise"}]
 
         # Actual GPU time tracking — accumulated per-stage
-        self.gpu_time_s: float = 0.0  # total seconds of actual GPU execution
+        self.gpu_time_s: float = 0.0  # stage execution time only (excludes model loading)
+        self.model_load_time_s: float = 0.0  # model loading time only
         self.gpu_stage_times: list[dict] = []  # [{"gpu": "GPU-...", "stage": "GpuDenoise", "model": "xavier_v10", "duration_s": 2.3}]
 
         # Intermediate state

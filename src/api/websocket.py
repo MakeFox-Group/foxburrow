@@ -111,6 +111,10 @@ class ProgressStreamer:
             "success": success,
             "error": error,
             "gpu_time_s": round(job.gpu_time_s, 3),
+            "model_load_time_s": round(job.model_load_time_s, 3),
+            "created_at": job.created_at.isoformat() + "Z",
+            "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
             "gpu_stages": job.gpu_stage_times,
         })
 

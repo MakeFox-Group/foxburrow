@@ -108,6 +108,32 @@ class GpuScheduler:
             for job in jobs:
                 self._cpu_pool.submit(self._execute_cpu_stage, job)
 
+        # Fail jobs that have OOM'd on every healthy GPU — they can never
+        # be dispatched and would otherwise block the entire work group.
+        # Exclude failed GPUs: a job shouldn't survive just because a dead
+        # GPU inflates the set (it can never run on a failed GPU anyway).
+        all_gpu_uuids = {w.gpu.uuid for w in self._workers if not w.gpu.is_failed}
+        if not all_gpu_uuids:
+            return  # no healthy GPUs — nothing to dispatch
+        for group in list(gpu_groups):
+            failed = []
+            for job in group.jobs:
+                if job.oom_gpu_ids >= all_gpu_uuids:
+                    failed.append(job)
+            if failed:
+                for job in failed:
+                    group.jobs.remove(job)
+                    log.error(f"  GpuScheduler: Job[{job.job_id}] OOM on all "
+                              f"{len(all_gpu_uuids)} GPUs — failing")
+                    from datetime import datetime
+                    job.completed_at = datetime.utcnow()
+                    job.set_result(JobResult(
+                        success=False,
+                        error="Out of memory on all available GPUs"))
+                self._queue.remove(failed)
+            if not group.jobs:
+                gpu_groups.remove(group)
+
         # Dispatch GPU stages using scoring — one job at a time
         dispatched = True
         while dispatched and gpu_groups:
@@ -129,7 +155,21 @@ class GpuScheduler:
             if best_worker is None or best_group is None or best_score == -2**31:
                 break
 
-            job = best_group.jobs.pop(0)
+            # Pick the first job not OOM'd on the chosen GPU (skip blocked ones)
+            job = None
+            for j in best_group.jobs:
+                if best_worker.gpu.uuid not in j.oom_gpu_ids:
+                    job = j
+                    break
+            if job is None:
+                # Defensive: scoring should prevent this. If reached, it
+                # means _score_worker failed to reject a fully-blocked group.
+                log.warning(f"  GpuScheduler: All jobs in {best_group} OOM'd on "
+                            f"{best_worker.gpu.uuid} — scoring check missed this")
+                gpu_groups.remove(best_group)
+                dispatched = True
+                continue
+            best_group.jobs.remove(job)
             self._queue.remove([job])
 
             log.debug(f"  GpuScheduler: Dispatching 1 job [{best_group.stage}] "
@@ -154,8 +194,15 @@ class GpuScheduler:
 
         # VRAM budget gate: reject if this GPU can't fit the new stage's
         # model loading cost + working memory alongside active jobs.
-        if group.jobs and not worker.check_vram_budget(stage, group.jobs[0]):
-            return -2**31
+        # Use the first non-OOM'd job for budget estimation (the one that
+        # will actually be dispatched), not jobs[0] which may be blocked.
+        if group.jobs:
+            budget_job = next(
+                (j for j in group.jobs if worker.gpu.uuid not in j.oom_gpu_ids),
+                group.jobs[0],  # fallback: all blocked, OOM check below rejects
+            )
+            if not worker.check_vram_budget(stage, budget_job):
+                return -2**31
 
         score = 0
         is_idle = worker.is_idle
@@ -227,12 +274,11 @@ class GpuScheduler:
             starvation = 50000
         score += starvation
 
-        # OOM avoidance: hard-reject GPUs where this job already OOM'd.
-        # Must be a hard reject (not just a penalty) because the starvation
-        # hard override at 120s (+50000) would overwhelm any penalty.
+        # OOM avoidance: hard-reject only if EVERY job in the group already
+        # OOM'd on this GPU.  Previously checked only jobs[0], which caused
+        # head-of-line blocking when one job OOM'd on all GPUs.
         if group.jobs:
-            job = group.jobs[0]
-            if worker.gpu.uuid in job.oom_gpu_ids:
+            if all(worker.gpu.uuid in j.oom_gpu_ids for j in group.jobs):
                 return -2**31
 
         return score
