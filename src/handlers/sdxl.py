@@ -179,15 +179,29 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         _proc_types = set(type(p).__name__ for p in _attn_procs.values())
         log.debug(f"  SDXL: UNet attention processors: {_proc_types}")
 
-        # Capture scheduler config before deleting pipeline — this contains
-        # the prediction_type (epsilon vs v_prediction) inferred from the
-        # checkpoint by diffusers.  Needed to create the right scheduler
-        # at denoise time.
+        # Detect prediction type: safetensors header is the authoritative source
+        # (checks v_pred marker tensor, ModelSpec metadata, kohya metadata,
+        # companion YAML).  Diffusers' from_single_file() often misdetects
+        # v-prediction checkpoints as epsilon.
+        from utils.checkpoint import detect_prediction_type
         sched_config = dict(pipe.scheduler.config)
+        diffusers_pred = sched_config.get("prediction_type", "epsilon")
+        safetensors_pred = detect_prediction_type(checkpoint_path)
+
+        if safetensors_pred is not None:
+            pred_type = safetensors_pred
+            source = "safetensors header"
+            if safetensors_pred != diffusers_pred:
+                log.info(f"  SDXL: Overriding diffusers prediction_type={diffusers_pred} "
+                         f"→ {safetensors_pred} (from safetensors header)")
+        else:
+            pred_type = diffusers_pred
+            source = "diffusers"
+
+        sched_config["prediction_type"] = pred_type
         components["_scheduler_config"] = sched_config
-        pred_type = sched_config.get("prediction_type", "epsilon")
         log.info(f"  SDXL: Scheduler prediction_type={pred_type} "
-                 f"(from {os.path.basename(checkpoint_path)})")
+                 f"(from {source}: {os.path.basename(checkpoint_path)})")
 
         # Persist prediction_type to .fpcache so it survives process restarts
         from utils import fingerprint as fp_util
@@ -696,17 +710,25 @@ def _get_prediction_type(model_dir: str) -> str:
 
     Checks (in order):
     1. Checkpoint extraction cache (_scheduler_config captured from pipe)
-    2. Diffusers-format scheduler_config.json
-    3. .fpcache metadata (persisted from previous extractions)
-    4. Default: "epsilon"
+    2. Safetensors header (v_pred marker tensor, ModelSpec metadata)
+    3. Diffusers-format scheduler_config.json
+    4. .fpcache metadata (persisted from previous extractions)
+    5. Default: "epsilon"
     """
-    # 1. Extraction cache (single-file checkpoints)
+    # 1. Extraction cache (single-file checkpoints — already corrected by safetensors check)
     if model_dir in _checkpoint_cache:
         sched = _checkpoint_cache[model_dir].get("_scheduler_config")
         if sched:
             return sched.get("prediction_type", "epsilon")
 
-    # 2. Diffusers-format directory
+    # 2. Safetensors header (most reliable for single-file checkpoints)
+    if _is_single_file(model_dir):
+        from utils.checkpoint import detect_prediction_type
+        safetensors_pred = detect_prediction_type(model_dir)
+        if safetensors_pred is not None:
+            return safetensors_pred
+
+    # 3. Diffusers-format directory
     import json
     sched_file = os.path.join(model_dir, "scheduler", "scheduler_config.json")
     if os.path.isfile(sched_file):
@@ -717,7 +739,7 @@ def _get_prediction_type(model_dir: str) -> str:
         except (OSError, json.JSONDecodeError):
             pass
 
-    # 3. .fpcache metadata (persisted from previous extraction)
+    # 4. .fpcache metadata (persisted from previous extraction)
     from utils import fingerprint as fp_util
     cached = fp_util.get_extra(model_dir, "prediction_type")
     if cached:
