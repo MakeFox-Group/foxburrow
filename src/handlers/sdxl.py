@@ -161,10 +161,13 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         # kernels are optimized for NHWC and avoid implicit format transposes.
         components["sdxl_unet"].to(memory_format=torch.channels_last)
 
-        # Log the attention processor type for diagnostics
-        _attn_procs = components["sdxl_unet"].attn_processors
-        _proc_types = set(type(p).__name__ for p in _attn_procs.values())
-        log.debug(f"  SDXL: UNet attention processors: {_proc_types}")
+        # Force math attention (AttnProcessor) instead of SDPA.  SDPA dispatches
+        # to Triton flash-attention kernels that JIT-compile per unique shape,
+        # causing multi-second GIL holds and 30x step-time variance on multi-GPU.
+        # TRT handles the fast path; PyTorch fallback prioritizes consistency.
+        from diffusers.models.attention_processor import AttnProcessor
+        components["sdxl_unet"].set_attn_processor(AttnProcessor())
+        log.debug(f"  SDXL: UNet attention processors: AttnProcessor (non-SDPA)")
 
         # Detect prediction type: safetensors header is the authoritative source
         # (checks v_pred marker tensor, ModelSpec metadata, kohya metadata,
@@ -272,7 +275,10 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "UNet")
         model.to(device, memory_format=torch.channels_last)
         model.eval()
-        log.debug(f"  SDXL: Loaded UNet (SDPA) to {device}")
+        # Force math attention — see comment in _ensure_checkpoint_extracted()
+        from diffusers.models.attention_processor import AttnProcessor
+        model.set_attn_processor(AttnProcessor())
+        log.debug(f"  SDXL: Loaded UNet (non-SDPA) to {device}")
         return model
 
     elif category in ("sdxl_vae", "sdxl_vae_enc"):
@@ -843,26 +849,9 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         unet = _get_cached_model(gpu, "sdxl_unet", job)
 
         # Apply LoRA adapters if requested
-        _saved_attn_procs = None  # saved for restoration after LoRA denoise
         if inp.loras:
             from state import app_state
             _ensure_loras(unet, inp.loras, gpu, app_state.lora_index)
-
-            # Use non-SDPA attention for LoRA to avoid Triton JIT variance.
-            # AttnProcessor uses manual scaled dot-product math — no Triton
-            # kernels, predictable timing. Acceptable for the minority of LoRA
-            # requests. Per-model, not global — safe for multi-GPU.
-            # Save original processors to restore after denoise loop.
-            from diffusers.models.attention_processor import AttnProcessor
-            current_procs = unet.attn_processors
-            needs_swap = any(
-                type(p).__name__ != "AttnProcessor"
-                for p in current_procs.values()
-            )
-            if needs_swap:
-                _saved_attn_procs = dict(current_procs)
-                unet.set_attn_processor(AttnProcessor())
-                log.debug(f"  SDXL: Switched to AttnProcessor (non-SDPA) for LoRA")
         elif hasattr(unet, 'peft_config') and unet.peft_config:
             unet.disable_adapters()  # clean UNet for non-LoRA jobs
 
@@ -1016,13 +1005,6 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     log.debug(f"  SDXL: Denoise loop took {_loop_elapsed:.3f}s "
               f"({active_step_count} steps, {_per_step:.3f}s/step, "
               f"first={_first_step_time:.3f}s)")
-
-    # Restore original attention processors if swapped for LoRA.
-    # This prevents a persistent ~10-30% throughput regression on all
-    # subsequent non-LoRA jobs that reuse this cached UNet.
-    if _saved_attn_procs is not None and unet is not None:
-        unet.set_attn_processor(_saved_attn_procs)
-        log.debug(f"  SDXL: Restored original attention processors after LoRA denoise")
 
     # Diagnostic: check latent health after denoising
     lat_min = latents.min().item()
