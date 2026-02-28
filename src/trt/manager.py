@@ -327,6 +327,15 @@ class TrtBuildManager:
         if not os.path.isfile(unet_onnx):
             try:
                 unet = load_component("sdxl_unet", model_dir, torch.device("cpu"))
+                # Validate this is actually an SDXL UNet (cross_attention_dim=2048).
+                # SD 1.5 models (768) can be mis-classified as SDXL and will fail
+                # with a shape mismatch during tracing.
+                ca_dim = getattr(getattr(unet, "config", None), "cross_attention_dim", None)
+                if ca_dim is not None and ca_dim != 2048:
+                    log.warning(f"  TRT: Skipping {short_hash} — UNet cross_attention_dim "
+                                f"is {ca_dim}, expected 2048 (not SDXL?)")
+                    del unet
+                    return
                 export_unet_onnx(unet, unet_onnx)
                 del unet
             except Exception as ex:
