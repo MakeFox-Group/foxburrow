@@ -54,6 +54,7 @@ class TrtBuildManager:
         cache_dir: str,
         workers: list[GpuWorker],
         export_threads: int = 0,
+        one_at_a_time: bool = False,
     ):
         self._cache_dir = os.path.abspath(cache_dir)
         self._workers = workers
@@ -61,6 +62,7 @@ class TrtBuildManager:
         self._build_queue: asyncio.Queue[_BuildRequest] = asyncio.Queue()
         self._ready_models: set[str] = set()  # model_hashes with all engines built
         self._lock = threading.Lock()
+        self._one_at_a_time = one_at_a_time
 
         # Thread pool for parallel ONNX export (CPU-bound).
         # 0 = auto: use fingerprint threads config (resolved by caller).
@@ -75,8 +77,9 @@ class TrtBuildManager:
     def start(self) -> None:
         """Start the background build loop as an asyncio task."""
         self._task = asyncio.get_running_loop().create_task(self._run_loop())
+        mode = "one-at-a-time" if self._one_at_a_time else "batched"
         log.info(f"  TRT: Build manager started (cache: {self._cache_dir}, "
-                 f"export_threads: {self._export_threads})")
+                 f"export_threads: {self._export_threads}, mode: {mode})")
 
     async def _run_loop(self) -> None:
         """Main build loop — batches requests, exports in parallel, builds on GPU."""
@@ -86,15 +89,20 @@ class TrtBuildManager:
                 first = await self._build_queue.get()
                 batch = [first]
 
-                # Drain any additional queued requests into the batch.
-                # Short sleep lets scan_and_queue() finish queueing all models
-                # before we start processing (avoids partial first batch).
-                await asyncio.sleep(0.1)
-                while not self._build_queue.empty():
-                    try:
-                        batch.append(self._build_queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                if self._one_at_a_time:
+                    # Test mode: process one model at a time (export + build)
+                    # so we can verify the pipeline quickly.
+                    pass
+                else:
+                    # Normal mode: drain queue into batch.
+                    # Short sleep lets scan_and_queue() finish queueing all models
+                    # before we start processing (avoids partial first batch).
+                    await asyncio.sleep(0.1)
+                    while not self._build_queue.empty():
+                        try:
+                            batch.append(self._build_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
 
                 try:
                     await self._process_batch(batch)
