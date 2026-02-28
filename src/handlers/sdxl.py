@@ -442,13 +442,18 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         _text_encode_regional(job, gpu)
         return
 
-    log.debug("  SDXL: Running text encoders...")
+    import time as _time
+
+    n_chunks = len(tok.prompt_tokens_1)
+    log.debug(f"  SDXL: Running text encoders ({n_chunks} chunk(s))...")
 
     # Get models from GPU cache
     te1 = _get_cached_model(gpu, "sdxl_te1", job)
     te2 = _get_cached_model(gpu, "sdxl_te2", job)
 
     device = gpu.device
+
+    _te_start = _time.monotonic()
 
     # TextEncoder1: hidden states [1, 77*N, 768]
     p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
@@ -457,6 +462,10 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     # TextEncoder2: hidden states [1, 77*N, 1280] + pooled [1, 1280]
     p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
     n_h2, n_pooled = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
+
+    _te_elapsed = _time.monotonic() - _te_start
+    log.debug(f"  SDXL: Encoder forward passes took {_te_elapsed:.3f}s "
+              f"({n_chunks} chunks, 4 passes)")
 
     # Apply emphasis weights to hidden states (not pooled) — flatten chunk weights
     _apply_token_weights(p_h1, _flatten_chunks(tok.prompt_weights_1))
@@ -659,6 +668,8 @@ def _broadcast_ws_progress(job: InferenceJob) -> None:
 
 def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     """Stage 3: GPU denoising with UNet + EulerAncestral scheduler."""
+    import time as _time
+
     inp = job.sdxl_input
     if inp is None:
         raise RuntimeError("SdxlInput is required for denoising.")
@@ -690,6 +701,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     # Different seed for hires to avoid correlated noise
     scheduler_seed = (inp.seed ^ 0x9E3779B9) if is_hires else inp.seed
 
+    _setup_start = _time.monotonic()
     unet = _get_cached_model(gpu, "sdxl_unet", job)
     device = gpu.device
 
@@ -699,6 +711,9 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _ensure_loras(unet, inp.loras, gpu, app_state.lora_index)
     elif hasattr(unet, 'peft_config') and unet.peft_config:
         unet.disable_adapters()  # clean UNet for non-LoRA jobs
+
+    _setup_elapsed = _time.monotonic() - _setup_start
+    log.debug(f"  SDXL: Denoise setup (model+LoRA) took {_setup_elapsed:.3f}s")
 
     # Create scheduler
     scheduler = EulerAncestralDiscreteScheduler(
@@ -765,10 +780,10 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     job.denoise_step = 0
     job.denoise_total_steps = active_step_count
 
-    prompt_embeds = enc.prompt_embeds
-    neg_prompt_embeds = enc.neg_prompt_embeds
-    pooled_prompt_embeds = enc.pooled_prompt_embeds
-    neg_pooled_prompt_embeds = enc.neg_pooled_prompt_embeds
+    prompt_embeds = enc.prompt_embeds.to(dtype=torch.float16)
+    neg_prompt_embeds = enc.neg_prompt_embeds.to(dtype=torch.float16)
+    pooled_prompt_embeds = enc.pooled_prompt_embeds.to(dtype=torch.float16)
+    neg_pooled_prompt_embeds = enc.neg_pooled_prompt_embeds.to(dtype=torch.float16)
 
     # MultiDiffusion: tile the UNet when latent exceeds threshold
     # unet_tile_width/height from job (pixels) → latent units; 0 = auto (≤ UNET_TILE_MAX)
@@ -787,6 +802,9 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                  f"{_tiles_x}x{_tiles_y} tiles "
                  f"({unet_tile_w*8}x{unet_tile_h*8}px, "
                  f"{UNET_TILE_OVERLAP*8}px overlap)")
+
+    _loop_start = _time.monotonic()
+    _first_step_time = None
 
     for i in range(start_step, len(timesteps)):
         job.denoise_step = i - start_step + 1
@@ -819,6 +837,15 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
         latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
+
+        if _first_step_time is None:
+            _first_step_time = _time.monotonic() - _loop_start
+
+    _loop_elapsed = _time.monotonic() - _loop_start
+    _per_step = _loop_elapsed / max(active_step_count, 1)
+    log.debug(f"  SDXL: Denoise loop took {_loop_elapsed:.3f}s "
+              f"({active_step_count} steps, {_per_step:.3f}s/step, "
+              f"first={_first_step_time:.3f}s)")
 
     # Diagnostic: check latent health after denoising
     lat_min = latents.min().item()
@@ -1009,12 +1036,12 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     )
 
     # Stack region embeddings: [N, 77*C, 2048]
-    all_embeds = torch.cat(rer.region_embeds, dim=0)  # each is [1, 77*C, 2048] → [N, 77*C, 2048]
+    all_embeds = torch.cat(rer.region_embeds, dim=0).to(dtype=torch.float16)
 
     # Build per-region negative stack if negatives differ across regions
     neg_stacked: torch.Tensor | None = None
     if rer.neg_region_embeds is not None:
-        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0)  # [N, 77*C, 2048]
+        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0).to(dtype=torch.float16)
 
     # If ADDBASE: prepend base_embeds and full-coverage mask, then renormalize
     if rer.base_embeds is not None:
@@ -1022,10 +1049,10 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         base_mask = torch.ones(1, 1, latent_h, latent_w, device=device, dtype=torch.float16) * base_ratio
         region_masks = region_masks * (1 - base_ratio)
         region_masks = torch.cat([base_mask, region_masks], dim=0)
-        all_embeds = torch.cat([rer.base_embeds, all_embeds], dim=0)
+        all_embeds = torch.cat([rer.base_embeds.to(dtype=torch.float16), all_embeds], dim=0)
         # For per-region negatives, prepend shared neg as the base region's negative
         if neg_stacked is not None:
-            neg_stacked = torch.cat([rer.neg_prompt_embeds, neg_stacked], dim=0)
+            neg_stacked = torch.cat([rer.neg_prompt_embeds.to(dtype=torch.float16), neg_stacked], dim=0)
         # Renormalize combined masks to sum to 1.0 at every spatial position
         mask_sum = region_masks.sum(dim=0, keepdim=True).clamp(min=1e-8)
         region_masks = region_masks / mask_sum
@@ -1035,9 +1062,9 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     state.set_regions(all_embeds, region_masks)
     original_procs = install_regional_processors(unet, state)
 
-    neg_prompt_embeds = rer.neg_prompt_embeds
-    pooled_prompt_embeds = rer.pooled_prompt_embeds
-    neg_pooled_prompt_embeds = rer.neg_pooled_prompt_embeds
+    neg_prompt_embeds = rer.neg_prompt_embeds.to(dtype=torch.float16)
+    pooled_prompt_embeds = rer.pooled_prompt_embeds.to(dtype=torch.float16)
+    neg_pooled_prompt_embeds = rer.neg_pooled_prompt_embeds.to(dtype=torch.float16)
 
     # Use first region's embeds as placeholder for encoder_hidden_states
     placeholder_embeds = all_embeds[0:1]
@@ -1484,37 +1511,31 @@ def _run_text_encoder_1(
     model: CLIPTextModel, chunks_ids: list[list[int]], chunks_masks: list[list[int]],
     device: torch.device
 ) -> torch.Tensor:
-    """Run CLIP-L text encoder over multiple chunks.
+    """Run CLIP-L text encoder over multiple chunks (batched).
     Returns hidden states [1, 77*N, 768]."""
-    all_hidden = []
-    for ids, mask in zip(chunks_ids, chunks_masks):
-        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-        attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                            output_hidden_states=True)
-            all_hidden.append(outputs.hidden_states[-2])
-    return torch.cat(all_hidden, dim=1)  # [1, 77*N, 768]
+    input_ids = torch.tensor(chunks_ids, dtype=torch.long, device=device)        # [N, 77]
+    attention_mask = torch.tensor(chunks_masks, dtype=torch.long, device=device)  # [N, 77]
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                        output_hidden_states=True)
+        hidden = outputs.hidden_states[-2]  # [N, 77, 768]
+    return hidden.reshape(1, -1, hidden.shape[-1])  # [1, 77*N, 768]
 
 
 def _run_text_encoder_2(
     model: CLIPTextModelWithProjection, chunks_ids: list[list[int]],
     chunks_masks: list[list[int]], device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run CLIP-bigG text encoder over multiple chunks.
+    """Run CLIP-bigG text encoder over multiple chunks (batched).
     Returns (hidden_states [1,77*N,1280], pooled [1,1280] from first chunk)."""
-    all_hidden = []
-    pooled = None
-    for i, (ids, mask) in enumerate(zip(chunks_ids, chunks_masks)):
-        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-        attention_mask = torch.tensor([mask], dtype=torch.long, device=device)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                            output_hidden_states=True)
-            all_hidden.append(outputs.hidden_states[-2])
-            if i == 0:
-                pooled = outputs.text_embeds
-    return torch.cat(all_hidden, dim=1), pooled  # [1, 77*N, 1280], [1, 1280]
+    input_ids = torch.tensor(chunks_ids, dtype=torch.long, device=device)        # [N, 77]
+    attention_mask = torch.tensor(chunks_masks, dtype=torch.long, device=device)  # [N, 77]
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                        output_hidden_states=True)
+        hidden = outputs.hidden_states[-2]  # [N, 77, 1280]
+        pooled = outputs.text_embeds[0:1]   # [1, 1280] from first chunk only
+    return hidden.reshape(1, -1, hidden.shape[-1]), pooled  # [1, 77*N, 1280], [1, 1280]
 
 
 def _apply_token_weights(hidden_states: torch.Tensor, weights: list[float]) -> None:
@@ -1775,7 +1796,9 @@ def _ensure_loras(unet, lora_specs: list, gpu: GpuInstance, lora_index: dict) ->
             log.warning(f"  LoRA not found in index: {spec.name}")
             continue
 
-        adapter_name = spec.name
+        # PEFT registers adapters as nn.Module children — Python module names
+        # can't contain periods.  Replace with underscores for PEFT compatibility.
+        adapter_name = spec.name.replace(".", "_")
 
         # Check if adapter already loaded on this UNet
         if hasattr(unet, 'peft_config') and adapter_name in unet.peft_config:
