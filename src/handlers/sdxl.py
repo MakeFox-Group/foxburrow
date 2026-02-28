@@ -179,6 +179,20 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         _proc_types = set(type(p).__name__ for p in _attn_procs.values())
         log.info(f"  SDXL: UNet attention processors: {_proc_types}")
 
+        # Capture scheduler config before deleting pipeline — this contains
+        # the prediction_type (epsilon vs v_prediction) inferred from the
+        # checkpoint by diffusers.  Needed to create the right scheduler
+        # at denoise time.
+        sched_config = dict(pipe.scheduler.config)
+        components["_scheduler_config"] = sched_config
+        pred_type = sched_config.get("prediction_type", "epsilon")
+        log.info(f"  SDXL: Scheduler prediction_type={pred_type} "
+                 f"(from {os.path.basename(checkpoint_path)})")
+
+        # Persist prediction_type to .fpcache so it survives process restarts
+        from utils import fingerprint as fp_util
+        fp_util.set_extra(checkpoint_path, prediction_type=pred_type)
+
         # Fix any meta tensors left by from_pretrained/accelerate, then
         # move neural-net components to CPU and set eval mode
         for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
@@ -677,6 +691,77 @@ def _broadcast_ws_progress(job: InferenceJob) -> None:
         pass
 
 
+def _get_prediction_type(model_dir: str) -> str:
+    """Detect prediction_type for an SDXL checkpoint (epsilon or v_prediction).
+
+    Checks (in order):
+    1. Checkpoint extraction cache (_scheduler_config captured from pipe)
+    2. Diffusers-format scheduler_config.json
+    3. .fpcache metadata (persisted from previous extractions)
+    4. Default: "epsilon"
+    """
+    # 1. Extraction cache (single-file checkpoints)
+    if model_dir in _checkpoint_cache:
+        sched = _checkpoint_cache[model_dir].get("_scheduler_config")
+        if sched:
+            return sched.get("prediction_type", "epsilon")
+
+    # 2. Diffusers-format directory
+    import json
+    sched_file = os.path.join(model_dir, "scheduler", "scheduler_config.json")
+    if os.path.isfile(sched_file):
+        try:
+            with open(sched_file) as f:
+                config = json.load(f)
+            return config.get("prediction_type", "epsilon")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 3. .fpcache metadata (persisted from previous extraction)
+    from utils import fingerprint as fp_util
+    cached = fp_util.get_extra(model_dir, "prediction_type")
+    if cached:
+        return cached
+
+    return "epsilon"
+
+
+def _create_scheduler(
+    model_dir: str, steps: int, device: torch.device,
+) -> EulerAncestralDiscreteScheduler:
+    """Create an EulerAncestralDiscreteScheduler with the correct prediction_type.
+
+    For v-prediction models:
+      - prediction_type="v_prediction"
+      - rescale_betas_zero_snr=True (zero terminal SNR)
+      - timestep_spacing="trailing" (matches training schedule)
+
+    For epsilon models (default):
+      - prediction_type="epsilon"
+      - timestep_spacing="linspace"
+    """
+    prediction_type = _get_prediction_type(model_dir)
+
+    kwargs = {
+        "beta_start": 0.00085,
+        "beta_end": 0.012,
+        "beta_schedule": "scaled_linear",
+        "num_train_timesteps": 1000,
+        "prediction_type": prediction_type,
+    }
+
+    if prediction_type == "v_prediction":
+        kwargs["rescale_betas_zero_snr"] = True
+        kwargs["timestep_spacing"] = "trailing"
+        log.debug(f"  SDXL: Using v-prediction scheduler (zero-SNR, trailing spacing)")
+    else:
+        kwargs["timestep_spacing"] = "linspace"
+
+    scheduler = EulerAncestralDiscreteScheduler(**kwargs)
+    scheduler.set_timesteps(steps, device=device)
+    return scheduler
+
+
 def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     """Stage 3: GPU denoising with UNet + EulerAncestral scheduler."""
     import time as _time
@@ -726,16 +811,8 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     _setup_elapsed = _time.monotonic() - _setup_start
     log.debug(f"  SDXL: Denoise setup (model+LoRA) took {_setup_elapsed:.3f}s")
 
-    # Create scheduler
-    scheduler = EulerAncestralDiscreteScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        num_train_timesteps=1000,
-        prediction_type="epsilon",
-        timestep_spacing="linspace",
-    )
-    scheduler.set_timesteps(steps, device=device)
+    # Create scheduler with correct prediction_type for this model
+    scheduler = _create_scheduler(inp.model_dir, steps, device)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
@@ -989,16 +1066,8 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     elif hasattr(unet, 'peft_config') and unet.peft_config:
         unet.disable_adapters()
 
-    # Create scheduler
-    scheduler = EulerAncestralDiscreteScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        num_train_timesteps=1000,
-        prediction_type="epsilon",
-        timestep_spacing="linspace",
-    )
-    scheduler.set_timesteps(steps, device=device)
+    # Create scheduler with correct prediction_type for this model
+    scheduler = _create_scheduler(inp.model_dir, steps, device)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
