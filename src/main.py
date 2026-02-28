@@ -34,10 +34,10 @@ torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-# Enable cuDNN auto-tuning: benchmarks multiple convolution algorithms on first
-# encounter of each input shape, then reuses the fastest one. Essential for UNet
-# inference where shapes are consistent across steps.
-torch.backends.cudnn.benchmark = True
+# NOTE: cudnn.benchmark = True was tested but adds 25s warmup on every new
+# job due to model eviction/reload cycles across 4 GPUs. The benchmark cache
+# doesn't persist when models are constantly swapped. Not worth it until
+# models stay resident longer.
 
 import log
 from config import FoxBurrowConfig, _auto_threads
