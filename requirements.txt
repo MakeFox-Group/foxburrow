@@ -1,5 +1,5 @@
-# Core ML — torch, torchvision, and xformers are installed separately
-# from PyTorch's nightly index (CUDA 13.0) by foxburrow.sh. Do NOT move
+# Core ML — torch and torchvision are installed separately from
+# PyTorch's nightly index (CUDA 13.0) by foxburrow.sh. Do NOT move
 # them into this file — pip's resolver will conflict with the nightly
 # pre-release versions when resolving other packages.
 diffusers>=0.27
