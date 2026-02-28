@@ -96,9 +96,10 @@ _tokenizer_2: CLIPTokenizer | None = None
 # so eviction (.to("cpu")) keeps the reference alive here for fast reload.
 _checkpoint_cache: dict[str, dict[str, object]] = {}
 _extraction_lock = threading.Lock()
-# Per-path events: threads waiting on the same checkpoint being extracted
-# by another thread block on the event, not the global lock.
-_extraction_events: dict[str, threading.Event] = {}
+# NOTE: _extraction_lock is held for the entire from_single_file() call.
+# PyTorch's torch.fx.traceback.annotate uses a module-global dict that is
+# not thread-safe — concurrent model construction causes KeyError crashes.
+# Serializing extraction avoids this without monkey-patching torch internals.
 
 # Prompt emphasis regex — A1111/Forge compatible
 _RE_ATTENTION = re.compile(
@@ -120,8 +121,9 @@ def _is_single_file(path: str) -> bool:
 def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
     """Extract all components from a single-file SDXL checkpoint.
 
-    Thread-safe: different checkpoints extract in parallel.  If two threads
-    request the *same* checkpoint, the second waits for the first to finish.
+    Thread-safe: extraction is serialized via _extraction_lock because
+    PyTorch's torch.fx.traceback uses a module-global dict that crashes
+    when two from_single_file() calls run concurrently (KeyError in annotate).
 
     Components are cached on CPU.  The same model objects are shared with
     the GPU pool cache — when the pool evicts a model (.to("cpu")), the
@@ -136,25 +138,6 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         if checkpoint_path in _checkpoint_cache:
             return _checkpoint_cache[checkpoint_path]
 
-        # Another thread already extracting this exact checkpoint?
-        if checkpoint_path in _extraction_events:
-            wait_event = _extraction_events[checkpoint_path]
-        else:
-            # We claim this checkpoint — create event for future waiters
-            wait_event = None
-            _extraction_events[checkpoint_path] = threading.Event()
-
-    if wait_event is not None:
-        # Wait for the other thread that's extracting the same checkpoint
-        wait_event.wait()
-        result = _checkpoint_cache.get(checkpoint_path)
-        if result is None:
-            raise RuntimeError(
-                f"Checkpoint extraction failed for {os.path.basename(checkpoint_path)}")
-        return result
-
-    # We're the extractor — heavy work runs lock-free (parallel with other checkpoints)
-    try:
         log.debug(f"  SDXL: Extracting components from "
                  f"{os.path.basename(checkpoint_path)} (this may take a moment)...")
 
@@ -173,11 +156,6 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
             "tokenizer_1": pipe.tokenizer,
             "tokenizer_2": pipe.tokenizer_2,
         }
-
-        # NOTE: xformers is NOT enabled on the CPU cache — attention backend
-        # is set after .to(device) in the load paths.  SDPA flash attention
-        # (enabled in main.py) is preferred; its Triton kernels are cached
-        # persistently via TRITON_CACHE_DIR.
 
         # Convert UNet to channels_last (NHWC) memory format — cuDNN convolution
         # kernels are optimized for NHWC and avoid implicit format transposes.
@@ -216,6 +194,14 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         from utils import fingerprint as fp_util
         fp_util.set_extra(checkpoint_path, prediction_type=pred_type)
 
+        # Sanity check: from_single_file() can return None components if
+        # the checkpoint is incomplete or extraction was corrupted.
+        for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
+            if components[key] is None:
+                raise RuntimeError(
+                    f"Component {key} is None after from_single_file() — "
+                    f"checkpoint may be incomplete: {os.path.basename(checkpoint_path)}")
+
         # Fix any meta tensors left by from_pretrained/accelerate, then
         # move neural-net components to CPU and set eval mode
         for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
@@ -226,17 +212,10 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         del pipe
         torch.cuda.empty_cache()
 
-        with _extraction_lock:
-            _checkpoint_cache[checkpoint_path] = components
+        _checkpoint_cache[checkpoint_path] = components
 
         log.debug(f"  SDXL: All components extracted to CPU cache")
         return components
-    finally:
-        # Wake any threads waiting on this checkpoint (success or failure)
-        with _extraction_lock:
-            done_event = _extraction_events.pop(checkpoint_path, None)
-        if done_event is not None:
-            done_event.set()
 
 
 def init_tokenizers(model_path: str) -> None:
