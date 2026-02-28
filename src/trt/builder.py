@@ -435,46 +435,51 @@ def build_all_engines(
     """
     results: dict[str, list[str]] = {"unet": [], "vae": []}
 
-    for component_type in ("unet", "vae"):
-        onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
-        if not os.path.isfile(onnx_path):
-            log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")
-            continue
+    # Set CUDA device for the entire build pipeline — TRT's Builder and
+    # OnnxParser bind to the current CUDA context at creation time.
+    # Without this, parallel builds on different GPUs all target device 0,
+    # causing memory contention and corrupt parser state.
+    with torch.cuda.device(device_id):
+        for component_type in ("unet", "vae"):
+            onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
+            if not os.path.isfile(onnx_path):
+                log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")
+                continue
 
-        # Static engine for 640×768
-        sw, sh = STATIC_RESOLUTION
-        static_path = get_engine_path(cache_dir, model_hash, component_type, arch_key, sw, sh)
-        if os.path.isfile(static_path):
-            log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
-            results[component_type].append(f"static-{sw}x{sh}")
-        else:
-            ok = build_static_engine(
-                onnx_path=onnx_path,
-                engine_path=static_path,
-                component_type=component_type,
-                width=sw,
-                height=sh,
-                device_id=device_id,
-            )
-            if ok:
+            # Static engine for 640×768
+            sw, sh = STATIC_RESOLUTION
+            static_path = get_engine_path(cache_dir, model_hash, component_type, arch_key, sw, sh)
+            if os.path.isfile(static_path):
+                log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
                 results[component_type].append(f"static-{sw}x{sh}")
-
-        # Dynamic engine for UNet only — covers non-standard resolutions.
-        # VAE skipped: dynamic range (512→2048) is too wide for conv/upsample
-        # kernels, and VAE runs once per image so PyTorch fallback is fine.
-        if component_type == "unet":
-            dynamic_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
-            if os.path.isfile(dynamic_path):
-                log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type}")
-                results[component_type].append("dynamic")
             else:
-                ok = build_dynamic_engine(
+                ok = build_static_engine(
                     onnx_path=onnx_path,
-                    engine_path=dynamic_path,
+                    engine_path=static_path,
                     component_type=component_type,
+                    width=sw,
+                    height=sh,
                     device_id=device_id,
                 )
                 if ok:
+                    results[component_type].append(f"static-{sw}x{sh}")
+
+            # Dynamic engine for UNet only — covers non-standard resolutions.
+            # VAE skipped: dynamic range (512→2048) is too wide for conv/upsample
+            # kernels, and VAE runs once per image so PyTorch fallback is fine.
+            if component_type == "unet":
+                dynamic_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
+                if os.path.isfile(dynamic_path):
+                    log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type}")
                     results[component_type].append("dynamic")
+                else:
+                    ok = build_dynamic_engine(
+                        onnx_path=onnx_path,
+                        engine_path=dynamic_path,
+                        component_type=component_type,
+                        device_id=device_id,
+                    )
+                    if ok:
+                        results[component_type].append("dynamic")
 
     return results
