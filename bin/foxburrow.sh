@@ -135,13 +135,25 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # ── Launch ──────────────────────────────────────────────────────────
-if [ "${1:-}" = "--bg" ]; then
+# Collect arguments: --bg is consumed by this script, everything else
+# is forwarded to main.py (e.g. --no-tui).
+bg=false
+main_args=()
+for arg in "$@"; do
+    if [ "$arg" = "--bg" ]; then
+        bg=true
+    else
+        main_args+=("$arg")
+    fi
+done
+
+if [ "$bg" = true ]; then
     mkdir -p "$LOG_DIR"
     echo "Starting foxburrow in background (log: $LOG_FILE)..."
-    nohup "$VENV_DIR/bin/python" src/main.py > "$LOG_FILE" 2>&1 &
+    nohup "$VENV_DIR/bin/python" src/main.py "${main_args[@]}" > "$LOG_FILE" 2>&1 &
     disown
     echo "PID: $!"
 else
     echo "Starting foxburrow..."
-    exec "$VENV_DIR/bin/python" src/main.py
+    exec "$VENV_DIR/bin/python" src/main.py "${main_args[@]}"
 fi
