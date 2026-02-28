@@ -103,11 +103,7 @@ old_hash=""
 if [ "$req_hash" != "$old_hash" ]; then
     echo "Installing/updating packages..."
 
-    # --no-deps: Install only the packages listed in requirements.txt
-    # without resolving transitive dependencies. This prevents pip's
-    # resolver from pulling in a different torch version through
-    # dependency chains like accelerate → torch>=2.0.0.
-    if "$VENV_DIR/bin/pip" install --no-deps -r "$REQ_FILE"; then
+    if "$VENV_DIR/bin/pip" install -r "$REQ_FILE"; then
         echo "$req_hash" > "$STAMP_FILE"
         echo "Packages up to date."
     else
