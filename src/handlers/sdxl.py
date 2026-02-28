@@ -109,52 +109,6 @@ _RE_BREAK = re.compile(r'\bBREAK\b')
 
 
 # ====================================================================
-# torch.compile support
-# ====================================================================
-
-# Serialize torch.compile() calls per model category so concurrent GPU
-# loads don't race on Inductor cache population.
-_compile_locks: dict[str, threading.Lock] = {}
-_compile_locks_guard = threading.Lock()
-
-
-def _try_compile(model: torch.nn.Module, category: str) -> torch.nn.Module:
-    """Wrap a model with torch.compile if supported. Returns original on failure.
-
-    Only compiles UNet for now — VAE and text encoders run once per job,
-    not iteratively, so the compile overhead isn't worth it.
-
-    Uses mode="default" (no CUDA graphs) to avoid VRAM overhead on 12GB cards
-    and complications with dynamic shapes + LoRA.
-    """
-    if category != "sdxl_unet":
-        return model
-
-    # Get or create a lock for this category.  All UNet2DConditionModel instances
-    # share the same graph structure so the Inductor cache key is the same.
-    with _compile_locks_guard:
-        if category not in _compile_locks:
-            _compile_locks[category] = threading.Lock()
-        lock = _compile_locks[category]
-
-    with lock:
-        try:
-            compiled = torch.compile(model, mode="default", fullgraph=False)
-            log.debug(f"  SDXL: torch.compile wrapped {category}")
-            return compiled
-        except Exception as ex:
-            log.warning(f"  SDXL: torch.compile failed for {category}, using eager: {ex}")
-            return model
-
-
-def _unwrap_compiled(model):
-    """Return the underlying model if torch.compile wrapped, else return as-is."""
-    if hasattr(model, '_orig_mod'):
-        return model._orig_mod
-    return model
-
-
-# ====================================================================
 # Model Loading
 # ====================================================================
 
@@ -220,10 +174,10 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
             "tokenizer_2": pipe.tokenizer_2,
         }
 
-        # NOTE: xformers is NOT enabled here on the CPU cache.  When the UNet
-        # is loaded to a GPU, _try_compile() wraps it with torch.compile (which
-        # uses SDPA).  If compilation fails, xformers is enabled as fallback in
-        # load_component().
+        # NOTE: xformers is NOT enabled on the CPU cache — attention backend
+        # is set after .to(device) in the load paths.  SDPA flash attention
+        # (enabled in main.py) is preferred; its Triton kernels are cached
+        # persistently via TRITON_CACHE_DIR.
 
         # Convert UNet to channels_last (NHWC) memory format — cuDNN convolution
         # kernels are optimized for NHWC and avoid implicit format transposes.
@@ -341,17 +295,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "UNet")
         model.to(device, memory_format=torch.channels_last)
         model.eval()
-        # SDPA (enabled in main.py) works better with torch.compile than xformers
-        model = _try_compile(model, "sdxl_unet")
-        if not hasattr(model, '_orig_mod'):
-            # Compilation failed or unavailable — enable xformers as fallback
-            try:
-                model.enable_xformers_memory_efficient_attention()
-                log.debug(f"  SDXL: Loaded UNet with xformers to {device}")
-            except Exception:
-                log.debug(f"  SDXL: Loaded UNet (SDPA) to {device}")
-        else:
-            log.debug(f"  SDXL: Loaded UNet (compiled) to {device}")
+        log.debug(f"  SDXL: Loaded UNet (SDPA) to {device}")
         return model
 
     elif category in ("sdxl_vae", "sdxl_vae_enc"):
@@ -398,13 +342,6 @@ def _load_component_from_single_file(
     elif category == "sdxl_unet":
         model.to(device, memory_format=torch.channels_last)
         model.eval()
-        model = _try_compile(model, "sdxl_unet")
-        if not hasattr(model, '_orig_mod'):
-            # Compilation failed — enable xformers as fallback (same as diffusers path)
-            try:
-                model.enable_xformers_memory_efficient_attention()
-            except Exception:
-                pass
     else:
         model.to(device)
 
