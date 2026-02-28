@@ -781,7 +781,7 @@ def main() -> None:
     app_state.pipeline_factory = PipelineFactory(app_state.registry)
 
     # Create scheduler and workers
-    scheduler = GpuScheduler(app_state.queue)
+    scheduler = GpuScheduler(app_state.queue, config.scheduler)
     workers = []
     for gpu in app_state.gpu_pool.gpus:
         worker = GpuWorker(gpu, app_state.queue, scheduler._wake)
@@ -810,6 +810,7 @@ def main() -> None:
         # Store the event loop so background threads can fire WebSocket events
         from api.websocket import streamer
         streamer.set_loop(asyncio.get_running_loop())
+        streamer.start_status_push()
 
         # Start workers and scheduler immediately so the server can accept jobs
         for w in workers:

@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from scheduling.worker import GpuWorker
 
 
+# Default model load rate (bytes/sec) for estimated_ready_s calculations.
+# 500 MB/s = NVMe safetensors sequential read speed.
+LOAD_RATE = 500 * 1024 * 1024
+
 # Duplicated from gpu/pool.py to avoid circular imports at runtime.
 # Must stay in sync with gpu.pool._get_group_for_category.
 def _get_group_for_category(category: str) -> str:
@@ -45,7 +49,6 @@ def _estimate_remaining_s(worker: GpuWorker) -> float:
     stage timing is available.
     """
     from datetime import datetime
-    import time as _time
 
     max_remaining = 0.0
     for job in worker.active_jobs:
@@ -178,10 +181,12 @@ def _score_simple_task(
         else:
             score -= 100
 
+    load_time = (needed / LOAD_RATE) if not model_loaded else 0.0
     return {
         "score": score,
         "best_gpu": gpu.uuid,
         "estimated_wait_s": round(wait_s, 1),
+        "estimated_ready_s": round(wait_s + load_time, 1),
         "model_loaded": model_loaded,
         "would_evict": would_evict,
     }
@@ -255,10 +260,12 @@ def _score_sdxl_checkpoint(
         if deficit > 0:
             score -= (deficit // (100 * 1024 * 1024)) * 30
 
+    load_time = (missing_vram / LOAD_RATE) if missing_vram > 0 else 0.0
     return {
         "score": score,
         "best_gpu": gpu.uuid,
         "estimated_wait_s": round(wait_s, 1),
+        "estimated_ready_s": round(wait_s + load_time, 1),
         "components_loaded": loaded_count,
         "components_needed": len(scoring_components),
         "missing_vram_bytes": missing_vram,

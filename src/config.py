@@ -27,6 +27,14 @@ class ServerConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    starvation_linear_s: float = 30.0    # Phase 1 duration (linear ramp)
+    starvation_hard_s: float = 90.0      # Phase 2 ends → hard override
+    load_rate_mb_s: float = 500.0        # Model load rate for time-to-ready (MB/s)
+    status_push_interval_s: float = 2.0  # WebSocket status push interval
+
+
+@dataclass
 class ThreadsConfig:
     fingerprint: int = 0  # 0 = auto: min(8, cpu_count - 1)
 
@@ -44,6 +52,7 @@ class FoxBurrowConfig:
     server: ServerConfig
     gpus: list[GpuConfig]
     threads: ThreadsConfig = field(default_factory=ThreadsConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
     @staticmethod
     def load_from_file(path: str) -> "FoxBurrowConfig":
@@ -65,6 +74,15 @@ class FoxBurrowConfig:
             server.enabled = s.getboolean("enabled", server.enabled)
             server.secret = s.get("secret", server.secret)
             server.hf_token = s.get("hf_token", server.hf_token)
+
+        # Parse [scheduler] section
+        scheduler = SchedulerConfig()
+        if parser.has_section("scheduler"):
+            s = parser["scheduler"]
+            scheduler.starvation_linear_s = s.getfloat("starvation_linear_s", scheduler.starvation_linear_s)
+            scheduler.starvation_hard_s = s.getfloat("starvation_hard_s", scheduler.starvation_hard_s)
+            scheduler.load_rate_mb_s = s.getfloat("load_rate_mb_s", scheduler.load_rate_mb_s)
+            scheduler.status_push_interval_s = s.getfloat("status_push_interval_s", scheduler.status_push_interval_s)
 
         # Parse [threads] section
         threads = ThreadsConfig()
@@ -100,4 +118,4 @@ class FoxBurrowConfig:
                 }
                 gpus.append(gpu)
 
-        return FoxBurrowConfig(server=server, gpus=gpus, threads=threads)
+        return FoxBurrowConfig(server=server, gpus=gpus, threads=threads, scheduler=scheduler)

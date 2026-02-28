@@ -7,10 +7,12 @@ import concurrent.futures
 from typing import TYPE_CHECKING
 
 import log
+from config import SchedulerConfig
 from scheduling.job import (
     InferenceJob, JobResult, StageType, WorkStage,
 )
 from scheduling.queue import JobQueue, WorkGroup
+from scheduling.readiness import _estimate_remaining_s
 
 if TYPE_CHECKING:
     from scheduling.worker import GpuWorker
@@ -50,8 +52,9 @@ class GpuScheduler:
     """Central scheduling loop. Dispatches CPU stages to thread pool,
     GPU stages to the best-scoring worker."""
 
-    def __init__(self, queue: JobQueue):
+    def __init__(self, queue: JobQueue, config: SchedulerConfig | None = None):
         self._queue = queue
+        self._config = config or SchedulerConfig()
         self._workers: list[GpuWorker] = []
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -159,18 +162,38 @@ class GpuScheduler:
         loaded_cats = worker.get_loaded_categories()
         required_group = get_session_group(stage.type)
 
-        # Model affinity
+        # ── Time-to-ready (dominant factor) ──────────────────────────
+        # Instead of fixed affinity bonuses, score by *how soon* this GPU
+        # can actually start the job: wait time + model load time.
+        wait_s = _estimate_remaining_s(worker) if not is_idle else 0.0
+
+        missing_vram = 0
+        loaded_count = 0
+        num_missing = 0
         if stage.required_components:
-            loaded_count = sum(
-                1 for c in stage.required_components
-                if worker.gpu.is_component_loaded(c.fingerprint)
-            )
+            for c in stage.required_components:
+                if worker.gpu.is_component_loaded(c.fingerprint):
+                    loaded_count += 1
+                else:
+                    missing_vram += c.estimated_vram_bytes
+                    num_missing += 1
+
+        # Model load time estimate: configurable MB/s + 0.5s per-component overhead
+        # (eviction, empty_cache, tensor allocation)
+        load_rate = self._config.load_rate_mb_s * 1024 * 1024
+        load_s = (missing_vram / load_rate + 0.5 * num_missing) if num_missing > 0 else 0.0
+        estimated_ready_s = wait_s + load_s
+
+        score -= int(estimated_ready_s * 50)  # 50 pts/second penalty
+
+        # Tiebreakers (only matter when estimated_ready_s values are close)
+        if stage.required_components:
             if loaded_count == len(stage.required_components):
-                score += 1000
+                score += 100       # prefer "ready now" over "ready in 0.01s"
             elif loaded_count > 0:
-                score += 300
-            else:
-                score -= 500
+                score += 50        # partial cache saves some load time
+        if is_idle:
+            score += 20            # slight preference for idle GPUs at equal time
 
         # Cross-group penalty — only when busy. An idle GPU has zero
         # context-switch cost so switching session groups is free.
@@ -186,27 +209,23 @@ class GpuScheduler:
         # Batch size bonus
         score += 50 * len(group.jobs)
 
-        # Starvation prevention — 3-phase ramp targeting 2-minute dispatch:
-        #   0-30s:   linear (normal scheduling priority)
-        #   30-120s: quadratic acceleration (dominates affinity by ~60s)
-        #   >=120s:  hard override (+50000, guarantees dispatch)
+        # Starvation prevention — configurable 3-phase ramp:
+        #   0..linear_s:  linear (normal scheduling priority)
+        #   linear_s..hard_s: quadratic acceleration
+        #   >=hard_s:     hard override (+50000, guarantees dispatch)
         age = group.oldest_age_seconds
+        linear_s = self._config.starvation_linear_s
+        hard_s = self._config.starvation_hard_s
         base_mult = 25 if is_idle else 10
-        if age <= 30:
+        if age <= linear_s:
             starvation = int(base_mult * age)
-        elif age <= 120:
-            linear_base = base_mult * 30
-            excess = age - 30
+        elif age <= hard_s:
+            linear_base = base_mult * linear_s
+            excess = age - linear_s
             starvation = int(linear_base + base_mult * excess + 0.5 * excess * excess)
         else:
             starvation = 50000
         score += starvation
-
-        # Prefer less-loaded GPUs — spread work across devices
-        if is_idle:
-            score += 200
-        else:
-            score -= 300 * worker.active_count
 
         # OOM avoidance: hard-reject GPUs where this job already OOM'd.
         # Must be a hard reject (not just a penalty) because the starvation

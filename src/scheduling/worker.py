@@ -762,6 +762,14 @@ class GpuWorker:
                     f"GpuWorker[{self._gpu.uuid}]: FATAL error in cleanup for {stage}")
             finally:
                 self._scheduler_wake.set()
+                # Push fresh status to WebSocket clients immediately so makefoxsrv
+                # knows a GPU just became available (don't wait for 2s periodic push)
+                try:
+                    from api.websocket import streamer
+                    from api.status_snapshot import compute_status_snapshot
+                    streamer.fire_event("status_update", compute_status_snapshot())
+                except Exception:
+                    pass  # non-critical — periodic push will catch up
 
     def _store_job_result(self, job: InferenceJob, result: JobResult) -> None:
         """Store result bytes in AppState for the queue-based API."""

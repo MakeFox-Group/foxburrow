@@ -189,27 +189,31 @@ def _image_response(image: Image.Image, mode: str = "RGB") -> Response:
 
 @router.get("/status")
 async def status():
+    from api.status_snapshot import compute_status_snapshot
+
     state = _get_state()
     pool = state.gpu_pool
     queue = state.queue
     scheduler = state.scheduler
 
+    # Start from the shared snapshot (same data WebSocket push uses)
+    result = compute_status_snapshot()
+
+    # Augment GPU entries with full details (active jobs, name, device_id, etc.)
     workers_by_uuid: dict[str, Any] = {}
     if scheduler and scheduler.workers:
         for w in scheduler.workers:
             workers_by_uuid[w.gpu.uuid] = w
 
-    gpus = []
+    enriched_gpus = []
+    snapshot_gpus_by_uuid = {g["uuid"]: g for g in result["gpus"]}
     for g in pool.gpus:
-        gpu_info: dict[str, Any] = {
-            "uuid": g.uuid,
-            "name": g.name,
-            "device_id": g.device_id,
-            "capabilities": sorted(g.capabilities),
-            "busy": g.is_busy,
-            "session_cache_count": g.session_cache_count,
-            "vram": g.get_vram_stats(),
-        }
+        gpu_info = snapshot_gpus_by_uuid.get(g.uuid, {})
+        # Add fields not included in the lightweight snapshot
+        gpu_info["name"] = g.name
+        gpu_info["device_id"] = g.device_id
+        gpu_info["capabilities"] = sorted(g.capabilities)
+        gpu_info["session_cache_count"] = g.session_cache_count
 
         worker = workers_by_uuid.get(g.uuid)
         if worker:
@@ -244,16 +248,7 @@ async def status():
                 })
             gpu_info["active_jobs"] = active_jobs
 
-        # Per-GPU slot availability (VRAM-aware)
-        if worker:
-            from scheduling.worker import estimate_gpu_slots
-            try:
-                gpu_info["slots"] = estimate_gpu_slots(worker)
-            except Exception as ex:
-                log.log_exception(ex, f"Failed to estimate slots for GPU [{g.uuid}]")
-                gpu_info["slots"] = {}
-        gpu_info["loaded_models"] = g.get_cached_models_info()
-        gpus.append(gpu_info)
+        enriched_gpus.append(gpu_info)
 
     all_caps = pool.get_all_capabilities()
     available = {cap: pool.available_count(cap) for cap in sorted(all_caps)}
@@ -276,43 +271,6 @@ async def status():
                     "stage": stage.type.value if stage else None,
                 })
 
-    # Compute readiness scores for C# dispatch
-    sdxl_models_snapshot = dict(state.sdxl_models)
-    readiness = {}
-    if scheduler and scheduler.workers:
-        from scheduling.readiness import compute_readiness
-        try:
-            readiness = compute_readiness(
-                pool, scheduler.workers, state.registry, sdxl_models_snapshot)
-        except Exception as ex:
-            log.log_exception(ex, "Failed to compute readiness scores")
-
-    # Real-time VRAM-aware slot estimation — tells makefoxsrv how many more
-    # jobs foxburrow can actually start right now, per capability.
-    available_slots: dict[str, int] = {}
-    if scheduler:
-        try:
-            available_slots = scheduler.estimate_available_slots()
-        except Exception as ex:
-            log.log_exception(ex, "Failed to estimate available slots")
-
-    # Tag slots: count GPUs with the tagger model actually loaded.
-    # Taggers run immediately (bypass the scheduler queue) and can always
-    # execute regardless of other GPU work, so the count = loaded models.
-    from handlers.tagger import is_loaded_on
-    tag_count = sum(1 for g in pool.gpus
-                    if g.supports_capability("tag") and is_loaded_on(g.device))
-    available_slots["tag"] = tag_count
-
-    # Max concurrent tasks and admission snapshot
-    admission_snapshot = None
-    if state.admission is not None:
-        admission_snapshot = state.admission.snapshot()
-        max_concurrent = state.admission.max_concurrent
-    else:
-        num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
-        max_concurrent = num_active_gpus + (num_active_gpus // 2)
-
     # Model scan progress
     model_scan = None
     scanner = state.model_scanner
@@ -324,17 +282,13 @@ async def status():
             "total": total,
         }
 
-    return {
-        "gpus": gpus,
-        "available": available,
-        "available_slots": available_slots,
-        "max_concurrent": max_concurrent,
-        "total": len(pool.gpus),
-        "queue": {"depth": queue.count if queue else 0, "jobs": queued_jobs},
-        "model_scan": model_scan,
-        "readiness": readiness,
-        "admission": admission_snapshot,
-    }
+    result["gpus"] = enriched_gpus
+    result["available"] = available
+    result["total"] = len(pool.gpus)
+    result["queue"] = {"depth": queue.count if queue else 0, "jobs": queued_jobs}
+    result["model_scan"] = model_scan
+
+    return result
 
 
 @router.get("/lora-list")

@@ -21,6 +21,7 @@ class ProgressStreamer:
         self._connections: list[WebSocket] = []
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._push_task: asyncio.Task | None = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Store the asyncio event loop for thread-safe event dispatch."""
@@ -156,6 +157,42 @@ class ProgressStreamer:
                 for ws in dead:
                     if ws in self._connections:
                         self._connections.remove(ws)
+
+    def start_status_push(self) -> None:
+        """Start background task that pushes status snapshots to connected clients."""
+        loop = self._loop
+        if loop is None:
+            return
+        self._push_task = loop.create_task(self._status_push_loop())
+
+    def stop_status_push(self) -> None:
+        """Cancel the status push background task."""
+        if self._push_task is not None:
+            self._push_task.cancel()
+            self._push_task = None
+
+    async def _status_push_loop(self) -> None:
+        """Push status_update periodically when clients are connected."""
+        from api.status_snapshot import compute_status_snapshot
+        from state import app_state
+
+        interval_s = app_state.config.scheduler.status_push_interval_s
+
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                if not self._connections:
+                    continue
+                try:
+                    snapshot = compute_status_snapshot()
+                    await self.broadcast_event("status_update", snapshot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error(f"  WebSocket: status push failed: {exc}")
+        except asyncio.CancelledError:
+            log.debug("  WebSocket: status push loop stopped")
+            raise
 
     def fire_event(self, event_type: str, data: dict) -> None:
         """Thread-safe: schedule broadcast_event on the stored event loop.
