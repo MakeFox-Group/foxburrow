@@ -868,7 +868,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
     if _tracer:
         _has_lora = bool(inp.loras)
-        _lora_name = inp.loras[0]["name"] if inp.loras else None
+        _lora_name = inp.loras[0].name if inp.loras else None
         _tracer.denoise_setup(job.job_id, _model_name, _setup_elapsed, _has_lora, _lora_name)
 
     # Create scheduler with correct prediction_type for this model
