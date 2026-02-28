@@ -347,13 +347,15 @@ def get_dynamic_engine_path(
 def get_onnx_path(cache_dir: str, model_hash: str, component_type: str) -> str:
     """Compute the filesystem path for an ONNX file.
 
-    Layout: ``{cache_dir}/{model_hash}/onnx/{component_type}_fp{precision}.onnx``
+    Layout: ``{cache_dir}/{model_hash}/onnx/{component_type}.onnx``
+
+    Both UNet and VAE are exported as FP32 ONNX.  TRT handles precision
+    conversion (FP16 for UNet) during engine building via builder flags.
     """
     short_hash = model_hash[:16]
-    precision = "fp16" if component_type == "unet" else "fp32"
     return os.path.join(
         cache_dir, short_hash, "onnx",
-        f"{component_type}_{precision}.onnx",
+        f"{component_type}.onnx",
     )
 
 
@@ -386,9 +388,17 @@ def all_engines_exist(
     component_type: str,
     arch_key: str,
 ) -> bool:
-    """Check if both static and dynamic engines exist for a component."""
-    return (static_engine_exists(cache_dir, model_hash, component_type, arch_key)
-            and dynamic_engine_exists(cache_dir, model_hash, component_type, arch_key))
+    """Check if all required engines exist for a component.
+
+    UNet: static + dynamic (dynamic covers non-standard resolutions).
+    VAE: static only (VAE runs once per image; dynamic builds fail due to
+    the wide conv/upsample kernel range, and PyTorch fallback is acceptable).
+    """
+    if not static_engine_exists(cache_dir, model_hash, component_type, arch_key):
+        return False
+    if component_type == "unet":
+        return dynamic_engine_exists(cache_dir, model_hash, component_type, arch_key)
+    return True
 
 
 def build_all_engines(
@@ -438,19 +448,22 @@ def build_all_engines(
             if ok:
                 results[component_type].append(f"static-{sw}x{sh}")
 
-        # Dynamic engine for everything else
-        dynamic_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
-        if os.path.isfile(dynamic_path):
-            log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type}")
-            results[component_type].append("dynamic")
-        else:
-            ok = build_dynamic_engine(
-                onnx_path=onnx_path,
-                engine_path=dynamic_path,
-                component_type=component_type,
-                device_id=device_id,
-            )
-            if ok:
+        # Dynamic engine for UNet only — covers non-standard resolutions.
+        # VAE skipped: dynamic range (512→2048) is too wide for conv/upsample
+        # kernels, and VAE runs once per image so PyTorch fallback is fine.
+        if component_type == "unet":
+            dynamic_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
+            if os.path.isfile(dynamic_path):
+                log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type}")
                 results[component_type].append("dynamic")
+            else:
+                ok = build_dynamic_engine(
+                    onnx_path=onnx_path,
+                    engine_path=dynamic_path,
+                    component_type=component_type,
+                    device_id=device_id,
+                )
+                if ok:
+                    results[component_type].append("dynamic")
 
     return results

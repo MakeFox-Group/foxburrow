@@ -68,7 +68,12 @@ def export_unet_onnx(
     output_path: str,
     opset: int = 17,
 ) -> None:
-    """Export an SDXL UNet to ONNX in float16.
+    """Export an SDXL UNet to ONNX in float32.
+
+    Exported as FP32 because TRT's ONNX parser cannot convert FP16 weights
+    stored in ONNX external data format (required for models > 2GB protobuf
+    limit).  TRT's FP16 builder flag handles precision conversion during
+    engine compilation.
 
     Args:
         unet: A loaded UNet2DConditionModel (can be on CPU or GPU).
@@ -77,20 +82,21 @@ def export_unet_onnx(
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Move to CPU for export (avoids GPU memory pressure during build)
+    # Move to CPU for export (avoids GPU memory pressure during build).
+    # FP32 for ONNX — TRT handles FP16 conversion at engine build time.
     device = torch.device("cpu")
-    unet_cpu = unet.to(device, dtype=torch.float16)
+    unet_cpu = unet.to(device, dtype=torch.float32)
     unet_cpu.eval()
 
     wrapper = _UNetOnnxWrapper(unet_cpu)
 
     # Dummy inputs matching SDXL UNet signature (batch=2 for CFG)
     # Use a mid-range latent size; dynamic axes handle the rest.
-    dummy_sample = torch.randn(2, 4, 96, 96, dtype=torch.float16, device=device)
+    dummy_sample = torch.randn(2, 4, 96, 96, dtype=torch.float32, device=device)
     dummy_timestep = torch.tensor([999], dtype=torch.long, device=device)
-    dummy_encoder_hidden_states = torch.randn(2, 77, 2048, dtype=torch.float16, device=device)
-    dummy_text_embeds = torch.randn(2, 1280, dtype=torch.float16, device=device)
-    dummy_time_ids = torch.randn(2, 6, dtype=torch.float16, device=device)
+    dummy_encoder_hidden_states = torch.randn(2, 77, 2048, dtype=torch.float32, device=device)
+    dummy_text_embeds = torch.randn(2, 1280, dtype=torch.float32, device=device)
+    dummy_time_ids = torch.randn(2, 6, dtype=torch.float32, device=device)
 
     dummy_args = (
         dummy_sample,

@@ -15,6 +15,24 @@ import torch
 import log
 
 
+def _trt_dtype_to_torch(trt_dtype) -> torch.dtype:
+    """Convert a TensorRT DataType to the corresponding PyTorch dtype."""
+    import tensorrt as trt
+    _map = {
+        trt.float32: torch.float32,
+        trt.float16: torch.float16,
+        trt.int32: torch.int32,
+        trt.int8: torch.int8,
+        trt.bool: torch.bool,
+    }
+    # TRT 10+ adds bfloat16
+    if hasattr(trt, "bfloat16"):
+        _map[trt.bfloat16] = torch.bfloat16
+    if trt_dtype not in _map:
+        raise ValueError(f"Unsupported TRT dtype: {trt_dtype}")
+    return _map[trt_dtype]
+
+
 class TrtUNetRunner:
     """TensorRT inference runner for the SDXL UNet.
 
@@ -51,12 +69,16 @@ class TrtUNetRunner:
         if self._context is None:
             raise RuntimeError(f"Failed to create TRT execution context: {engine_path}")
 
+        # Determine output dtype from the engine itself
+        self._output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("noise_pred"))
+
         # Pre-allocate output buffer (will be resized on first run if needed)
         self._output_buffer: torch.Tensor | None = None
         self._engine_size = os.path.getsize(engine_path)
 
         engine_mb = self._engine_size / (1024 * 1024)
-        log.debug(f"  TRT: UNet runner loaded ({engine_mb:.0f}MB) on {device}")
+        log.debug(f"  TRT: UNet runner loaded ({engine_mb:.0f}MB, "
+                  f"output={self._output_dtype}) on {device}")
 
     def run(
         self,
@@ -103,7 +125,7 @@ class TrtUNetRunner:
                 or list(self._output_buffer.shape) != list(output_shape)
                 or self._output_buffer.device != self.device):
             self._output_buffer = torch.empty(
-                tuple(output_shape), dtype=torch.float16, device=self.device)
+                tuple(output_shape), dtype=self._output_dtype, device=self.device)
 
         ctx.set_tensor_address("noise_pred", self._output_buffer.data_ptr())
 
@@ -170,11 +192,14 @@ class TrtVaeRunner:
         if self._context is None:
             raise RuntimeError(f"Failed to create TRT execution context: {engine_path}")
 
+        self._output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("image"))
+
         self._output_buffer: torch.Tensor | None = None
         self._engine_size = os.path.getsize(engine_path)
 
         engine_mb = self._engine_size / (1024 * 1024)
-        log.debug(f"  TRT: VAE runner loaded ({engine_mb:.0f}MB) on {device}")
+        log.debug(f"  TRT: VAE runner loaded ({engine_mb:.0f}MB, "
+                  f"output={self._output_dtype}) on {device}")
 
     def run(self, latents: torch.Tensor) -> torch.Tensor:
         """Run VAE decoder inference through TRT engine.
@@ -196,7 +221,7 @@ class TrtVaeRunner:
                 or list(self._output_buffer.shape) != list(output_shape)
                 or self._output_buffer.device != self.device):
             self._output_buffer = torch.empty(
-                tuple(output_shape), dtype=torch.float32, device=self.device)
+                tuple(output_shape), dtype=self._output_dtype, device=self.device)
 
         ctx.set_tensor_address("image", self._output_buffer.data_ptr())
 
