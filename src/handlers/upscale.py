@@ -156,11 +156,12 @@ def load_model(device: torch.device) -> nn.Module:
     elif "params" in state:
         state = state["params"]
 
-    # Fix any meta tensors left by accelerate's init_empty_weights() leak.
-    n = fix_meta_tensors(model)
-    if n:
-        log.debug(f"  Upscale: Fixed {n} meta tensor(s)")
-    model.load_state_dict(state, strict=True)
+    # Use assign=True so load_state_dict REPLACES parameter objects entirely
+    # instead of copy_() into them. This handles the case where accelerate's
+    # init_empty_weights() leak left all params on the meta device — copy_()
+    # into a meta tensor raises NotImplementedError, but assign=True just
+    # swaps in the real CPU tensors from the file.
+    model.load_state_dict(state, strict=True, assign=True)
     model.to(device).half().eval()
 
     log.debug(f"  Upscale: Loaded RealESRGAN x2plus to {device}")

@@ -42,14 +42,12 @@ def load_model(device: torch.device) -> torch.nn.Module:
         repair_accelerate_leak()
         model = BiRefNet(bb_pretrained=False)
 
-        # Fix any meta tensors left by accelerate's init_empty_weights() leak.
-        n = fix_meta_tensors(model)
-        if n:
-            log.debug(f"  BGRemove: Fixed {n} meta tensor(s)")
-
         weights_path = os.path.join(_model_path, "model.safetensors")
         state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+        # assign=True replaces parameter objects entirely instead of copy_()
+        # into them — handles meta tensors from accelerate leaks without
+        # needing fix_meta_tensors first.
+        model.load_state_dict(state_dict, strict=False, assign=True)
         model.to(device=device, dtype=torch.float16).eval()
         log.debug(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model

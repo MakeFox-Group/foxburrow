@@ -164,12 +164,13 @@ def init_tagger(device: torch.device) -> None:
     # and repair this BEFORE doing anything else with nn.Module.
     repair_accelerate_leak()
 
-    # Fix any meta tensors left by timm/accelerate in the model.
-    n = fix_meta_tensors(model)
-    if n:
-        log.debug(f"  Tagger: Fixed {n} meta tensor(s)")
-
-    safetensors.torch.load_model(model, safetensors_path)
+    # Load weights with assign=True to replace parameter objects entirely
+    # instead of copy_() into them — handles meta tensors from accelerate
+    # leaks without needing fix_meta_tensors. We call load_file + load_state_dict
+    # directly instead of safetensors.torch.load_model because load_model
+    # internally uses load_state_dict without assign=True.
+    state_dict = safetensors.torch.load_file(safetensors_path, device="cpu")
+    model.load_state_dict(state_dict, strict=False, assign=True)
     model.to(device=device, dtype=torch.float16).eval()
 
     # Only hold the lock for the dict write — never during heavy loading.
