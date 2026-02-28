@@ -73,6 +73,28 @@ if [ ! -d "$VENV_DIR" ]; then
     "$PYTHON" -m venv "$VENV_DIR"
 fi
 
+# ── PyTorch nightly (CUDA 13.0) ─────────────────────────────────────
+# Torch, torchvision, and xformers come from PyTorch's nightly index
+# (pre-release builds with Blackwell sm_120 support). These are managed
+# separately from requirements.txt to avoid pip resolver conflicts.
+TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu130"
+TORCH_STAMP="$VENV_DIR/.torch.stamp"
+TORCH_WANT="torch torchvision xformers"
+TORCH_HASH="$(echo "$TORCH_WANT $TORCH_INDEX" | sha256sum | cut -d' ' -f1)"
+old_torch_hash=""
+[ -f "$TORCH_STAMP" ] && old_torch_hash="$(cat "$TORCH_STAMP")"
+
+if [ "$TORCH_HASH" != "$old_torch_hash" ]; then
+    echo "Installing/updating PyTorch packages from nightly index..."
+    if "$VENV_DIR/bin/pip" install --upgrade pip && \
+       "$VENV_DIR/bin/pip" install --pre $TORCH_WANT --index-url "$TORCH_INDEX"; then
+        echo "$TORCH_HASH" > "$TORCH_STAMP"
+    else
+        echo "ERROR: PyTorch nightly install failed." >&2
+        exit 1
+    fi
+fi
+
 # ── Install/update packages if requirements.txt changed ─────────────
 req_hash="$(sha256sum "$REQ_FILE" | cut -d' ' -f1)"
 old_hash=""
@@ -83,11 +105,9 @@ if [ "$req_hash" != "$old_hash" ]; then
 
     # --no-deps: Install only the packages listed in requirements.txt
     # without resolving transitive dependencies. This prevents pip's
-    # resolver from replacing the custom PyTorch build (sm_120 Blackwell
-    # support) through dependency chains like accelerate → torch>=2.0.0.
-    # Sub-dependencies should already be present from previous installs.
-    if "$VENV_DIR/bin/pip" install --upgrade pip && \
-       "$VENV_DIR/bin/pip" install --no-deps -r "$REQ_FILE"; then
+    # resolver from pulling in a different torch version through
+    # dependency chains like accelerate → torch>=2.0.0.
+    if "$VENV_DIR/bin/pip" install --no-deps -r "$REQ_FILE"; then
         echo "$req_hash" > "$STAMP_FILE"
         echo "Packages up to date."
     else

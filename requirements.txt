@@ -1,7 +1,7 @@
-# Core ML
-# NOTE: torch and torchvision are installed manually (custom PyTorch build
-# with sm_120 support). Do NOT add them here — pip will replace the custom
-# build with the official PyPI version which lacks Blackwell support.
+# Core ML — torch, torchvision, and xformers are installed separately
+# from PyTorch's nightly index (CUDA 13.0) by foxburrow.sh. Do NOT move
+# them into this file — pip's resolver will conflict with the nightly
+# pre-release versions when resolving other packages.
 diffusers>=0.27
 transformers>=4.40
 safetensors>=0.4
