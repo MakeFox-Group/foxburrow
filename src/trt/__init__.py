@@ -9,7 +9,7 @@ Pipeline: PyTorch model → ONNX export → TRT engine build → TRT inference
 
 from trt.runner import TrtUNetRunner, TrtVaeRunner
 from trt.exporter import export_unet_onnx, export_vae_onnx
-from trt.builder import build_engine, build_all_engines
+from trt.builder import build_static_engine, build_dynamic_engine, build_all_engines
 from trt.manager import TrtBuildManager
 
 __all__ = [
@@ -17,7 +17,8 @@ __all__ = [
     "TrtVaeRunner",
     "export_unet_onnx",
     "export_vae_onnx",
-    "build_engine",
+    "build_static_engine",
+    "build_dynamic_engine",
     "build_all_engines",
     "TrtBuildManager",
 ]

@@ -1,7 +1,11 @@
 """TensorRT engine building from ONNX models.
 
-Builds optimized TRT engines per resolution with workspace stepping:
-starts at a conservative workspace size and steps up on OOM failure.
+Builds two engine types per model × component × GPU architecture:
+  1. Static engine for 640×768 (80% of traffic, maximum kernel optimization)
+  2. Dynamic engine covering 512×512 → 2048×2048 (optimized at 1024×1024)
+
+Uses workspace stepping: starts at a conservative workspace size and
+steps up on OOM failure.
 """
 
 from __future__ import annotations
@@ -14,13 +18,14 @@ import torch
 import log
 
 
-# Target resolutions: (width, height) in pixels
-# These cover ~99% of traffic. Unsupported resolutions fall back to PyTorch.
-TARGET_RESOLUTIONS: list[tuple[int, int]] = [
-    (640, 768),     # 80% of traffic — primary optimization target
-    (768, 768),     # Square
-    (1024, 1024),   # Max non-tiled; also MultiDiffusion tile size
-]
+# Static engine: exact-match resolution for the overwhelming majority of traffic.
+STATIC_RESOLUTION: tuple[int, int] = (640, 768)
+
+# Dynamic engine: covers all other resolutions up to 2048×2048.
+# TRT optimizes kernels for the OPT shape but handles any shape in [MIN, MAX].
+DYNAMIC_MIN: tuple[int, int] = (512, 512)
+DYNAMIC_OPT: tuple[int, int] = (1024, 1024)
+DYNAMIC_MAX: tuple[int, int] = (2048, 2048)
 
 # Workspace stepping parameters (GB)
 _WORKSPACE_START_GB = 2.0
@@ -50,7 +55,41 @@ def _latent_shape(width: int, height: int) -> tuple[int, int]:
     return height // 8, width // 8
 
 
-def build_engine(
+def _parse_onnx(parser, onnx_path: str) -> bool:
+    """Parse an ONNX model, handling external data (weights > 2GB protobuf limit).
+
+    Large models (e.g. SDXL UNet FP16 ~5GB) are exported by torch.onnx.export
+    with external weight files.  The 4MB .onnx file contains only the graph
+    structure.  TRT's ``parse_from_file()`` resolves these external references
+    automatically; a raw ``parse(bytes)`` cannot.
+    """
+    # parse_from_file handles external data automatically (TRT 10+)
+    try:
+        if not parser.parse_from_file(onnx_path):
+            for i in range(parser.num_errors):
+                log.error(f"  TRT: ONNX parse error: {parser.get_error(i)}")
+            return False
+        return True
+    except AttributeError:
+        pass  # Older TRT without parse_from_file — fall through
+
+    # Fallback: load with onnx library to resolve external data, then
+    # serialize to bytes for the parser.  This only works for models
+    # under the 2GB protobuf limit (i.e. VAE but not UNet).
+    try:
+        import onnx
+        model = onnx.load(onnx_path, load_external_data=True)
+        if not parser.parse(model.SerializeToString()):
+            for i in range(parser.num_errors):
+                log.error(f"  TRT: ONNX parse error: {parser.get_error(i)}")
+            return False
+        return True
+    except Exception as ex:
+        log.error(f"  TRT: Failed to load ONNX with external data: {ex}")
+        return False
+
+
+def build_static_engine(
     onnx_path: str,
     engine_path: str,
     component_type: str,
@@ -59,10 +98,11 @@ def build_engine(
     device_id: int,
     max_workspace_gb: float = _WORKSPACE_MAX_GB,
 ) -> bool:
-    """Build a TensorRT engine from an ONNX model for a specific resolution.
+    """Build a TensorRT engine with a fixed-resolution profile.
 
-    Uses workspace stepping: starts at _WORKSPACE_START_GB, steps up by
-    _WORKSPACE_STEP_GB on build failure, until max_workspace_gb.
+    The engine is optimized exclusively for the given resolution — TRT picks
+    the single best kernel per layer.  Will not accept other resolutions at
+    inference time.
 
     Args:
         onnx_path: Path to the ONNX model file.
@@ -84,47 +124,33 @@ def build_engine(
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    # EXPLICIT_BATCH was removed in TRT 10.0 (all networks are explicit-batch).
-    # Guard for compatibility with both TRT 8.x/9.x and TRT 10.x+.
     try:
         explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     except AttributeError:
-        explicit_batch_flag = 0  # TRT 10+: flag removed, pass 0
+        explicit_batch_flag = 0
     network = builder.create_network(explicit_batch_flag)
     parser = trt.OnnxParser(network, logger)
 
-    log.info(f"  TRT: Parsing ONNX for {component_type} ({width}x{height})...")
+    log.info(f"  TRT: Parsing ONNX for {component_type} (static {width}x{height})...")
 
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                log.error(f"  TRT: ONNX parse error: {parser.get_error(i)}")
-            return False
+    if not _parse_onnx(parser, onnx_path):
+        return False
 
     config = builder.create_builder_config()
-
-    # Set device for building
     config.set_flag(trt.BuilderFlag.GPU_FALLBACK)
 
     if component_type == "unet":
         config.set_flag(trt.BuilderFlag.FP16)
-    # VAE stays FP32 — no FP16 flag
 
-    # Create optimization profile for the target resolution
     profile = builder.create_optimization_profile()
 
     if component_type == "unet":
-        # Fixed spatial shapes for this specific resolution.
-        # Batch=2 for CFG (uncond + cond concatenated).
-        # encoder_hidden_states seq_len is 77*N where N = prompt chunk count
-        # (most prompts are 1 chunk = 77, long prompts can be 2-4 chunks).
         profile.set_shape("sample", (2, 4, lat_h, lat_w), (2, 4, lat_h, lat_w), (2, 4, lat_h, lat_w))
         profile.set_shape("timestep", (1,), (1,), (1,))
         profile.set_shape("encoder_hidden_states", (2, 77, 2048), (2, 77, 2048), (2, 77 * 4, 2048))
         profile.set_shape("text_embeds", (2, 1280), (2, 1280), (2, 1280))
         profile.set_shape("time_ids", (2, 6), (2, 6), (2, 6))
     elif component_type == "vae":
-        # Batch=1 for VAE decode
         profile.set_shape("latents", (1, 4, lat_h, lat_w), (1, 4, lat_h, lat_w), (1, 4, lat_h, lat_w))
     else:
         log.error(f"  TRT: Unknown component type: {component_type}")
@@ -132,9 +158,110 @@ def build_engine(
 
     config.add_optimization_profile(profile)
 
-    # Set the active CUDA device so TRT builds on the correct GPU
-    # (important on multi-GPU systems where device_id may not be 0).
-    # Workspace stepping: try increasing sizes until build succeeds.
+    return _do_build(builder, network, config, engine_path, component_type,
+                     f"static {width}x{height}", device_id, max_workspace_gb)
+
+
+def build_dynamic_engine(
+    onnx_path: str,
+    engine_path: str,
+    component_type: str,
+    device_id: int,
+    min_res: tuple[int, int] = DYNAMIC_MIN,
+    opt_res: tuple[int, int] = DYNAMIC_OPT,
+    max_res: tuple[int, int] = DYNAMIC_MAX,
+    max_workspace_gb: float = _WORKSPACE_MAX_GB,
+) -> bool:
+    """Build a TensorRT engine with a dynamic-resolution profile.
+
+    TRT optimizes for the OPT resolution but accepts any resolution within
+    [MIN, MAX].  Slightly less optimal than a static engine (~5-15% slower
+    at OPT) but covers arbitrary resolutions without PyTorch fallback.
+
+    Args:
+        onnx_path: Path to the ONNX model file.
+        engine_path: Where to write the serialized engine.
+        component_type: "unet" or "vae" — determines input shapes.
+        device_id: CUDA device index to build on.
+        min_res: Minimum (width, height) in pixels.
+        opt_res: Optimal (width, height) — TRT tunes kernels for this.
+        max_res: Maximum (width, height) in pixels.
+        max_workspace_gb: Maximum workspace size in GB.
+
+    Returns:
+        True if engine was built successfully, False on failure.
+    """
+    import tensorrt as trt
+
+    os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+
+    min_lat_h, min_lat_w = _latent_shape(*min_res)
+    opt_lat_h, opt_lat_w = _latent_shape(*opt_res)
+    max_lat_h, max_lat_w = _latent_shape(*max_res)
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    try:
+        explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    except AttributeError:
+        explicit_batch_flag = 0
+    network = builder.create_network(explicit_batch_flag)
+    parser = trt.OnnxParser(network, logger)
+
+    log.info(f"  TRT: Parsing ONNX for {component_type} "
+             f"(dynamic {min_res[0]}x{min_res[1]}→{max_res[0]}x{max_res[1]}, "
+             f"opt {opt_res[0]}x{opt_res[1]})...")
+
+    if not _parse_onnx(parser, onnx_path):
+        return False
+
+    config = builder.create_builder_config()
+    config.set_flag(trt.BuilderFlag.GPU_FALLBACK)
+
+    if component_type == "unet":
+        config.set_flag(trt.BuilderFlag.FP16)
+
+    profile = builder.create_optimization_profile()
+
+    if component_type == "unet":
+        profile.set_shape("sample",
+                          (2, 4, min_lat_h, min_lat_w),
+                          (2, 4, opt_lat_h, opt_lat_w),
+                          (2, 4, max_lat_h, max_lat_w))
+        profile.set_shape("timestep", (1,), (1,), (1,))
+        profile.set_shape("encoder_hidden_states",
+                          (2, 77, 2048), (2, 77, 2048), (2, 77 * 4, 2048))
+        profile.set_shape("text_embeds", (2, 1280), (2, 1280), (2, 1280))
+        profile.set_shape("time_ids", (2, 6), (2, 6), (2, 6))
+    elif component_type == "vae":
+        profile.set_shape("latents",
+                          (1, 4, min_lat_h, min_lat_w),
+                          (1, 4, opt_lat_h, opt_lat_w),
+                          (1, 4, max_lat_h, max_lat_w))
+    else:
+        log.error(f"  TRT: Unknown component type: {component_type}")
+        return False
+
+    config.add_optimization_profile(profile)
+
+    label = f"dynamic {min_res[0]}x{min_res[1]}→{max_res[0]}x{max_res[1]}"
+    return _do_build(builder, network, config, engine_path, component_type,
+                     label, device_id, max_workspace_gb)
+
+
+def _do_build(
+    builder,
+    network,
+    config,
+    engine_path: str,
+    component_type: str,
+    label: str,
+    device_id: int,
+    max_workspace_gb: float,
+) -> bool:
+    """Shared build logic with workspace stepping."""
+    import tensorrt as trt
+
     workspace_gb = _WORKSPACE_START_GB
     engine_bytes = None
 
@@ -143,7 +270,7 @@ def build_engine(
             workspace_bytes = int(workspace_gb * 1024 * 1024 * 1024)
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
 
-            log.info(f"  TRT: Building {component_type} engine for {width}x{height} "
+            log.info(f"  TRT: Building {component_type} engine ({label}) "
                      f"(workspace={workspace_gb:.1f}GB, device={device_id})...")
 
             start = _time.monotonic()
@@ -167,12 +294,10 @@ def build_engine(
             break
 
     if engine_bytes is None:
-        log.error(f"  TRT: Failed to build {component_type} engine for {width}x{height} "
+        log.error(f"  TRT: Failed to build {component_type} engine ({label}) "
                   f"after all workspace attempts (up to {max_workspace_gb:.1f}GB)")
         return False
 
-    # Serialize to disk atomically — write to .tmp then rename to prevent
-    # corrupt partial engine files on crash during multi-GB writes.
     tmp_path = engine_path + ".tmp"
     with open(tmp_path, "wb") as f:
         f.write(engine_bytes)
@@ -191,7 +316,7 @@ def get_engine_path(
     width: int,
     height: int,
 ) -> str:
-    """Compute the filesystem path for a TRT engine file.
+    """Compute the filesystem path for a static TRT engine file.
 
     Layout: ``{cache_dir}/{model_hash}/{component_type}/{arch_key}/{WxH}.engine``
     """
@@ -199,6 +324,23 @@ def get_engine_path(
     return os.path.join(
         cache_dir, short_hash, component_type, arch_key,
         f"{width}x{height}.engine",
+    )
+
+
+def get_dynamic_engine_path(
+    cache_dir: str,
+    model_hash: str,
+    component_type: str,
+    arch_key: str,
+) -> str:
+    """Compute the filesystem path for a dynamic TRT engine file.
+
+    Layout: ``{cache_dir}/{model_hash}/{component_type}/{arch_key}/dynamic.engine``
+    """
+    short_hash = model_hash[:16]
+    return os.path.join(
+        cache_dir, short_hash, component_type, arch_key,
+        "dynamic.engine",
     )
 
 
@@ -215,17 +357,38 @@ def get_onnx_path(cache_dir: str, model_hash: str, component_type: str) -> str:
     )
 
 
-def engine_exists(
+def static_engine_exists(
     cache_dir: str,
     model_hash: str,
     component_type: str,
     arch_key: str,
-    width: int,
-    height: int,
 ) -> bool:
-    """Check if a TRT engine file exists on disk."""
-    path = get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)
+    """Check if the static TRT engine file exists on disk."""
+    w, h = STATIC_RESOLUTION
+    path = get_engine_path(cache_dir, model_hash, component_type, arch_key, w, h)
     return os.path.isfile(path)
+
+
+def dynamic_engine_exists(
+    cache_dir: str,
+    model_hash: str,
+    component_type: str,
+    arch_key: str,
+) -> bool:
+    """Check if the dynamic TRT engine file exists on disk."""
+    path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
+    return os.path.isfile(path)
+
+
+def all_engines_exist(
+    cache_dir: str,
+    model_hash: str,
+    component_type: str,
+    arch_key: str,
+) -> bool:
+    """Check if both static and dynamic engines exist for a component."""
+    return (static_engine_exists(cache_dir, model_hash, component_type, arch_key)
+            and dynamic_engine_exists(cache_dir, model_hash, component_type, arch_key))
 
 
 def build_all_engines(
@@ -233,24 +396,23 @@ def build_all_engines(
     cache_dir: str,
     arch_key: str,
     device_id: int,
-    resolutions: list[tuple[int, int]] | None = None,
-) -> dict[str, list[tuple[int, int]]]:
+) -> dict[str, list[str]]:
     """Build all missing TRT engines for a model on a specific GPU architecture.
+
+    Builds two engines per component:
+      1. Static engine for 640×768 (exact match, maximum optimization)
+      2. Dynamic engine for 512×512 → 2048×2048 (optimized at 1024×1024)
 
     Args:
         model_hash: Content fingerprint of the model (from registry).
         cache_dir: Root TRT cache directory.
         arch_key: GPU architecture key (e.g. "sm_120_cu128").
         device_id: CUDA device index to build on.
-        resolutions: Target resolutions to build. Defaults to TARGET_RESOLUTIONS.
 
     Returns:
-        Dict mapping component_type -> list of successfully built (width, height).
+        Dict mapping component_type -> list of successfully built engine labels.
     """
-    if resolutions is None:
-        resolutions = TARGET_RESOLUTIONS
-
-    results: dict[str, list[tuple[int, int]]] = {"unet": [], "vae": []}
+    results: dict[str, list[str]] = {"unet": [], "vae": []}
 
     for component_type in ("unet", "vae"):
         onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
@@ -258,22 +420,37 @@ def build_all_engines(
             log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")
             continue
 
-        for width, height in resolutions:
-            ep = get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)
-            if os.path.isfile(ep):
-                log.debug(f"  TRT: Engine exists, skipping: {component_type} {width}x{height}")
-                results[component_type].append((width, height))
-                continue
-
-            ok = build_engine(
+        # Static engine for 640×768
+        sw, sh = STATIC_RESOLUTION
+        static_path = get_engine_path(cache_dir, model_hash, component_type, arch_key, sw, sh)
+        if os.path.isfile(static_path):
+            log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
+            results[component_type].append(f"static-{sw}x{sh}")
+        else:
+            ok = build_static_engine(
                 onnx_path=onnx_path,
-                engine_path=ep,
+                engine_path=static_path,
                 component_type=component_type,
-                width=width,
-                height=height,
+                width=sw,
+                height=sh,
                 device_id=device_id,
             )
             if ok:
-                results[component_type].append((width, height))
+                results[component_type].append(f"static-{sw}x{sh}")
+
+        # Dynamic engine for everything else
+        dynamic_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key)
+        if os.path.isfile(dynamic_path):
+            log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type}")
+            results[component_type].append("dynamic")
+        else:
+            ok = build_dynamic_engine(
+                onnx_path=onnx_path,
+                engine_path=dynamic_path,
+                component_type=component_type,
+                device_id=device_id,
+            )
+            if ok:
+                results[component_type].append("dynamic")
 
     return results

@@ -16,9 +16,8 @@ import torch
 
 import log
 from trt.builder import (
-    TARGET_RESOLUTIONS,
+    all_engines_exist,
     build_all_engines,
-    engine_exists,
     get_arch_key,
     get_onnx_path,
 )
@@ -128,14 +127,11 @@ class TrtBuildManager:
 
             model_hash = unet_comp.fingerprint
 
-            # Check if all engines exist for all architectures
+            # Check if all engines (static + dynamic) exist for all architectures
             all_exist = True
             for arch_key in arch_keys:
-                for w, h in TARGET_RESOLUTIONS:
-                    if not engine_exists(self._cache_dir, model_hash, "unet", arch_key, w, h):
-                        all_exist = False
-                        break
-                    if not engine_exists(self._cache_dir, model_hash, "vae", arch_key, w, h):
+                for component_type in ("unet", "vae"):
+                    if not all_engines_exist(self._cache_dir, model_hash, component_type, arch_key):
                         all_exist = False
                         break
                 if not all_exist:
@@ -189,11 +185,8 @@ class TrtBuildManager:
                 onnx = unet_onnx if component_type == "unet" else vae_onnx
                 if not os.path.isfile(onnx):
                     continue
-                for w, h in TARGET_RESOLUTIONS:
-                    if not engine_exists(self._cache_dir, model_hash, component_type, arch_key, w, h):
-                        missing = True
-                        break
-                if missing:
+                if not all_engines_exist(self._cache_dir, model_hash, component_type, arch_key):
+                    missing = True
                     break
 
             if not missing:
@@ -216,13 +209,12 @@ class TrtBuildManager:
                     self._cache_dir,
                     arch_key,
                     worker.gpu.device_id,
-                    TARGET_RESOLUTIONS,
                 )
 
-                built_unet = len(results.get("unet", []))
-                built_vae = len(results.get("vae", []))
-                log.info(f"  TRT: Built {built_unet} UNet + {built_vae} VAE engines "
-                         f"on {arch_key}")
+                built_unet = results.get("unet", [])
+                built_vae = results.get("vae", [])
+                log.info(f"  TRT: Built UNet [{', '.join(built_unet)}] + "
+                         f"VAE [{', '.join(built_vae)}] on {arch_key}")
 
             finally:
                 await worker.release_drain()
@@ -238,11 +230,8 @@ class TrtBuildManager:
                 if not os.path.isfile(onnx):
                     all_built = False
                     break
-                for w, h in TARGET_RESOLUTIONS:
-                    if not engine_exists(self._cache_dir, model_hash, component_type, arch_key, w, h):
-                        all_built = False
-                        break
-                if not all_built:
+                if not all_engines_exist(self._cache_dir, model_hash, component_type, arch_key):
+                    all_built = False
                     break
             if not all_built:
                 break

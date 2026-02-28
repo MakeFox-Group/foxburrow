@@ -2180,13 +2180,13 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
                           width: int, height: int):
     """Try to get a TRT UNet runner for the given resolution.
 
-    Returns a TrtUNetRunner if an engine exists and is cached (or can be loaded),
-    or None to fall back to PyTorch.
+    Tries static engine (exact resolution match) first for maximum performance,
+    then falls back to dynamic engine (covers any resolution up to 2048×2048).
+    Returns a TrtUNetRunner or None to fall back to PyTorch.
     """
-    from trt.builder import get_arch_key, get_engine_path
+    from trt.builder import get_arch_key, get_engine_path, get_dynamic_engine_path
     from trt.runner import TrtUNetRunner
 
-    # Get model fingerprint for UNet
     fp = getattr(job, '_stage_model_fps', {}).get("sdxl_unet")
     if not fp:
         return None
@@ -2195,40 +2195,58 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
 
     from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
-    engine_path = get_engine_path(cache_dir, fp, "unet", arch_key, width, height)
 
-    if not os.path.isfile(engine_path):
-        return None
+    # 1. Try static engine for exact resolution match
+    static_path = get_engine_path(cache_dir, fp, "unet", arch_key, width, height)
+    if os.path.isfile(static_path):
+        trt_fp = f"{fp}:unet_trt:{width}x{height}"
+        cached = gpu.get_cached_model(trt_fp)
+        if cached is not None:
+            return cached.model
+        try:
+            runner = TrtUNetRunner(static_path, gpu.device)
+            gpu.cache_model(
+                trt_fp, "sdxl_unet_trt", runner,
+                estimated_vram=runner.vram_usage,
+                source=f"TRT-UNet-static-{width}x{height}",
+                evict_callback=runner.unload,
+            )
+            log.debug(f"  TRT: Loaded UNet static runner {width}x{height} on GPU [{gpu.uuid}]")
+            return runner
+        except Exception as ex:
+            log.warning(f"  TRT: Failed to load UNet static engine {width}x{height}: {ex}")
 
-    # Check if TRT runner is already cached on this GPU
-    trt_fp = f"{fp}:unet_trt:{width}x{height}"
-    cached = gpu.get_cached_model(trt_fp)
-    if cached is not None:
-        return cached.model
+    # 2. Fall back to dynamic engine
+    dynamic_path = get_dynamic_engine_path(cache_dir, fp, "unet", arch_key)
+    if os.path.isfile(dynamic_path):
+        # Dynamic engine is shared across resolutions — one runner per GPU
+        trt_fp = f"{fp}:unet_trt:dynamic"
+        cached = gpu.get_cached_model(trt_fp)
+        if cached is not None:
+            return cached.model
+        try:
+            runner = TrtUNetRunner(dynamic_path, gpu.device)
+            gpu.cache_model(
+                trt_fp, "sdxl_unet_trt", runner,
+                estimated_vram=runner.vram_usage,
+                source="TRT-UNet-dynamic",
+                evict_callback=runner.unload,
+            )
+            log.debug(f"  TRT: Loaded UNet dynamic runner on GPU [{gpu.uuid}]")
+            return runner
+        except Exception as ex:
+            log.warning(f"  TRT: Failed to load UNet dynamic engine: {ex}")
 
-    # Load engine from disk and cache it
-    try:
-        runner = TrtUNetRunner(engine_path, gpu.device)
-        gpu.cache_model(
-            trt_fp, "sdxl_unet_trt", runner,
-            estimated_vram=runner.vram_usage,
-            source=f"TRT-UNet-{width}x{height}",
-            evict_callback=runner.unload,
-        )
-        log.debug(f"  TRT: Loaded UNet runner {width}x{height} on GPU [{gpu.uuid}]")
-        return runner
-    except Exception as ex:
-        log.warning(f"  TRT: Failed to load UNet engine {width}x{height}: {ex}")
-        return None
+    return None
 
 
 def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
                          width: int, height: int):
     """Try to get a TRT VAE runner for the given resolution.
 
-    Returns a TrtVaeRunner if an engine exists, or None to fall back to PyTorch.
+    Tries static engine first, then dynamic. Returns a TrtVaeRunner or None.
     """
-    from trt.builder import get_arch_key, get_engine_path
+    from trt.builder import get_arch_key, get_engine_path, get_dynamic_engine_path
     from trt.runner import TrtVaeRunner
 
     fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae")
@@ -2239,29 +2257,48 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
 
     from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
-    engine_path = get_engine_path(cache_dir, fp, "vae", arch_key, width, height)
 
-    if not os.path.isfile(engine_path):
-        return None
+    # 1. Try static engine for exact resolution match
+    static_path = get_engine_path(cache_dir, fp, "vae", arch_key, width, height)
+    if os.path.isfile(static_path):
+        trt_fp = f"{fp}:vae_trt:{width}x{height}"
+        cached = gpu.get_cached_model(trt_fp)
+        if cached is not None:
+            return cached.model
+        try:
+            runner = TrtVaeRunner(static_path, gpu.device)
+            gpu.cache_model(
+                trt_fp, "sdxl_vae_trt", runner,
+                estimated_vram=runner.vram_usage,
+                source=f"TRT-VAE-static-{width}x{height}",
+                evict_callback=runner.unload,
+            )
+            log.debug(f"  TRT: Loaded VAE static runner {width}x{height} on GPU [{gpu.uuid}]")
+            return runner
+        except Exception as ex:
+            log.warning(f"  TRT: Failed to load VAE static engine {width}x{height}: {ex}")
 
-    trt_fp = f"{fp}:vae_trt:{width}x{height}"
-    cached = gpu.get_cached_model(trt_fp)
-    if cached is not None:
-        return cached.model
+    # 2. Fall back to dynamic engine
+    dynamic_path = get_dynamic_engine_path(cache_dir, fp, "vae", arch_key)
+    if os.path.isfile(dynamic_path):
+        trt_fp = f"{fp}:vae_trt:dynamic"
+        cached = gpu.get_cached_model(trt_fp)
+        if cached is not None:
+            return cached.model
+        try:
+            runner = TrtVaeRunner(dynamic_path, gpu.device)
+            gpu.cache_model(
+                trt_fp, "sdxl_vae_trt", runner,
+                estimated_vram=runner.vram_usage,
+                source="TRT-VAE-dynamic",
+                evict_callback=runner.unload,
+            )
+            log.debug(f"  TRT: Loaded VAE dynamic runner on GPU [{gpu.uuid}]")
+            return runner
+        except Exception as ex:
+            log.warning(f"  TRT: Failed to load VAE dynamic engine: {ex}")
 
-    try:
-        runner = TrtVaeRunner(engine_path, gpu.device)
-        gpu.cache_model(
-            trt_fp, "sdxl_vae_trt", runner,
-            estimated_vram=runner.vram_usage,
-            source=f"TRT-VAE-{width}x{height}",
-            evict_callback=runner.unload,
-        )
-        log.debug(f"  TRT: Loaded VAE runner {width}x{height} on GPU [{gpu.uuid}]")
-        return runner
-    except Exception as ex:
-        log.warning(f"  TRT: Failed to load VAE engine {width}x{height}: {ex}")
-        return None
+    return None
 
 
 def _get_cached_model(gpu: GpuInstance, category: str,
