@@ -170,6 +170,15 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         except Exception as ex:
             log.debug(f"  SDXL: xformers not available, using default attention ({ex})")
 
+        # Convert UNet to channels_last (NHWC) memory format — cuDNN convolution
+        # kernels are optimized for NHWC and avoid implicit format transposes.
+        components["sdxl_unet"].to(memory_format=torch.channels_last)
+
+        # Log the attention processor type for diagnostics
+        _attn_procs = components["sdxl_unet"].attn_processors
+        _proc_types = set(type(p).__name__ for p in _attn_procs.values())
+        log.info(f"  SDXL: UNet attention processors: {_proc_types}")
+
         # Fix any meta tensors left by from_pretrained/accelerate, then
         # move neural-net components to CPU and set eval mode
         for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
@@ -247,7 +256,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         model = UNet2DConditionModel.from_pretrained(
             model_dir, subfolder="unet", torch_dtype=dtype)
         _fix_from_pretrained(model, "UNet")
-        model.to(device)
+        model.to(device, memory_format=torch.channels_last)
         model.eval()
         try:
             model.enable_xformers_memory_efficient_attention()
@@ -297,6 +306,8 @@ def _load_component_from_single_file(
     # for certain latent distributions (a well-known SDXL VAE issue).
     if category in ("sdxl_vae", "sdxl_vae_enc"):
         model.to(device=device, dtype=torch.float32)
+    elif category == "sdxl_unet":
+        model.to(device, memory_format=torch.channels_last)
     else:
         model.to(device)
 
@@ -803,6 +814,11 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                  f"({unet_tile_w*8}x{unet_tile_h*8}px, "
                  f"{UNET_TILE_OVERLAP*8}px overlap)")
 
+    # Pre-compute static CFG tensors (these don't change between steps)
+    batched_embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
+    batched_pooled = torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds])
+    batched_time_ids = torch.cat([add_time_ids, add_time_ids])
+
     _loop_start = _time.monotonic()
     _first_step_time = None
 
@@ -827,10 +843,10 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                 latent_in = torch.cat([latent_input, latent_input])
                 out = unet(
                     latent_in, t,
-                    encoder_hidden_states=torch.cat([neg_prompt_embeds, prompt_embeds]),
+                    encoder_hidden_states=batched_embeds,
                     added_cond_kwargs={
-                        "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
-                        "time_ids": torch.cat([add_time_ids, add_time_ids]),
+                        "text_embeds": batched_pooled,
+                        "time_ids": batched_time_ids,
                     },
                 ).sample
                 noise_pred_uncond, noise_pred_cond = out.chunk(2)
@@ -1090,6 +1106,12 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
                  f"({unet_tile_w*8}x{unet_tile_h*8}px, "
                  f"{UNET_TILE_OVERLAP*8}px overlap)")
 
+    # Pre-compute static CFG tensors for batched regional denoise
+    uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
+    batched_regional_embeds = torch.cat([uncond_enc, placeholder_embeds])
+    batched_regional_pooled = torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds])
+    batched_regional_time_ids = torch.cat([add_time_ids, add_time_ids])
+
     try:
         for i in range(start_step, len(timesteps)):
             job.denoise_step = i - start_step + 1
@@ -1125,13 +1147,12 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
                         state.uncond_text_embeds = neg_prompt_embeds
 
                     latent_in = torch.cat([latent_input, latent_input])
-                    uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
                     out = unet(
                         latent_in, t,
-                        encoder_hidden_states=torch.cat([uncond_enc, placeholder_embeds]),
+                        encoder_hidden_states=batched_regional_embeds,
                         added_cond_kwargs={
-                            "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
-                            "time_ids": torch.cat([add_time_ids, add_time_ids]),
+                            "text_embeds": batched_regional_pooled,
+                            "time_ids": batched_regional_time_ids,
                         },
                     ).sample
                     noise_pred_uncond, noise_pred_cond = out.chunk(2)
