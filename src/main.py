@@ -129,7 +129,7 @@ def generate_default_config() -> str:
         "address=127.0.0.1",
         "port=15888",
         "models_dir=models/",
-        "tensorrt_cache=data/trt_cache/",
+        "tensorrt_cache=data/cache/tensorrt/",
         f"secret={secret}",
         "",
         "# IMPORTANT: You must review this configuration and set enabled=true",

@@ -20,7 +20,7 @@ class ServerConfig:
     address: str = "0.0.0.0"
     port: int = 8800
     models_dir: str = "models/"
-    tensorrt_cache: str = "data/trt_cache/"
+    tensorrt_cache: str = "data/cache/tensorrt/"
     enabled: bool = False
     secret: str = ""
     hf_token: str = ""  # HuggingFace API token for faster downloads

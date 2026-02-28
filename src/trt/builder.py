@@ -318,11 +318,11 @@ def get_engine_path(
 ) -> str:
     """Compute the filesystem path for a static TRT engine file.
 
-    Layout: ``{cache_dir}/{model_hash}/{component_type}/{arch_key}/{WxH}.engine``
+    Layout: ``{cache_dir}/{hash}/{arch_key}/{component_type}/{WxH}.engine``
     """
     short_hash = model_hash[:16]
     return os.path.join(
-        cache_dir, short_hash, component_type, arch_key,
+        cache_dir, short_hash, arch_key, component_type,
         f"{width}x{height}.engine",
     )
 
@@ -335,11 +335,11 @@ def get_dynamic_engine_path(
 ) -> str:
     """Compute the filesystem path for a dynamic TRT engine file.
 
-    Layout: ``{cache_dir}/{model_hash}/{component_type}/{arch_key}/dynamic.engine``
+    Layout: ``{cache_dir}/{hash}/{arch_key}/{component_type}/dynamic.engine``
     """
     short_hash = model_hash[:16]
     return os.path.join(
-        cache_dir, short_hash, component_type, arch_key,
+        cache_dir, short_hash, arch_key, component_type,
         "dynamic.engine",
     )
 
@@ -347,9 +347,10 @@ def get_dynamic_engine_path(
 def get_onnx_path(cache_dir: str, model_hash: str, component_type: str) -> str:
     """Compute the filesystem path for an ONNX file.
 
-    Layout: ``{cache_dir}/{model_hash}/onnx/{component_type}.onnx``
+    Layout: ``{cache_dir}/{hash}/onnx/{component_type}.onnx``
 
-    Both UNet and VAE are exported as FP32 ONNX.  TRT handles precision
+    ONNX is arch-independent (shared across GPU architectures).
+    Both UNet and VAE are exported as FP32 — TRT handles precision
     conversion (FP16 for UNet) during engine building via builder flags.
     """
     short_hash = model_hash[:16]
