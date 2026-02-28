@@ -35,7 +35,7 @@ _WORKSPACE_HEADROOM_GB = 1.0  # Reserved for CUDA context + TRT overhead
 
 def _device_max_workspace_gb(device_id: int) -> float:
     """Query the GPU's total VRAM and return max usable workspace in GB."""
-    total_bytes = torch.cuda.get_device_properties(device_id).total_mem
+    total_bytes = torch.cuda.get_device_properties(device_id).total_memory
     total_gb = total_bytes / (1024 ** 3)
     return max(total_gb - _WORKSPACE_HEADROOM_GB, _WORKSPACE_START_GB)
 
