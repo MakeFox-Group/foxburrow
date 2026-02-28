@@ -105,6 +105,14 @@ class GpuTracer:
                     tile=tile, total_tiles=total_tiles,
                     tile_w=tile_w, tile_h=tile_h, op=op)
 
+    def tensor_migrate(self, job_id: str, model: str | None,
+                       tensor_name: str, size_bytes: int,
+                       source_device: str, dest_device: str,
+                       duration_s: float) -> None:
+        self.record("tensor_migrate", job_id, model, duration_s,
+                    tensor_name=tensor_name, size_bytes=size_bytes,
+                    source_device=source_device, dest_device=dest_device)
+
     def stage_complete(self, job_id: str, model: str | None, stage: str,
                        width: int, height: int, steps: int | None,
                        total_duration_s: float) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time as _time
 from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -561,7 +562,6 @@ class GpuWorker:
                 self._active_jobs[job.job_id] = job
 
             # Model loading (serialized) — included in GPU time
-            import time as _time
             load_start = _time.monotonic()
             async with self._model_load_lock:
                 # Release PyTorch's cached allocator memory before loading/checking VRAM.
@@ -600,7 +600,6 @@ class GpuWorker:
                 job.stage_status = "running"
 
                 # Measure actual GPU execution time (model loading already measured above)
-                import time as _time
                 stage_start = _time.monotonic()
 
                 # Snapshot active_count NOW (before execution) so we know
@@ -1036,49 +1035,89 @@ class GpuWorker:
             except Exception as ex:
                 log.warning(f"  WorkspaceProfiler: Failed to profile bgremove: {ex}")
 
+    def _migrate_tensor(self, tensor: torch.Tensor, name: str,
+                         device: torch.device, job_id: str,
+                         model_name: str | None) -> torch.Tensor:
+        """Move a single tensor to device, profiling the transfer if a tracer is set.
+
+        Compares device type + index to handle the edge case where a tensor's
+        device is 'cuda' (no index) vs the worker's explicit 'cuda:N'.
+        The .to(device) call is synchronous by default (non_blocking=False),
+        so timing with monotonic() is accurate without explicit device sync.
+        """
+        # Normalize comparison: always compare type + index
+        src = tensor.device
+        if src.type == device.type and (src.index or 0) == (device.index or 0):
+            return tensor
+        if device.type != "cuda":
+            return tensor  # CPU tensors don't need migration profiling
+        src_str = str(src)
+        size_bytes = tensor.nelement() * tensor.element_size()
+        _t = _time.monotonic()
+        result = tensor.to(device)
+        dur = _time.monotonic() - _t
+        log.debug(f"  Migrate {name}: {src_str} → {device} "
+                  f"({size_bytes / 1024:.1f}KB, {dur*1000:.1f}ms)")
+        if self._tracer:
+            self._tracer.tensor_migrate(
+                job_id, model_name, name, size_bytes, src_str, str(device), dur)
+        return result
+
     def _migrate_tensors_to_device(self, job: InferenceJob) -> None:
         """Move intermediate tensors to this worker's GPU device.
 
         When a job's stages run on different GPUs (e.g. text_encode on GPU 1,
         denoise on GPU 0), the intermediate tensors remain on the original
         device. This method moves them to the current worker's GPU before
-        stage execution.
+        stage execution. Each transfer is individually profiled if a tracer
+        is registered for this GPU.
         """
         device = self._gpu.device
+        job_id = job.job_id
+        model_name = _get_model_name(job)
 
         if job.encode_result is not None:
             er = job.encode_result
-            if er.prompt_embeds is not None and er.prompt_embeds.device != device:
-                er.prompt_embeds = er.prompt_embeds.to(device)
-            if er.neg_prompt_embeds is not None and er.neg_prompt_embeds.device != device:
-                er.neg_prompt_embeds = er.neg_prompt_embeds.to(device)
-            if er.pooled_prompt_embeds is not None and er.pooled_prompt_embeds.device != device:
-                er.pooled_prompt_embeds = er.pooled_prompt_embeds.to(device)
-            if er.neg_pooled_prompt_embeds is not None and er.neg_pooled_prompt_embeds.device != device:
-                er.neg_pooled_prompt_embeds = er.neg_pooled_prompt_embeds.to(device)
+            if er.prompt_embeds is not None:
+                er.prompt_embeds = self._migrate_tensor(
+                    er.prompt_embeds, "prompt_embeds", device, job_id, model_name)
+            if er.neg_prompt_embeds is not None:
+                er.neg_prompt_embeds = self._migrate_tensor(
+                    er.neg_prompt_embeds, "neg_prompt_embeds", device, job_id, model_name)
+            if er.pooled_prompt_embeds is not None:
+                er.pooled_prompt_embeds = self._migrate_tensor(
+                    er.pooled_prompt_embeds, "pooled_prompt_embeds", device, job_id, model_name)
+            if er.neg_pooled_prompt_embeds is not None:
+                er.neg_pooled_prompt_embeds = self._migrate_tensor(
+                    er.neg_pooled_prompt_embeds, "neg_pooled_prompt_embeds", device, job_id, model_name)
 
-        if job.latents is not None and job.latents.device != device:
-            job.latents = job.latents.to(device)
+        if job.latents is not None:
+            job.latents = self._migrate_tensor(
+                job.latents, "latents", device, job_id, model_name)
 
         if job.regional_encode_result is not None:
             rer = job.regional_encode_result
             rer.region_embeds = [
-                e.to(device) if e.device != device else e
-                for e in rer.region_embeds
+                self._migrate_tensor(e, f"region_embeds[{i}]", device, job_id, model_name)
+                for i, e in enumerate(rer.region_embeds)
             ]
             if rer.neg_region_embeds is not None:
                 rer.neg_region_embeds = [
-                    e.to(device) if e.device != device else e
-                    for e in rer.neg_region_embeds
+                    self._migrate_tensor(e, f"neg_region_embeds[{i}]", device, job_id, model_name)
+                    for i, e in enumerate(rer.neg_region_embeds)
                 ]
-            if rer.neg_prompt_embeds is not None and rer.neg_prompt_embeds.device != device:
-                rer.neg_prompt_embeds = rer.neg_prompt_embeds.to(device)
-            if rer.pooled_prompt_embeds is not None and rer.pooled_prompt_embeds.device != device:
-                rer.pooled_prompt_embeds = rer.pooled_prompt_embeds.to(device)
-            if rer.neg_pooled_prompt_embeds is not None and rer.neg_pooled_prompt_embeds.device != device:
-                rer.neg_pooled_prompt_embeds = rer.neg_pooled_prompt_embeds.to(device)
-            if rer.base_embeds is not None and rer.base_embeds.device != device:
-                rer.base_embeds = rer.base_embeds.to(device)
+            if rer.neg_prompt_embeds is not None:
+                rer.neg_prompt_embeds = self._migrate_tensor(
+                    rer.neg_prompt_embeds, "regional_neg_prompt_embeds", device, job_id, model_name)
+            if rer.pooled_prompt_embeds is not None:
+                rer.pooled_prompt_embeds = self._migrate_tensor(
+                    rer.pooled_prompt_embeds, "regional_pooled_prompt_embeds", device, job_id, model_name)
+            if rer.neg_pooled_prompt_embeds is not None:
+                rer.neg_pooled_prompt_embeds = self._migrate_tensor(
+                    rer.neg_pooled_prompt_embeds, "regional_neg_pooled_prompt_embeds", device, job_id, model_name)
+            if rer.base_embeds is not None:
+                rer.base_embeds = self._migrate_tensor(
+                    rer.base_embeds, "regional_base_embeds", device, job_id, model_name)
 
     def _execute_stage(self, job: InferenceJob, stage: WorkStage):
         """Execute a single job's current stage. Returns output image for final stages."""

@@ -928,10 +928,10 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     job.denoise_step = 0
     job.denoise_total_steps = active_step_count
 
-    prompt_embeds = enc.prompt_embeds.to(dtype=torch.float16)
-    neg_prompt_embeds = enc.neg_prompt_embeds.to(dtype=torch.float16)
-    pooled_prompt_embeds = enc.pooled_prompt_embeds.to(dtype=torch.float16)
-    neg_pooled_prompt_embeds = enc.neg_pooled_prompt_embeds.to(dtype=torch.float16)
+    prompt_embeds = enc.prompt_embeds.to(device=device, dtype=torch.float16)
+    neg_prompt_embeds = enc.neg_prompt_embeds.to(device=device, dtype=torch.float16)
+    pooled_prompt_embeds = enc.pooled_prompt_embeds.to(device=device, dtype=torch.float16)
+    neg_pooled_prompt_embeds = enc.neg_pooled_prompt_embeds.to(device=device, dtype=torch.float16)
 
     # MultiDiffusion: tile the UNet when latent exceeds threshold
     # unet_tile_width/height from job (pixels) → latent units; 0 = auto (≤ UNET_TILE_MAX)
@@ -1188,12 +1188,12 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     )
 
     # Stack region embeddings: [N, 77*C, 2048]
-    all_embeds = torch.cat(rer.region_embeds, dim=0).to(dtype=torch.float16)
+    all_embeds = torch.cat(rer.region_embeds, dim=0).to(device=device, dtype=torch.float16)
 
     # Build per-region negative stack if negatives differ across regions
     neg_stacked: torch.Tensor | None = None
     if rer.neg_region_embeds is not None:
-        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0).to(dtype=torch.float16)
+        neg_stacked = torch.cat(rer.neg_region_embeds, dim=0).to(device=device, dtype=torch.float16)
 
     # If ADDBASE: prepend base_embeds and full-coverage mask, then renormalize
     if rer.base_embeds is not None:
@@ -1201,10 +1201,10 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         base_mask = torch.ones(1, 1, latent_h, latent_w, device=device, dtype=torch.float16) * base_ratio
         region_masks = region_masks * (1 - base_ratio)
         region_masks = torch.cat([base_mask, region_masks], dim=0)
-        all_embeds = torch.cat([rer.base_embeds.to(dtype=torch.float16), all_embeds], dim=0)
+        all_embeds = torch.cat([rer.base_embeds.to(device=device, dtype=torch.float16), all_embeds], dim=0)
         # For per-region negatives, prepend shared neg as the base region's negative
         if neg_stacked is not None:
-            neg_stacked = torch.cat([rer.neg_prompt_embeds.to(dtype=torch.float16), neg_stacked], dim=0)
+            neg_stacked = torch.cat([rer.neg_prompt_embeds.to(device=device, dtype=torch.float16), neg_stacked], dim=0)
         # Renormalize combined masks to sum to 1.0 at every spatial position
         mask_sum = region_masks.sum(dim=0, keepdim=True).clamp(min=1e-8)
         region_masks = region_masks / mask_sum
@@ -1214,9 +1214,9 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     state.set_regions(all_embeds, region_masks)
     original_procs = install_regional_processors(unet, state)
 
-    neg_prompt_embeds = rer.neg_prompt_embeds.to(dtype=torch.float16)
-    pooled_prompt_embeds = rer.pooled_prompt_embeds.to(dtype=torch.float16)
-    neg_pooled_prompt_embeds = rer.neg_pooled_prompt_embeds.to(dtype=torch.float16)
+    neg_prompt_embeds = rer.neg_prompt_embeds.to(device=device, dtype=torch.float16)
+    pooled_prompt_embeds = rer.pooled_prompt_embeds.to(device=device, dtype=torch.float16)
+    neg_pooled_prompt_embeds = rer.neg_pooled_prompt_embeds.to(device=device, dtype=torch.float16)
 
     # Use first region's embeds as placeholder for encoder_hidden_states
     placeholder_embeds = all_embeds[0:1]

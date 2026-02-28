@@ -21,7 +21,8 @@ _TRACES_DIR = os.path.join(
 
 # Valid fields for group_by aggregation
 _VALID_GROUP_BY = {"model", "type", "gpu_uuid", "gpu_arch", "stage",
-                   "component", "encoder", "op", "direction"}
+                   "component", "encoder", "op", "direction",
+                   "tensor_name", "source_device", "dest_device"}
 
 _CHUNK_SIZE = 65536
 
