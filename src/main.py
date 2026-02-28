@@ -39,6 +39,42 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 # doesn't persist when models are constantly swapped. Not worth it until
 # models stay resident longer.
 
+# TorchInductor tuning for SDXL convolution patterns.
+# These improve kernel selection for 1x1 convolutions (used heavily in UNet).
+torch._inductor.config.conv_1x1_as_mm = True
+torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.epilogue_fusion = False
+torch._inductor.config.coordinate_descent_check_all_directions = True
+
+
+def _setup_compile_cache() -> None:
+    """Configure persistent Triton + TorchInductor cache directory.
+
+    Builds a cache path keyed on GPU arch, Python version, CUDA version, and
+    cuDNN version so compiled kernels are never loaded against mismatched
+    runtimes.  The env vars are read lazily at first compile, not at import.
+    """
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cuda_ver = torch.version.cuda or "unknown"
+    cudnn_ver = str(torch.backends.cudnn.version() or "unknown")
+
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        cap = torch.cuda.get_device_capability(0)
+        gpu_arch = f"sm_{cap[0] * 10 + cap[1]}"
+    else:
+        gpu_arch = "cpu"
+
+    cache_dir = os.path.abspath(
+        f"data/cache/{gpu_arch}_py{py_ver}_cu{cuda_ver}_cudnn{cudnn_ver}/torch")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
+
+    log.info(f"  Kernel cache: {cache_dir}")
+
 import log
 from config import FoxBurrowConfig, _auto_threads
 from gpu.pool import GpuPool
@@ -630,6 +666,10 @@ def main() -> None:
             log.warning("  All GPUs are disabled in config — CUDA has no visible devices")
     else:
         log.debug(f"  CUDA_VISIBLE_DEVICES already set: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+    # Set up persistent Triton/Inductor cache AFTER CUDA_VISIBLE_DEVICES is set,
+    # so get_device_capability(0) queries the correct (first enabled) GPU.
+    _setup_compile_cache()
 
     # Safety gate: server won't start unless enabled=true
     if not config.server.enabled:
