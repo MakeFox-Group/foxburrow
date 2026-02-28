@@ -30,7 +30,14 @@ DYNAMIC_MAX: tuple[int, int] = (2048, 2048)
 # Workspace stepping parameters (GB)
 _WORKSPACE_START_GB = 2.0
 _WORKSPACE_STEP_GB = 1.0
-_WORKSPACE_MAX_GB = 8.0
+_WORKSPACE_HEADROOM_GB = 1.0  # Reserved for CUDA context + TRT overhead
+
+
+def _device_max_workspace_gb(device_id: int) -> float:
+    """Query the GPU's total VRAM and return max usable workspace in GB."""
+    total_bytes = torch.cuda.get_device_properties(device_id).total_mem
+    total_gb = total_bytes / (1024 ** 3)
+    return max(total_gb - _WORKSPACE_HEADROOM_GB, _WORKSPACE_START_GB)
 
 
 def get_arch_key(device_id: int) -> str:
@@ -96,7 +103,7 @@ def build_static_engine(
     width: int,
     height: int,
     device_id: int,
-    max_workspace_gb: float = _WORKSPACE_MAX_GB,
+    max_workspace_gb: float = 0,
 ) -> bool:
     """Build a TensorRT engine with a fixed-resolution profile.
 
@@ -170,7 +177,7 @@ def build_dynamic_engine(
     min_res: tuple[int, int] = DYNAMIC_MIN,
     opt_res: tuple[int, int] = DYNAMIC_OPT,
     max_res: tuple[int, int] = DYNAMIC_MAX,
-    max_workspace_gb: float = _WORKSPACE_MAX_GB,
+    max_workspace_gb: float = 0,
 ) -> bool:
     """Build a TensorRT engine with a dynamic-resolution profile.
 
@@ -261,6 +268,9 @@ def _do_build(
 ) -> bool:
     """Shared build logic with workspace stepping."""
     import tensorrt as trt
+
+    if max_workspace_gb <= 0:
+        max_workspace_gb = _device_max_workspace_gb(device_id)
 
     workspace_gb = _WORKSPACE_START_GB
     engine_bytes = None
