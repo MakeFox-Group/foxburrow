@@ -81,22 +81,13 @@ old_hash=""
 if [ "$req_hash" != "$old_hash" ]; then
     echo "Installing/updating packages..."
 
-    # Build a constraints file that pins torch/torchvision to their
-    # currently-installed versions. This prevents pip's dependency
-    # resolver from replacing the custom PyTorch build (sm_120 support)
-    # when resolving transitive deps (e.g. accelerate → torch>=2.0.0).
-    CONSTRAINT_FILE="$(mktemp)"
-    trap 'rm -f "$CONSTRAINT_FILE"' EXIT
-    for pkg in torch torchvision; do
-        ver="$("$VENV_DIR/bin/pip" show "$pkg" 2>/dev/null | grep '^Version:' | awk '{print $2}')"
-        if [ -n "$ver" ]; then
-            echo "$pkg==$ver" >> "$CONSTRAINT_FILE"
-            echo "  Pinning $pkg==$ver (constraint)"
-        fi
-    done
-
+    # --no-deps: Install only the packages listed in requirements.txt
+    # without resolving transitive dependencies. This prevents pip's
+    # resolver from replacing the custom PyTorch build (sm_120 Blackwell
+    # support) through dependency chains like accelerate → torch>=2.0.0.
+    # Sub-dependencies should already be present from previous installs.
     if "$VENV_DIR/bin/pip" install --upgrade pip && \
-       "$VENV_DIR/bin/pip" install -r "$REQ_FILE" -c "$CONSTRAINT_FILE"; then
+       "$VENV_DIR/bin/pip" install --no-deps -r "$REQ_FILE"; then
         echo "$req_hash" > "$STAMP_FILE"
         echo "Packages up to date."
     else
