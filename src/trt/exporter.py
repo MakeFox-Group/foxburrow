@@ -125,6 +125,7 @@ def export_unet_onnx(
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -177,6 +178,7 @@ def export_vae_onnx(
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)

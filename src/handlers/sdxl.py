@@ -194,17 +194,15 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         from utils import fingerprint as fp_util
         fp_util.set_extra(checkpoint_path, prediction_type=pred_type)
 
-        # Sanity check: from_single_file() can return None components if
-        # the checkpoint is incomplete or extraction was corrupted.
+        # Fix any meta tensors left by from_pretrained/accelerate, then
+        # move neural-net components to CPU and set eval mode.
+        # Skip None components — some checkpoints don't contain all parts
+        # (e.g. missing text_encoder_2). They'll fail at load time instead.
         for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
             if components[key] is None:
-                raise RuntimeError(
-                    f"Component {key} is None after from_single_file() — "
-                    f"checkpoint may be incomplete: {os.path.basename(checkpoint_path)}")
-
-        # Fix any meta tensors left by from_pretrained/accelerate, then
-        # move neural-net components to CPU and set eval mode
-        for key in ("sdxl_te1", "sdxl_te2", "sdxl_unet", "sdxl_vae"):
+                log.warning(f"  SDXL: Component {key} is None in "
+                           f"{os.path.basename(checkpoint_path)} — will be unavailable")
+                continue
             _fix_from_pretrained(components[key], key)
             components[key].to("cpu")
             components[key].eval()
@@ -308,6 +306,11 @@ def _load_component_from_single_file(
     cache_key = "sdxl_vae" if category == "sdxl_vae_enc" else category
     if cache_key not in components:
         raise ValueError(f"Unknown SDXL component category: {category}")
+
+    if components[cache_key] is None:
+        raise RuntimeError(
+            f"Component {cache_key} is not available in "
+            f"{os.path.basename(checkpoint_path)} (from_single_file returned None)")
 
     # Deep-copy the CPU-resident model so each GPU gets an independent copy.
     # Without this, .to(device) would move the shared reference and break
