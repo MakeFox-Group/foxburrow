@@ -256,6 +256,18 @@ def _is_cuda_fatal(ex: Exception) -> bool:
     return any(p in msg for p in _CUDA_FATAL_PATTERNS)
 
 
+def _get_model_name(job: InferenceJob) -> str | None:
+    """Extract clean model name from job's sdxl_input.model_dir."""
+    inp = job.sdxl_input
+    if not inp or not inp.model_dir:
+        return None
+    name = os.path.basename(inp.model_dir)
+    for ext in (".safetensors", ".ckpt"):
+        if name.endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
 class GpuWorker:
     """Per-GPU background worker. Receives work items, loads models, executes stages."""
 
@@ -560,6 +572,10 @@ class GpuWorker:
                 with torch.cuda.device(self._gpu.device):
                     torch.cuda.empty_cache()
 
+                # Timer inside lock — measures actual load, not lock contention
+                _actual_load_start = _time.monotonic()
+                _vram_before = torch.cuda.memory_allocated(self._gpu.device)
+
                 await self._loop.run_in_executor(
                     None, self._ensure_models_for_stage, stage, job)
 
@@ -567,22 +583,17 @@ class GpuWorker:
                 if min_free > 0:
                     protect = self._gpu.get_active_fingerprints()
                     self._gpu.ensure_free_vram(min_free, protect)
+
+                _actual_load_duration = _time.monotonic() - _actual_load_start
+                _vram_delta = torch.cuda.memory_allocated(self._gpu.device) - _vram_before
             load_duration = _time.monotonic() - load_start
             job.model_load_time_s += load_duration
 
-            # Record model load event for profiling
-            if load_duration > 0.01:  # skip trivial cache hits
-                _load_model_name = None
-                if job.sdxl_input and job.sdxl_input.model_dir:
-                    _load_model_name = os.path.basename(job.sdxl_input.model_dir)
-                    for _ext in (".safetensors", ".ckpt"):
-                        if _load_model_name.endswith(_ext):
-                            _load_model_name = _load_model_name[:-len(_ext)]
-                            break
-                _vram_after = torch.cuda.memory_allocated(self._gpu.device)
+            # Record model load event for profiling (actual load time, not queued)
+            if _actual_load_duration > 0.01:  # skip trivial cache hits
                 self._tracer.model_load(
-                    job.job_id, _load_model_name, stage.type.value,
-                    load_duration, _vram_after, 0)
+                    job.job_id, _get_model_name(job), stage.type.value,
+                    _actual_load_duration, _vram_delta)
 
             # Execute stage
             try:
@@ -648,13 +659,7 @@ class GpuWorker:
                          f"{'' if is_solo else ' CONCURRENT — BPP update skipped'}")
 
                 # Get model name for this stage
-                model_name = None
-                if job.sdxl_input and job.sdxl_input.model_dir:
-                    model_name = os.path.basename(job.sdxl_input.model_dir)
-                    for ext in (".safetensors", ".ckpt"):
-                        if model_name.endswith(ext):
-                            model_name = model_name[:-len(ext)]
-                            break
+                model_name = _get_model_name(job)
                 job.gpu_stage_times.append({
                     "gpu": self._gpu.uuid,
                     "gpu_name": self._gpu.name,
@@ -664,9 +669,11 @@ class GpuWorker:
                 })
 
                 # Record stage completion for profiling
+                # Use actual executed step count (denoise_step after loop),
+                # not the requested input steps which differ for hires passes
                 _stage_w = job.sdxl_input.width if job.sdxl_input else 0
                 _stage_h = job.sdxl_input.height if job.sdxl_input else 0
-                _stage_steps = job.sdxl_input.steps if job.sdxl_input else None
+                _stage_steps = job.denoise_step if job.denoise_step > 0 else None
                 self._tracer.stage_complete(
                     job.job_id, model_name, stage.type.value,
                     _stage_w, _stage_h, _stage_steps, stage_duration)

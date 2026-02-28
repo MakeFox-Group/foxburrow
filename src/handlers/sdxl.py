@@ -497,6 +497,8 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     from profiling.tracer import get_current_tracer
 
     n_chunks = len(tok.prompt_tokens_1)
+    n_neg_chunks_1 = len(tok.neg_tokens_1)
+    n_neg_chunks_2 = len(tok.neg_tokens_2)
     log.debug(f"  SDXL: Running text encoders ({n_chunks} chunk(s))...")
 
     _tracer = get_current_tracer()
@@ -518,7 +520,7 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     _t = _time.monotonic()
     n_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
     if _tracer:
-        _tracer.text_encode(job.job_id, _model_name, "te1", n_chunks, "negative", _time.monotonic() - _t)
+        _tracer.text_encode(job.job_id, _model_name, "te1", n_neg_chunks_1, "negative", _time.monotonic() - _t)
 
     # TextEncoder2: hidden states [1, 77*N, 1280] + pooled [1, 1280]
     _t = _time.monotonic()
@@ -528,7 +530,7 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     _t = _time.monotonic()
     n_h2, n_pooled = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
     if _tracer:
-        _tracer.text_encode(job.job_id, _model_name, "te2", n_chunks, "negative", _time.monotonic() - _t)
+        _tracer.text_encode(job.job_id, _model_name, "te2", n_neg_chunks_2, "negative", _time.monotonic() - _t)
 
     _te_elapsed = _time.monotonic() - _te_start
     log.debug(f"  SDXL: Encoder forward passes took {_te_elapsed:.3f}s "

@@ -1,11 +1,15 @@
-"""GPU profiling tracer — appends structured JSONL events to per-architecture trace files."""
+"""GPU profiling tracer — appends structured JSONL events to per-architecture trace files.
+
+Delivery guarantee: at-most-once for in-flight events. A reader opening
+the same file may see a partial trailing line if a write is in progress;
+the query engine silently skips malformed lines.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -42,6 +46,15 @@ class GpuTracer:
         self._lock = _get_file_lock(self._path)
         self._file = open(self._path, "a", encoding="utf-8")
 
+    def close(self) -> None:
+        """Flush and close the underlying file handle."""
+        try:
+            with self._lock:
+                self._file.flush()
+                self._file.close()
+        except Exception:
+            pass
+
     def record(self, event_type: str, job_id: str, model: str | None,
                duration_s: float, **extra: Any) -> None:
         """Append a JSONL line with common fields + extras."""
@@ -64,15 +77,9 @@ class GpuTracer:
     # ── Convenience methods ──────────────────────────────────────────
 
     def model_load(self, job_id: str, model: str | None, component: str,
-                   duration_s: float, vram_bytes: int, evicted_count: int) -> None:
+                   duration_s: float, vram_delta: int) -> None:
         self.record("model_load", job_id, model, duration_s,
-                    component=component, vram_bytes=vram_bytes,
-                    evicted_count=evicted_count)
-
-    def model_evict(self, job_id: str, model: str | None, component: str,
-                    vram_freed: int) -> None:
-        self.record("model_evict", job_id, model, 0.0,
-                    component=component, vram_freed=vram_freed)
+                    component=component, vram_delta=vram_delta)
 
     def text_encode(self, job_id: str, model: str | None, encoder: str,
                     chunks: int, direction: str, duration_s: float) -> None:
@@ -108,6 +115,7 @@ class GpuTracer:
 # ── Module-level registry ────────────────────────────────────────────
 
 _tracers: dict[str, GpuTracer] = {}  # gpu_uuid → GpuTracer
+_tracers_lock = threading.Lock()
 
 
 def get_tracer(gpu_uuid: str) -> GpuTracer | None:
@@ -116,9 +124,13 @@ def get_tracer(gpu_uuid: str) -> GpuTracer | None:
 
 
 def register_tracer(gpu_uuid: str, gpu_arch: str, gpu_name: str) -> GpuTracer:
-    """Create and register a tracer for a GPU."""
-    tracer = GpuTracer(gpu_uuid, gpu_arch, gpu_name)
-    _tracers[gpu_uuid] = tracer
+    """Create and register a tracer for a GPU. Closes any existing tracer for the same UUID."""
+    with _tracers_lock:
+        old = _tracers.get(gpu_uuid)
+        if old is not None:
+            old.close()
+        tracer = GpuTracer(gpu_uuid, gpu_arch, gpu_name)
+        _tracers[gpu_uuid] = tracer
     log.info(f"Profiling tracer registered for {gpu_name} ({gpu_arch}, {gpu_uuid})")
     return tracer
 

@@ -1981,7 +1981,8 @@ def _filter_by_time(records: list[dict], after: str | None, before: str | None) 
 async def profiling_traces():
     """List available profiling trace files with metadata."""
     from profiling.query import list_trace_files
-    traces = await asyncio.get_event_loop().run_in_executor(None, list_trace_files)
+    loop = asyncio.get_running_loop()
+    traces = await loop.run_in_executor(None, list_trace_files)
     return {"traces": traces}
 
 
@@ -1999,7 +2000,8 @@ async def profiling_search(
 ):
     """Search profiling trace events with filters."""
     from profiling.query import search_events
-    events = await asyncio.get_event_loop().run_in_executor(
+    loop = asyncio.get_running_loop()
+    events = await loop.run_in_executor(
         None, lambda: search_events(
             arch=arch, job_id=job_id, event_type=type, model=model,
             gpu_uuid=gpu_uuid, after=after, before=before,
@@ -2018,11 +2020,15 @@ async def profiling_stats(
 ):
     """Aggregate profiling stats (count, sum, avg, min, max, p50, p95) grouped by field."""
     from profiling.query import aggregate_stats
-    groups = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: aggregate_stats(
-            group_by=group_by, event_type=type, model=model,
-            after=after, before=before,
-        ))
+    loop = asyncio.get_running_loop()
+    try:
+        groups = await loop.run_in_executor(
+            None, lambda: aggregate_stats(
+                group_by=group_by, event_type=type, model=model,
+                after=after, before=before,
+            ))
+    except ValueError as e:
+        return JSONResponse(status_code=422, content={"error": str(e)})
     return {"groups": groups}
 
 
@@ -2030,6 +2036,7 @@ async def profiling_stats(
 async def profiling_job_timeline(job_id: str):
     """Get complete event timeline for a specific job across all GPUs."""
     from profiling.query import job_timeline
-    events = await asyncio.get_event_loop().run_in_executor(
+    loop = asyncio.get_running_loop()
+    events = await loop.run_in_executor(
         None, lambda: job_timeline(job_id))
     return {"job_id": job_id, "events": events, "count": len(events)}
