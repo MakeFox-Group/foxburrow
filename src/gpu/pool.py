@@ -437,7 +437,15 @@ class GpuInstance:
         return True
 
     def _safe_to_cpu(self, model_entry: CachedModel) -> None:
-        """Move a model to CPU, fixing any meta tensors first."""
+        """Move a model to CPU, fixing any meta tensors first.
+
+        TRT runners cannot be moved to CPU — they are destroyed on eviction
+        and reloaded from disk when needed again.  The evict_callback handles
+        cleanup (freeing TRT context + device memory).
+        """
+        # TRT runners: no CPU offload possible — evict_callback handles cleanup
+        if model_entry.category.endswith("_trt"):
+            return
         if not hasattr(model_entry.model, "to"):
             return
         if isinstance(model_entry.model, nn.Module):
@@ -656,3 +664,8 @@ def _get_group_for_category(category: str) -> str:
     if category == "tagger":
         return "tagger"
     return "unknown"
+
+
+def is_trt_category(category: str) -> bool:
+    """Check if a cache category is a TRT runner (not a PyTorch model)."""
+    return category.endswith("_trt")

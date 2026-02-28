@@ -129,7 +129,7 @@ def generate_default_config() -> str:
         "address=127.0.0.1",
         "port=15888",
         "models_dir=models/",
-        "tensorrt_cache=data/tensorrt_cache/",
+        "tensorrt_cache=data/trt_cache/",
         f"secret={secret}",
         "",
         "# IMPORTANT: You must review this configuration and set enabled=true",
@@ -389,6 +389,15 @@ def _background_model_init(
         start_background_hashing(app_state.lora_index, pool=fp_pool, shutdown_pool=True)
     else:
         fp_pool.shutdown(wait=False)
+
+    # 8. TRT build manager — scan registered models and queue engine builds
+    # for any missing resolutions.  Runs on the asyncio event loop, builds
+    # happen in background threads after draining the target GPU.
+    if app_state.trt_manager is not None and all_sdxl:
+        try:
+            app_state.trt_manager.scan_and_queue(all_sdxl, app_state.registry)
+        except Exception as ex:
+            log.log_exception(ex, "TRT: Failed to scan/queue builds")
 
     elapsed = time.monotonic() - start_time
     log.info(f"  Background init: complete ({elapsed:.1f}s)")
@@ -861,6 +870,20 @@ def main() -> None:
             w.start()
         scheduler.start()
         log.info(f"  Scheduler started with {len(workers)} worker(s)")
+
+        # Start TRT build manager — runs as asyncio task, coordinates background
+        # engine compilation on drained GPUs.
+        try:
+            from trt.manager import TrtBuildManager
+            trt_cache = os.path.abspath(config.server.tensorrt_cache)
+            os.makedirs(trt_cache, exist_ok=True)
+            trt_mgr = TrtBuildManager(trt_cache, workers)
+            trt_mgr.start()
+            app_state.trt_manager = trt_mgr
+        except ImportError:
+            log.debug("  TRT: tensorrt not available — TRT acceleration disabled")
+        except Exception as ex:
+            log.log_exception(ex, "TRT: Failed to start build manager")
 
         # Start filesystem watcher — auto-detect model additions/removals.
         # Runs async tasks in the event loop, zero CPU when idle (inotify).

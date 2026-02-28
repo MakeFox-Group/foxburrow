@@ -30,6 +30,7 @@ class AppState:
         self.lora_index: dict = {}  # name -> LoraEntry (from utils.lora_index)
         self.loras_dir: str | None = None  # path to loras directory for rescans
         self.fs_watcher: FileSystemWatcher | None = None
+        self.trt_manager = None  # TrtBuildManager (set in main.py on_startup)
 
         # Job registry for queue-based API
         self.jobs: dict[str, "InferenceJob"] = {}          # job_id → job

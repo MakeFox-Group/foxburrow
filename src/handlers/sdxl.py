@@ -847,15 +847,42 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     scheduler_seed = (inp.seed ^ 0x9E3779B9) if is_hires else inp.seed
 
     _setup_start = _time.monotonic()
-    unet = _get_cached_model(gpu, "sdxl_unet", job)
     device = gpu.device
 
-    # Apply LoRA adapters if requested
-    if inp.loras:
-        from state import app_state
-        _ensure_loras(unet, inp.loras, gpu, app_state.lora_index)
-    elif hasattr(unet, 'peft_config') and unet.peft_config:
-        unet.disable_adapters()  # clean UNet for non-LoRA jobs
+    # TRT path: use pre-compiled TensorRT engine when available (no LoRA)
+    trt_runner = None
+    if not inp.loras:
+        trt_runner = _get_trt_unet_runner(gpu, job, width, height)
+
+    if trt_runner is not None:
+        unet = None  # not needed — TRT handles forward pass
+        log.debug(f"  SDXL: Using TRT UNet for {width}x{height}")
+    else:
+        unet = _get_cached_model(gpu, "sdxl_unet", job)
+
+        # Apply LoRA adapters if requested
+        _saved_attn_procs = None  # saved for restoration after LoRA denoise
+        if inp.loras:
+            from state import app_state
+            _ensure_loras(unet, inp.loras, gpu, app_state.lora_index)
+
+            # Use non-SDPA attention for LoRA to avoid Triton JIT variance.
+            # AttnProcessor uses manual scaled dot-product math — no Triton
+            # kernels, predictable timing. Acceptable for the minority of LoRA
+            # requests. Per-model, not global — safe for multi-GPU.
+            # Save original processors to restore after denoise loop.
+            from diffusers.models.attention_processor import AttnProcessor
+            current_procs = unet.attn_processors
+            needs_swap = any(
+                type(p).__name__ != "AttnProcessor"
+                for p in current_procs.values()
+            )
+            if needs_swap:
+                _saved_attn_procs = dict(current_procs)
+                unet.set_attn_processor(AttnProcessor())
+                log.debug(f"  SDXL: Switched to AttnProcessor (non-SDPA) for LoRA")
+        elif hasattr(unet, 'peft_config') and unet.peft_config:
+            unet.disable_adapters()  # clean UNet for non-LoRA jobs
 
     _setup_elapsed = _time.monotonic() - _setup_start
     log.debug(f"  SDXL: Denoise setup (model+LoRA) took {_setup_elapsed:.3f}s")
@@ -961,7 +988,14 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
         latent_input = scheduler.scale_model_input(latents, t)
 
-        if use_tiled:
+        if trt_runner is not None and not use_tiled:
+            # TRT path — direct tensor I/O, no Python overhead, GIL-free
+            latent_in = torch.cat([latent_input, latent_input])
+            out = trt_runner.run(latent_in, t.unsqueeze(0), batched_embeds,
+                                 batched_pooled, batched_time_ids)
+            noise_pred_uncond, noise_pred_cond = out.chunk(2)
+            noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
+        elif use_tiled:
             noise_pred = _unet_tiled(
                 unet, latent_input, t,
                 prompt_embeds, neg_prompt_embeds,
@@ -1000,6 +1034,13 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     log.debug(f"  SDXL: Denoise loop took {_loop_elapsed:.3f}s "
               f"({active_step_count} steps, {_per_step:.3f}s/step, "
               f"first={_first_step_time:.3f}s)")
+
+    # Restore original attention processors if swapped for LoRA.
+    # This prevents a persistent ~10-30% throughput regression on all
+    # subsequent non-LoRA jobs that reuse this cached UNet.
+    if _saved_attn_procs is not None and unet is not None:
+        unet.set_attn_processor(_saved_attn_procs)
+        log.debug(f"  SDXL: Restored original attention processors after LoRA denoise")
 
     # Diagnostic: check latent health after denoising
     lat_min = latents.min().item()
@@ -1316,15 +1357,12 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
     if latents is None:
         raise RuntimeError("Latents are required for VAE decoding.")
 
-    vae = _get_cached_model(gpu, "sdxl_vae", job)
     device = gpu.device
+    vae = None  # loaded below only when TRT is unavailable
 
-    # Scale latent and match VAE dtype/device
-    latents = latents.to(device=device, dtype=vae.dtype)
-    scaled_latents = latents / VAE_SCALE_FACTOR
-
-    lat_h = scaled_latents.shape[2]
-    lat_w = scaled_latents.shape[3]
+    # Determine image dimensions from latent shape
+    lat_h = latents.shape[2]
+    lat_w = latents.shape[3]
     img_w = lat_w * 8
     img_h = lat_h * 8
 
@@ -1339,6 +1377,20 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 
     lat_tile_w = tile_w // 8
     lat_tile_h = tile_h // 8
+    use_tiled = lat_w > lat_tile_w or lat_h > lat_tile_h
+
+    # Try TRT VAE runner for non-tiled decode
+    trt_vae = None
+    if not use_tiled:
+        trt_vae = _get_trt_vae_runner(gpu, job, img_w, img_h)
+
+    if trt_vae is not None:
+        # TRT path — float32 input, direct tensor I/O
+        scaled_latents = latents.to(device=device, dtype=torch.float32) / VAE_SCALE_FACTOR
+        log.debug(f"  SDXL: Using TRT VAE for {img_w}x{img_h}")
+    else:
+        vae = _get_cached_model(gpu, "sdxl_vae", job)
+        scaled_latents = latents.to(device=device, dtype=vae.dtype) / VAE_SCALE_FACTOR
 
     # Diagnostic: check latent stats before decode
     lat_min = scaled_latents.min().item()
@@ -1349,8 +1401,23 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
                     f"min={lat_min:.4f} max={lat_max:.4f} has_nan={lat_has_nan}")
 
     # Use tiled decode if image needs splitting
-    if lat_w > lat_tile_w or lat_h > lat_tile_h:
+    if use_tiled:
         image = _vae_decode_tiled(scaled_latents, vae, lat_tile_w, lat_tile_h, job=job)
+    elif trt_vae is not None:
+        # TRT VAE decode — GIL-free
+        decoded = trt_vae.run(scaled_latents)
+
+        # Diagnostic: check decoded tensor stats
+        dec_min = decoded.min().item()
+        dec_max = decoded.max().item()
+        dec_has_nan = torch.isnan(decoded).any().item()
+        dec_mean = decoded.mean().item()
+        if dec_has_nan or dec_max - dec_min < 0.01:
+            log.warning(f"  SDXL: VAE decode (TRT) — BAD decoded tensor: "
+                        f"min={dec_min:.4f} max={dec_max:.4f} mean={dec_mean:.4f} "
+                        f"has_nan={dec_has_nan}")
+
+        image = _tensor_to_pil(decoded)
     else:
         with torch.no_grad():
             decoded = vae.decode(scaled_latents.to(device)).sample
@@ -2121,6 +2188,98 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
     n_unet_keys = sum(1 for k in converted_sd if k.startswith("unet."))
     log.debug(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
              f"({n_unet_keys} unet params, {lora_size // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
+
+
+# ====================================================================
+# TRT Runner Retrieval
+# ====================================================================
+
+def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
+                          width: int, height: int):
+    """Try to get a TRT UNet runner for the given resolution.
+
+    Returns a TrtUNetRunner if an engine exists and is cached (or can be loaded),
+    or None to fall back to PyTorch.
+    """
+    from trt.builder import get_arch_key, get_engine_path
+    from trt.runner import TrtUNetRunner
+
+    # Get model fingerprint for UNet
+    fp = getattr(job, '_stage_model_fps', {}).get("sdxl_unet")
+    if not fp:
+        return None
+
+    arch_key = get_arch_key(gpu.device_id)
+
+    from state import app_state
+    cache_dir = app_state.config.server.tensorrt_cache
+    engine_path = get_engine_path(cache_dir, fp, "unet", arch_key, width, height)
+
+    if not os.path.isfile(engine_path):
+        return None
+
+    # Check if TRT runner is already cached on this GPU
+    trt_fp = f"{fp}:unet_trt:{width}x{height}"
+    cached = gpu.get_cached_model(trt_fp)
+    if cached is not None:
+        return cached.model
+
+    # Load engine from disk and cache it
+    try:
+        runner = TrtUNetRunner(engine_path, gpu.device)
+        gpu.cache_model(
+            trt_fp, "sdxl_unet_trt", runner,
+            estimated_vram=runner.vram_usage,
+            source=f"TRT-UNet-{width}x{height}",
+            evict_callback=runner.unload,
+        )
+        log.debug(f"  TRT: Loaded UNet runner {width}x{height} on GPU [{gpu.uuid}]")
+        return runner
+    except Exception as ex:
+        log.warning(f"  TRT: Failed to load UNet engine {width}x{height}: {ex}")
+        return None
+
+
+def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
+                         width: int, height: int):
+    """Try to get a TRT VAE runner for the given resolution.
+
+    Returns a TrtVaeRunner if an engine exists, or None to fall back to PyTorch.
+    """
+    from trt.builder import get_arch_key, get_engine_path
+    from trt.runner import TrtVaeRunner
+
+    fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae")
+    if not fp:
+        return None
+
+    arch_key = get_arch_key(gpu.device_id)
+
+    from state import app_state
+    cache_dir = app_state.config.server.tensorrt_cache
+    engine_path = get_engine_path(cache_dir, fp, "vae", arch_key, width, height)
+
+    if not os.path.isfile(engine_path):
+        return None
+
+    trt_fp = f"{fp}:vae_trt:{width}x{height}"
+    cached = gpu.get_cached_model(trt_fp)
+    if cached is not None:
+        return cached.model
+
+    try:
+        runner = TrtVaeRunner(engine_path, gpu.device)
+        gpu.cache_model(
+            trt_fp, "sdxl_vae_trt", runner,
+            estimated_vram=runner.vram_usage,
+            source=f"TRT-VAE-{width}x{height}",
+            evict_callback=runner.unload,
+        )
+        log.debug(f"  TRT: Loaded VAE runner {width}x{height} on GPU [{gpu.uuid}]")
+        return runner
+    except Exception as ex:
+        log.warning(f"  TRT: Failed to load VAE engine {width}x{height}: {ex}")
+        return None
 
 
 def _get_cached_model(gpu: GpuInstance, category: str,

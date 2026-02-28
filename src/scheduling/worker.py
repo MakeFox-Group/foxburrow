@@ -302,6 +302,12 @@ class GpuWorker:
         # Cross-GPU failure propagation — set by scheduler via set_workers()
         self._all_workers: list[GpuWorker] = []
 
+        # TRT build drain state — when True, worker stops accepting new work
+        # and waits for active jobs to complete so TRT engines can be compiled.
+        self._draining = False
+        self._building = False
+        self._drain_event: asyncio.Event | None = None  # signaled when drain completes
+
     def has_session_capacity(self, session_key: str) -> bool:
         """Check if this worker can accept one more job of the given session type."""
         with self._state_lock:
@@ -375,6 +381,8 @@ class GpuWorker:
     def can_accept_work(self, stage: WorkStage) -> bool:
         """Whether this worker can accept a new work item for the given stage."""
         if self._gpu.is_failed:
+            return False
+        if self._draining or self._building:
             return False
         if stage.required_capability and not self._gpu.supports_capability(stage.required_capability):
             return False
@@ -810,6 +818,14 @@ class GpuWorker:
 
                 if became_idle:
                     self._gpu.release()
+                    # If draining for TRT build, signal that the GPU is now idle.
+                    # Use call_soon_threadsafe because this runs in a thread pool
+                    # executor, not on the asyncio event loop thread.
+                    if self._draining and self._drain_event is not None:
+                        if self._loop is not None:
+                            self._loop.call_soon_threadsafe(self._drain_event.set)
+                        else:
+                            self._drain_event.set()
             except Exception as ex:
                 log.log_exception(ex,
                     f"GpuWorker[{self._gpu.uuid}]: FATAL error in cleanup for {stage}")
@@ -1180,6 +1196,49 @@ class GpuWorker:
 
         else:
             raise RuntimeError(f"GPU worker cannot execute stage type {stage.type}")
+
+    # ── TRT build drain ────────────────────────────────────────────
+
+    async def request_drain(self) -> None:
+        """Request this worker to drain for TRT engine building.
+
+        Sets the draining flag (stops accepting new work), then waits
+        until all active jobs complete and the GPU is idle.  After this
+        returns, the GPU is exclusively available for TRT compilation.
+        """
+        if self._draining or self._building:
+            raise RuntimeError(f"GPU [{self._gpu.uuid}] is already draining/building")
+
+        self._drain_event = asyncio.Event()
+        self._draining = True
+
+        log.info(f"  GpuWorker[{self._gpu.uuid}]: Drain requested — "
+                 f"waiting for {self._active_count} active job(s)")
+
+        # If already idle, drain is instant
+        with self._state_lock:
+            if self._active_count == 0:
+                self._drain_event.set()
+
+        await self._drain_event.wait()
+
+        # Evict all cached models to free VRAM for engine building
+        while self._gpu.evict_lru() is not None:
+            pass
+        with torch.cuda.device(self._gpu.device):
+            torch.cuda.empty_cache()
+
+        self._building = True
+        log.info(f"  GpuWorker[{self._gpu.uuid}]: Drained — GPU ready for TRT build")
+
+    async def release_drain(self) -> None:
+        """Release the GPU from drain/building state, resume normal scheduling."""
+        self._building = False
+        self._draining = False
+        self._drain_event = None
+
+        log.info(f"  GpuWorker[{self._gpu.uuid}]: Drain released — resuming normal operation")
+        self._scheduler_wake.set()
 
 
 # ── Slot estimation (for /api/status) ──────────────────────────────
