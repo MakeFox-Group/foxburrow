@@ -39,6 +39,18 @@ def _fix_from_pretrained(model: torch.nn.Module, label: str) -> None:
         log.debug(f"  SDXL: Fixed {n} meta tensor(s) in {label}")
 
 
+def _get_model_name(job: InferenceJob) -> str | None:
+    """Extract clean model name from job's sdxl_input.model_dir."""
+    inp = job.sdxl_input
+    if not inp or not inp.model_dir:
+        return None
+    name = os.path.basename(inp.model_dir)
+    for ext in (".safetensors", ".ckpt"):
+        if name.endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
 # Constants
 VAE_SCALE_FACTOR = 0.13025
 VAE_TILE_THRESHOLD = 1024    # force tiled mode when any image dimension >= this (pixels)
@@ -482,9 +494,13 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         return
 
     import time as _time
+    from profiling.tracer import get_current_tracer
 
     n_chunks = len(tok.prompt_tokens_1)
     log.debug(f"  SDXL: Running text encoders ({n_chunks} chunk(s))...")
+
+    _tracer = get_current_tracer()
+    _model_name = _get_model_name(job)
 
     # Get models from GPU cache
     te1 = _get_cached_model(gpu, "sdxl_te1", job)
@@ -495,12 +511,24 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     _te_start = _time.monotonic()
 
     # TextEncoder1: hidden states [1, 77*N, 768]
+    _t = _time.monotonic()
     p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
+    if _tracer:
+        _tracer.text_encode(job.job_id, _model_name, "te1", n_chunks, "prompt", _time.monotonic() - _t)
+    _t = _time.monotonic()
     n_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
+    if _tracer:
+        _tracer.text_encode(job.job_id, _model_name, "te1", n_chunks, "negative", _time.monotonic() - _t)
 
     # TextEncoder2: hidden states [1, 77*N, 1280] + pooled [1, 1280]
+    _t = _time.monotonic()
     p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
+    if _tracer:
+        _tracer.text_encode(job.job_id, _model_name, "te2", n_chunks, "prompt", _time.monotonic() - _t)
+    _t = _time.monotonic()
     n_h2, n_pooled = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
+    if _tracer:
+        _tracer.text_encode(job.job_id, _model_name, "te2", n_chunks, "negative", _time.monotonic() - _t)
 
     _te_elapsed = _time.monotonic() - _te_start
     log.debug(f"  SDXL: Encoder forward passes took {_te_elapsed:.3f}s "
@@ -787,6 +815,9 @@ def _create_scheduler(
 def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     """Stage 3: GPU denoising with UNet + EulerAncestral scheduler."""
     import time as _time
+    from profiling.tracer import get_current_tracer
+    _tracer = get_current_tracer()
+    _model_name = _get_model_name(job)
 
     inp = job.sdxl_input
     if inp is None:
@@ -832,6 +863,11 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
     _setup_elapsed = _time.monotonic() - _setup_start
     log.debug(f"  SDXL: Denoise setup (model+LoRA) took {_setup_elapsed:.3f}s")
+
+    if _tracer:
+        _has_lora = bool(inp.loras)
+        _lora_name = inp.loras[0]["name"] if inp.loras else None
+        _tracer.denoise_setup(job.job_id, _model_name, _setup_elapsed, _has_lora, _lora_name)
 
     # Create scheduler with correct prediction_type for this model
     scheduler = _create_scheduler(inp.model_dir, steps, device)
@@ -922,6 +958,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     _first_step_time = None
 
     for i in range(start_step, len(timesteps)):
+        _step_start = _time.monotonic()
         job.denoise_step = i - start_step + 1
         _broadcast_ws_progress(job)
         t = timesteps[i]
@@ -952,6 +989,12 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
         latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
+
+        _step_dur = _time.monotonic() - _step_start
+        if _tracer:
+            _tracer.denoise_step(
+                job.job_id, _model_name, i - start_step + 1,
+                active_step_count, int(t), _step_dur, use_tiled)
 
         if _first_step_time is None:
             _first_step_time = _time.monotonic() - _loop_start
@@ -1709,6 +1752,10 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
                       *, job: InferenceJob | None = None) -> torch.Tensor:
     """Tiled VAE encode for large images. Supports non-square tiles.
     Tiles in pixel space, blends in latent space with linear feathering."""
+    import time as _time
+    from profiling.tracer import get_current_tracer
+    _tracer = get_current_tracer()
+    _model_name = _get_model_name(job) if job else None
     min_tile_px = LATENT_TILE_OVERLAP * 8 + 8  # 136px minimum
     if tile_w_px < min_tile_px or tile_h_px < min_tile_px:
         raise ValueError(
@@ -1755,8 +1802,10 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
             t = torch.from_numpy(tile_np).permute(2, 0, 1).unsqueeze(0)
             t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
 
+            _tile_start = _time.monotonic()
             with torch.no_grad():
                 tile_lat_t = vae.encode(t).latent_dist.mean * VAE_SCALE_FACTOR
+            _tile_dur = _time.monotonic() - _tile_start
 
             tile_lat_np = tile_lat_t.squeeze(0).cpu().float().numpy()  # [4, th, tw]
             th_lat = tile_lat_np.shape[1]
@@ -1785,6 +1834,9 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
             weights [0, 0, ly:ly+th_lat, lx:lx+tw_lat] += w_mask
 
             tile_count += 1
+            if _tracer and job:
+                _tracer.vae_tile(job.job_id, _model_name, tile_count, total_tiles,
+                                 px2 - px, py2 - py, "encode", _tile_dur)
             if job is not None:
                 job.stage_step = tile_count
 
@@ -1802,6 +1854,10 @@ def _vae_decode_tiled(
 ) -> Image.Image:
     """Tiled VAE decode for large images with linear feathering blend.
     Uses numpy broadcasting for weight accumulation (no Python pixel loops)."""
+    import time as _time
+    from profiling.tracer import get_current_tracer
+    _tracer = get_current_tracer()
+    _model_name = _get_model_name(job) if job else None
     min_lat = LATENT_TILE_OVERLAP + 1
     if lat_tile_w < min_lat or lat_tile_h < min_lat:
         raise ValueError(
@@ -1846,8 +1902,10 @@ def _vae_decode_tiled(
 
             tile = latents[:, :, lat_y:lat_y+tile_h, lat_x:lat_x+tile_w]
 
+            _tile_start = _time.monotonic()
             with torch.no_grad():
                 decoded = vae.decode(tile).sample
+            _tile_dur = _time.monotonic() - _tile_start
 
             decoded_np = decoded.squeeze(0).cpu().float().numpy()  # [3, H, W]
             tile_img_h = tile_h * 8
@@ -1872,6 +1930,9 @@ def _vae_decode_tiled(
             weights[img_y:img_y+tile_img_h, img_x:img_x+tile_img_w] += w_mask
 
             tile_count += 1
+            if _tracer and job:
+                _tracer.vae_tile(job.job_id, _model_name, tile_count, total_tiles,
+                                 tile_img_w, tile_img_h, "decode", _tile_dur)
             if job is not None:
                 job.stage_step = tile_count
 

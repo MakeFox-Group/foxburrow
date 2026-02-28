@@ -272,6 +272,10 @@ class GpuWorker:
         from gpu.workspace_profiler import get_gpu_model_name
         self._gpu_model_name: str = get_gpu_model_name(gpu.device)
 
+        # GPU profiling tracer for structured JSONL event recording
+        from profiling.tracer import register_tracer
+        self._tracer = register_tracer(gpu.uuid, self._gpu_model_name, gpu.name)
+
         # Concurrency tracking
         self._state_lock = threading.Lock()
         self._active_count = 0
@@ -566,6 +570,20 @@ class GpuWorker:
             load_duration = _time.monotonic() - load_start
             job.model_load_time_s += load_duration
 
+            # Record model load event for profiling
+            if load_duration > 0.01:  # skip trivial cache hits
+                _load_model_name = None
+                if job.sdxl_input and job.sdxl_input.model_dir:
+                    _load_model_name = os.path.basename(job.sdxl_input.model_dir)
+                    for _ext in (".safetensors", ".ckpt"):
+                        if _load_model_name.endswith(_ext):
+                            _load_model_name = _load_model_name[:-len(_ext)]
+                            break
+                _vram_after = torch.cuda.memory_allocated(self._gpu.device)
+                self._tracer.model_load(
+                    job.job_id, _load_model_name, stage.type.value,
+                    load_duration, _vram_after, 0)
+
             # Execute stage
             try:
                 job.stage_status = "running"
@@ -644,6 +662,14 @@ class GpuWorker:
                     "model": model_name,
                     "duration_s": round(stage_duration, 3),
                 })
+
+                # Record stage completion for profiling
+                _stage_w = job.sdxl_input.width if job.sdxl_input else 0
+                _stage_h = job.sdxl_input.height if job.sdxl_input else 0
+                _stage_steps = job.sdxl_input.steps if job.sdxl_input else None
+                self._tracer.stage_complete(
+                    job.job_id, model_name, stage.type.value,
+                    _stage_w, _stage_h, _stage_steps, stage_duration)
 
                 job.active_gpus = []
 
@@ -1049,12 +1075,19 @@ class GpuWorker:
 
     def _execute_stage(self, job: InferenceJob, stage: WorkStage):
         """Execute a single job's current stage. Returns output image for final stages."""
+        # Set the profiling tracer for this thread so handlers can access it
+        from profiling.tracer import set_current_tracer
+        set_current_tracer(self._tracer)
+
         # Tag all allocations during stage execution as activations (thread-local,
         # must be set here on the executor thread — not on the asyncio event loop).
         tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_ACTIVATIONS)
                    if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
-        with tag_ctx:
-            return self._dispatch_stage(job, stage)
+        try:
+            with tag_ctx:
+                return self._dispatch_stage(job, stage)
+        finally:
+            set_current_tracer(None)
 
     def _dispatch_stage(self, job: InferenceJob, stage: WorkStage):
         """Dispatch to the appropriate handler for a stage type."""

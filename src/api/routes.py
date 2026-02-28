@@ -1971,3 +1971,65 @@ def _filter_by_time(records: list[dict], after: str | None, before: str | None) 
                     continue
         result.append(rec)
     return result
+
+
+# ====================================================================
+# Profiling Endpoints
+# ====================================================================
+
+@router.get("/profiling/traces")
+async def profiling_traces():
+    """List available profiling trace files with metadata."""
+    from profiling.query import list_trace_files
+    traces = await asyncio.get_event_loop().run_in_executor(None, list_trace_files)
+    return {"traces": traces}
+
+
+@router.get("/profiling/search")
+async def profiling_search(
+    arch: str | None = None,
+    job_id: str | None = None,
+    type: str | None = None,
+    model: str | None = None,
+    gpu_uuid: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = Query(default=500, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+):
+    """Search profiling trace events with filters."""
+    from profiling.query import search_events
+    events = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: search_events(
+            arch=arch, job_id=job_id, event_type=type, model=model,
+            gpu_uuid=gpu_uuid, after=after, before=before,
+            limit=limit, offset=offset,
+        ))
+    return {"events": events, "count": len(events)}
+
+
+@router.get("/profiling/stats")
+async def profiling_stats(
+    group_by: str = Query(default="model"),
+    type: str | None = None,
+    model: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+):
+    """Aggregate profiling stats (count, sum, avg, min, max, p50, p95) grouped by field."""
+    from profiling.query import aggregate_stats
+    groups = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: aggregate_stats(
+            group_by=group_by, event_type=type, model=model,
+            after=after, before=before,
+        ))
+    return {"groups": groups}
+
+
+@router.get("/profiling/job/{job_id}")
+async def profiling_job_timeline(job_id: str):
+    """Get complete event timeline for a specific job across all GPUs."""
+    from profiling.query import job_timeline
+    events = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: job_timeline(job_id))
+    return {"job_id": job_id, "events": events, "count": len(events)}
