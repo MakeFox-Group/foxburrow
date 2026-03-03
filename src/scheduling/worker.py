@@ -905,7 +905,7 @@ class GpuWorker:
         if stage.type in (StageType.GPU_TEXT_ENCODE, StageType.GPU_DENOISE,
                           StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
             self._gpu.ensure_session_group("sdxl")
-            self._load_sdxl_components(stage, model_dir)
+            self._load_sdxl_components(stage, model_dir, job)
         elif stage.type == StageType.GPU_UPSCALE:
             self._gpu.ensure_session_group("upscale")
             self._load_upscale_model()
@@ -917,9 +917,60 @@ class GpuWorker:
         active_fps = {c.fingerprint for c in stage.required_components}
         self._gpu.add_active_fingerprints(active_fps)
 
-    def _load_sdxl_components(self, stage: WorkStage, model_dir: str | None) -> None:
+    def _trt_covers_component(self, stage: WorkStage, job: InferenceJob,
+                              component) -> bool:
+        """Check if a TRT engine can handle this component for the job's resolution.
+
+        Returns True if PyTorch loading can be skipped because TRT will handle it.
+        Only applies to sdxl_unet (when no LoRAs) and sdxl_vae/sdxl_vae_enc.
+        """
+        inp = job.sdxl_input
+        if inp is None:
+            return False
+
+        # Determine which TRT component type this maps to
+        if component.category == "sdxl_unet":
+            # LoRAs require PyTorch UNet — TRT can't apply adapter weights
+            if inp.loras:
+                return False
+            trt_component = "unet"
+        elif component.category in ("sdxl_vae", "sdxl_vae_enc"):
+            trt_component = "vae"
+        else:
+            return False  # text encoders etc. — no TRT
+
+        # Determine the resolution this stage will process
+        if stage.type == StageType.GPU_DENOISE:
+            if job.is_hires_pass and job.hires_input:
+                width, height = job.hires_input.hires_width, job.hires_input.hires_height
+            else:
+                width, height = inp.width, inp.height
+        elif stage.type == StageType.GPU_VAE_DECODE:
+            if job.is_hires_pass and job.hires_input:
+                width, height = job.hires_input.hires_width, job.hires_input.hires_height
+            else:
+                width, height = inp.width, inp.height
+        elif stage.type == StageType.GPU_VAE_ENCODE:
+            width, height = inp.width, inp.height
+        else:
+            return False
+
+        try:
+            from trt.builder import has_trt_coverage, get_arch_key
+            from state import app_state
+            cache_dir = app_state.config.server.tensorrt_cache
+            arch_key = get_arch_key(self._gpu.device_id)
+            return has_trt_coverage(
+                cache_dir, component.fingerprint, trt_component, arch_key,
+                width, height)
+        except Exception:
+            return False  # any error → fall back to PyTorch
+
+    def _load_sdxl_components(self, stage: WorkStage, model_dir: str | None,
+                              job: InferenceJob) -> None:
         """Load SDXL sub-model components for a stage.
-        Uses cached models when fingerprints match."""
+        Uses cached models when fingerprints match.  Skips PyTorch models
+        when TRT engines are available for the resolution."""
         # Extract checkpoint name from model_dir for display
         source_name = ""
         if model_dir:
@@ -932,6 +983,10 @@ class GpuWorker:
 
         for component in stage.required_components:
             if self._gpu.is_component_loaded(component.fingerprint):
+                continue
+            # Skip PyTorch model if TRT engine covers this resolution
+            if self._trt_covers_component(stage, job, component):
+                log.debug(f"  Skipping PyTorch {component.category} — TRT engine available")
                 continue
             # Ensure enough VRAM before loading (evicts non-current-group LRU first)
             active_fps = {c.fingerprint for c in stage.required_components}

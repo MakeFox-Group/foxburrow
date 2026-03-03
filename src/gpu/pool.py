@@ -248,6 +248,14 @@ class GpuInstance:
         # Adapters live inside the UNet's PEFT layers; cleared when UNet is evicted
         self._loaded_lora_adapters: dict[str, str] = {}
 
+        # TRT shared device memory pools — one buffer per component type (e.g.
+        # "unet", "vae").  All TRT engines of the same type on this GPU share a
+        # single workspace/activation buffer.  Safe because per-session-key limits
+        # guarantee at most one UNet (or one VAE) executes at a time per GPU.
+        # Each buffer is a torch.Tensor allocated on THIS GPU — no cross-device.
+        self._trt_shared_mem: dict[str, torch.Tensor] = {}
+        self._trt_shared_mem_lock = threading.Lock()
+
         # GPU failure tracking — permanently disables the GPU when a fatal
         # CUDA error corrupts the context (e.g. cudaErrorIllegalAddress / Xid 31)
         self._failed = False
@@ -526,6 +534,46 @@ class GpuInstance:
     def session_cache_count(self) -> int:
         with self._cache_lock:
             return len(self._cache)
+
+    # ---- TRT shared device memory ----
+
+    def get_trt_shared_memory(self, component_type: str, min_bytes: int) -> torch.Tensor:
+        """Get or grow the shared device memory buffer for a TRT component type.
+
+        The buffer is allocated on THIS GPU's device — no cross-GPU VRAM access.
+        If the existing buffer is too small, it is reallocated (grown).
+
+        Args:
+            component_type: "unet" or "vae" — determines which shared pool.
+            min_bytes: Minimum buffer size (engine.device_memory_size).
+
+        Returns:
+            A torch.Tensor of at least *min_bytes* bytes on this GPU.
+        """
+        with self._trt_shared_mem_lock:
+            existing = self._trt_shared_mem.get(component_type)
+            if existing is not None and existing.nbytes >= min_bytes:
+                return existing
+
+            # Allocate on this specific GPU.  torch.empty with uint8 gives us
+            # a raw byte buffer.  device= ensures it lands on the correct card.
+            buf = torch.empty(min_bytes, dtype=torch.uint8, device=self.device)
+            self._trt_shared_mem[component_type] = buf
+
+            old_mb = (existing.nbytes / (1024 * 1024)) if existing is not None else 0
+            new_mb = min_bytes / (1024 * 1024)
+            if existing is not None:
+                log.debug(f"  GPU [{self.uuid}]: TRT shared memory '{component_type}' "
+                          f"grown {old_mb:.0f}MB → {new_mb:.0f}MB")
+            else:
+                log.debug(f"  GPU [{self.uuid}]: TRT shared memory '{component_type}' "
+                          f"allocated {new_mb:.0f}MB")
+            return buf
+
+    def get_trt_shared_memory_vram(self) -> int:
+        """Return total VRAM consumed by TRT shared device memory buffers."""
+        with self._trt_shared_mem_lock:
+            return sum(buf.nbytes for buf in self._trt_shared_mem.values())
 
 
 class GpuPool:
