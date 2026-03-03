@@ -165,7 +165,7 @@ class AdmissionControl:
 
             # Global limit: total pipeline capacity across all GPUs
             num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
-            global_limit = num_active * max(self._PIPELINE_DEPTH.values())
+            global_limit = num_active * max(self._PIPELINE_DEPTH.values(), default=1)
             if self._total >= global_limit:
                 return f"Server at capacity: {self._total}/{global_limit}"
 
@@ -195,7 +195,7 @@ class AdmissionControl:
     def max_concurrent(self) -> int:
         """Current global limit: active_gpus × max pipeline depth."""
         num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
-        return num_active * max(self._PIPELINE_DEPTH.values())
+        return num_active * max(self._PIPELINE_DEPTH.values(), default=1)
 
     def snapshot(self) -> dict:
         """Return current admission state for the status endpoint."""
@@ -210,7 +210,7 @@ class AdmissionControl:
                  * self._PIPELINE_DEPTH.get(cap, 1)
             for cap in sorted(set(self._CAPABILITY_MAP.values()))
         }
-        max_conc = num_active * max(self._PIPELINE_DEPTH.values())
+        max_conc = num_active * max(self._PIPELINE_DEPTH.values(), default=1)
 
         with self._lock:
             return {
