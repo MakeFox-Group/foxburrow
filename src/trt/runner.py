@@ -152,6 +152,7 @@ class TrtUNetRunner:
 
         # Re-query the shared buffer on every call — the pool may have grown
         # it since this runner was created (e.g. a larger engine was loaded).
+        # Keep buf alive as a local — data_ptr() is only valid while the tensor exists.
         if self._shared_memory_getter is not None:
             buf = self._shared_memory_getter(self._device_memory_size)
             ctx.device_memory = buf.data_ptr()
@@ -303,6 +304,7 @@ class TrtVaeRunner:
 
         # Re-query the shared buffer on every call — the pool may have grown
         # it since this runner was created (e.g. a larger engine was loaded).
+        # Keep buf alive as a local — data_ptr() is only valid while the tensor exists.
         if self._shared_memory_getter is not None:
             buf = self._shared_memory_getter(self._device_memory_size)
             ctx.device_memory = buf.data_ptr()
