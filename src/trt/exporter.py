@@ -72,6 +72,147 @@ class _VaeDecoderOnnxWrapper(nn.Module):
         return self.vae.decode(latents).sample
 
 
+class _Te1OnnxWrapper(nn.Module):
+    """Wrapper for CLIP-L text encoder (TE1) ONNX export.
+
+    Extracts ``hidden_states[-2]`` (penultimate layer) which is what SDXL
+    uses for the 768-dim component of the prompt embedding.  Config is
+    patched to always output hidden states so the traced graph includes
+    all transformer layers.
+    """
+
+    def __init__(self, te1: nn.Module):
+        super().__init__()
+        self.te1 = te1
+        te1.config.output_hidden_states = True
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        outputs = self.te1(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.hidden_states[-2]  # [N, 77, 768]
+
+
+class _Te2OnnxWrapper(nn.Module):
+    """Wrapper for CLIP-bigG text encoder (TE2) ONNX export.
+
+    Returns both ``hidden_states[-2]`` (1280-dim component of prompt embedding)
+    and ``text_embeds`` (pooled projection used for SDXL conditioning).
+    """
+
+    def __init__(self, te2: nn.Module):
+        super().__init__()
+        self.te2 = te2
+        te2.config.output_hidden_states = True
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        outputs = self.te2(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.hidden_states[-2], outputs.text_embeds  # [N,77,1280], [N,1280]
+
+
+def export_te1_onnx(
+    te1: nn.Module,
+    output_path: str,
+    opset: int = 17,
+) -> None:
+    """Export CLIP-L text encoder to ONNX in float32.
+
+    Args:
+        te1: A loaded CLIPTextModel (can be on CPU or GPU).
+        output_path: Where to write the .onnx file.
+        opset: ONNX opset version.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    device = torch.device("cpu")
+    te1_cpu = te1.to(device, dtype=torch.float32)
+    te1_cpu.eval()
+
+    wrapper = _Te1OnnxWrapper(te1_cpu)
+
+    dummy_input_ids = torch.zeros(1, 77, dtype=torch.long, device=device)
+    dummy_attention_mask = torch.ones(1, 77, dtype=torch.long, device=device)
+
+    input_names = ["input_ids", "attention_mask"]
+    output_names = ["hidden_states"]
+
+    dynamic_axes = {
+        "input_ids": {0: "batch"},
+        "attention_mask": {0: "batch"},
+        "hidden_states": {0: "batch"},
+    }
+
+    log.info(f"  TRT: Exporting TE1 (CLIP-L) to ONNX (opset {opset})...")
+
+    with _onnx_lock, torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (dummy_input_ids, dummy_attention_mask),
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    log.info(f"  TRT: TE1 ONNX exported ({file_size_mb:.0f}MB): {output_path}")
+
+
+def export_te2_onnx(
+    te2: nn.Module,
+    output_path: str,
+    opset: int = 17,
+) -> None:
+    """Export CLIP-bigG text encoder to ONNX in float32.
+
+    Args:
+        te2: A loaded CLIPTextModelWithProjection (can be on CPU or GPU).
+        output_path: Where to write the .onnx file.
+        opset: ONNX opset version.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    device = torch.device("cpu")
+    te2_cpu = te2.to(device, dtype=torch.float32)
+    te2_cpu.eval()
+
+    wrapper = _Te2OnnxWrapper(te2_cpu)
+
+    dummy_input_ids = torch.zeros(1, 77, dtype=torch.long, device=device)
+    dummy_attention_mask = torch.ones(1, 77, dtype=torch.long, device=device)
+
+    input_names = ["input_ids", "attention_mask"]
+    output_names = ["hidden_states", "text_embeds"]
+
+    dynamic_axes = {
+        "input_ids": {0: "batch"},
+        "attention_mask": {0: "batch"},
+        "hidden_states": {0: "batch"},
+        "text_embeds": {0: "batch"},
+    }
+
+    log.info(f"  TRT: Exporting TE2 (CLIP-bigG) to ONNX (opset {opset})...")
+
+    with _onnx_lock, torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (dummy_input_ids, dummy_attention_mask),
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    log.info(f"  TRT: TE2 ONNX exported ({file_size_mb:.0f}MB): {output_path}")
+
+
 def export_unet_onnx(
     unet: nn.Module,
     output_path: str,

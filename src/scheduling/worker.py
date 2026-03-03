@@ -516,6 +516,10 @@ class GpuWorker:
             source = f" ({m['source']})" if m.get('source') else ""
             log.debug(f"    ├─ {m['category']}{source}: {vram // (1024**2)}MB")
 
+        trt_shared = gpu.get_trt_shared_memory_vram()
+        if trt_shared > 0:
+            log.debug(f"    ├─ TRT shared memory: {trt_shared // (1024**2)}MB")
+
         if torch_ext.HAS_HISTOGRAM:
             hist = torch.cuda.allocation_histogram(gpu.device)
             large_bins = {k: v for k, v in hist.items()
@@ -936,8 +940,24 @@ class GpuWorker:
             trt_component = "unet"
         elif component.category in ("sdxl_vae", "sdxl_vae_enc"):
             trt_component = "vae"
+        elif component.category == "sdxl_te1":
+            trt_component = "te1"
+        elif component.category == "sdxl_te2":
+            trt_component = "te2"
         else:
-            return False  # text encoders etc. — no TRT
+            return False
+
+        # Text encoders don't depend on resolution — just check engine exists
+        if trt_component in ("te1", "te2"):
+            try:
+                from trt.builder import has_trt_coverage, get_arch_key
+                from state import app_state
+                cache_dir = app_state.config.server.tensorrt_cache
+                arch_key = get_arch_key(self._gpu.device_id)
+                return has_trt_coverage(
+                    cache_dir, component.fingerprint, trt_component, arch_key, 0, 0)
+            except Exception:
+                return False
 
         # Determine the resolution this stage will process
         if stage.type == StageType.GPU_DENOISE:

@@ -365,3 +365,277 @@ class TrtVaeRunner:
         self._shared_memory_getter = None
         torch.cuda.empty_cache()
         log.debug(f"  TRT: VAE runner unloaded from {self.device}")
+
+
+class TrtTe1Runner:
+    """TensorRT inference runner for the SDXL CLIP-L text encoder (TE1).
+
+    Input:  input_ids [N,77] int64, attention_mask [N,77] int64
+    Output: hidden_states [N,77,768]
+
+    N is the number of 77-token chunks (typically 1).
+    Uses the same shared_memory_getter pattern as UNet/VAE runners.
+    """
+
+    def __init__(self, engine_path: str, device: torch.device,
+                 shared_memory_getter: Callable[[int], torch.Tensor] | None = None):
+        import tensorrt as trt
+
+        self.device = device
+        self.engine_path = engine_path
+        self._stream = torch.cuda.Stream(device=device)
+        self._shared_memory_getter = shared_memory_getter
+
+        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._runtime = trt.Runtime(self._trt_logger)
+
+        with open(engine_path, "rb") as f:
+            engine_bytes = f.read()
+
+        self._engine = self._runtime.deserialize_cuda_engine(engine_bytes)
+        if self._engine is None:
+            raise RuntimeError(f"Failed to deserialize TRT engine: {engine_path}")
+
+        self._device_memory_size = self._engine.device_memory_size
+
+        if shared_memory_getter is not None:
+            shared_memory_getter(self._device_memory_size)
+            self._context = self._engine.create_execution_context_without_device_memory()
+        else:
+            self._context = self._engine.create_execution_context()
+
+        if self._context is None:
+            raise RuntimeError(f"Failed to create TRT execution context: {engine_path}")
+
+        self._input_dtypes: dict[str, torch.dtype] = {}
+        for name in ("input_ids", "attention_mask"):
+            self._input_dtypes[name] = _trt_dtype_to_torch(self._engine.get_tensor_dtype(name))
+        self._output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("hidden_states"))
+
+        self._output_buffer: torch.Tensor | None = None
+        self._engine_size = os.path.getsize(engine_path)
+
+        engine_mb = self._engine_size / (1024 * 1024)
+        dev_mb = self._device_memory_size / (1024 * 1024)
+        shared_tag = " [shared]" if self._shared_memory_getter is not None else ""
+        log.debug(f"  TRT: TE1 runner loaded ({engine_mb:.0f}MB on disk, "
+                  f"{dev_mb:.0f}MB device mem{shared_tag}, "
+                  f"output={self._output_dtype}) on {device}")
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run TE1 inference through TRT engine.
+
+        Returns hidden_states [N, 77, 768].
+        """
+        ctx = self._context
+        stream_ptr = self._stream.cuda_stream
+
+        if self._shared_memory_getter is not None:
+            buf = self._shared_memory_getter(self._device_memory_size)
+            ctx.device_memory = buf.data_ptr()
+
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        for name in inputs:
+            t = inputs[name]
+            expected = self._input_dtypes[name]
+            if t.dtype != expected:
+                t = t.to(expected)
+            t = t.contiguous()
+            if t.data_ptr() % 8 != 0:
+                t = t.clone()
+            inputs[name] = t
+
+        for name, t in inputs.items():
+            ctx.set_input_shape(name, tuple(t.shape))
+            ctx.set_tensor_address(name, t.data_ptr())
+
+        output_shape = ctx.get_tensor_shape("hidden_states")
+        if (self._output_buffer is None
+                or list(self._output_buffer.shape) != list(output_shape)
+                or self._output_buffer.device != self.device):
+            self._output_buffer = torch.empty(
+                tuple(output_shape), dtype=self._output_dtype, device=self.device)
+
+        ctx.set_tensor_address("hidden_states", self._output_buffer.data_ptr())
+
+        ok = ctx.execute_async_v3(stream_ptr)
+        if not ok:
+            raise RuntimeError("TRT TE1 execute_async_v3 failed")
+
+        self._stream.synchronize()
+        return self._output_buffer.clone()
+
+    @property
+    def vram_usage(self) -> int:
+        buf_bytes = 0
+        if self._output_buffer is not None:
+            buf_bytes = self._output_buffer.nelement() * self._output_buffer.element_size()
+        if self._shared_memory_getter is not None:
+            return self._engine_size + buf_bytes
+        return self._engine_size + self._device_memory_size + buf_bytes
+
+    def unload(self) -> None:
+        if self._context is not None:
+            del self._context
+            self._context = None
+        if self._engine is not None:
+            del self._engine
+            self._engine = None
+        self._runtime = None
+        self._trt_logger = None
+        self._output_buffer = None
+        self._stream = None
+        self._shared_memory_getter = None
+        torch.cuda.empty_cache()
+        log.debug(f"  TRT: TE1 runner unloaded from {self.device}")
+
+
+class TrtTe2Runner:
+    """TensorRT inference runner for the SDXL CLIP-bigG text encoder (TE2).
+
+    Input:  input_ids [N,77] int64, attention_mask [N,77] int64
+    Output: hidden_states [N,77,1280], text_embeds [N,1280]
+
+    Two outputs — hidden_states[-2] for the 1280-dim embedding component,
+    and text_embeds (pooled projection) for SDXL conditioning.
+    """
+
+    def __init__(self, engine_path: str, device: torch.device,
+                 shared_memory_getter: Callable[[int], torch.Tensor] | None = None):
+        import tensorrt as trt
+
+        self.device = device
+        self.engine_path = engine_path
+        self._stream = torch.cuda.Stream(device=device)
+        self._shared_memory_getter = shared_memory_getter
+
+        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._runtime = trt.Runtime(self._trt_logger)
+
+        with open(engine_path, "rb") as f:
+            engine_bytes = f.read()
+
+        self._engine = self._runtime.deserialize_cuda_engine(engine_bytes)
+        if self._engine is None:
+            raise RuntimeError(f"Failed to deserialize TRT engine: {engine_path}")
+
+        self._device_memory_size = self._engine.device_memory_size
+
+        if shared_memory_getter is not None:
+            shared_memory_getter(self._device_memory_size)
+            self._context = self._engine.create_execution_context_without_device_memory()
+        else:
+            self._context = self._engine.create_execution_context()
+
+        if self._context is None:
+            raise RuntimeError(f"Failed to create TRT execution context: {engine_path}")
+
+        self._input_dtypes: dict[str, torch.dtype] = {}
+        for name in ("input_ids", "attention_mask"):
+            self._input_dtypes[name] = _trt_dtype_to_torch(self._engine.get_tensor_dtype(name))
+        self._hs_output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("hidden_states"))
+        self._te_output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("text_embeds"))
+
+        self._hs_buffer: torch.Tensor | None = None
+        self._te_buffer: torch.Tensor | None = None
+        self._engine_size = os.path.getsize(engine_path)
+
+        engine_mb = self._engine_size / (1024 * 1024)
+        dev_mb = self._device_memory_size / (1024 * 1024)
+        shared_tag = " [shared]" if self._shared_memory_getter is not None else ""
+        log.debug(f"  TRT: TE2 runner loaded ({engine_mb:.0f}MB on disk, "
+                  f"{dev_mb:.0f}MB device mem{shared_tag}, "
+                  f"hs_out={self._hs_output_dtype}, te_out={self._te_output_dtype}) on {device}")
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run TE2 inference through TRT engine.
+
+        Returns (hidden_states [N,77,1280], text_embeds [N,1280]).
+        """
+        ctx = self._context
+        stream_ptr = self._stream.cuda_stream
+
+        if self._shared_memory_getter is not None:
+            buf = self._shared_memory_getter(self._device_memory_size)
+            ctx.device_memory = buf.data_ptr()
+
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        for name in inputs:
+            t = inputs[name]
+            expected = self._input_dtypes[name]
+            if t.dtype != expected:
+                t = t.to(expected)
+            t = t.contiguous()
+            if t.data_ptr() % 8 != 0:
+                t = t.clone()
+            inputs[name] = t
+
+        for name, t in inputs.items():
+            ctx.set_input_shape(name, tuple(t.shape))
+            ctx.set_tensor_address(name, t.data_ptr())
+
+        # Allocate or reuse hidden_states output buffer
+        hs_shape = ctx.get_tensor_shape("hidden_states")
+        if (self._hs_buffer is None
+                or list(self._hs_buffer.shape) != list(hs_shape)
+                or self._hs_buffer.device != self.device):
+            self._hs_buffer = torch.empty(
+                tuple(hs_shape), dtype=self._hs_output_dtype, device=self.device)
+
+        # Allocate or reuse text_embeds output buffer
+        te_shape = ctx.get_tensor_shape("text_embeds")
+        if (self._te_buffer is None
+                or list(self._te_buffer.shape) != list(te_shape)
+                or self._te_buffer.device != self.device):
+            self._te_buffer = torch.empty(
+                tuple(te_shape), dtype=self._te_output_dtype, device=self.device)
+
+        ctx.set_tensor_address("hidden_states", self._hs_buffer.data_ptr())
+        ctx.set_tensor_address("text_embeds", self._te_buffer.data_ptr())
+
+        ok = ctx.execute_async_v3(stream_ptr)
+        if not ok:
+            raise RuntimeError("TRT TE2 execute_async_v3 failed")
+
+        self._stream.synchronize()
+        return self._hs_buffer.clone(), self._te_buffer.clone()
+
+    @property
+    def vram_usage(self) -> int:
+        buf_bytes = 0
+        for b in (self._hs_buffer, self._te_buffer):
+            if b is not None:
+                buf_bytes += b.nelement() * b.element_size()
+        if self._shared_memory_getter is not None:
+            return self._engine_size + buf_bytes
+        return self._engine_size + self._device_memory_size + buf_bytes
+
+    def unload(self) -> None:
+        if self._context is not None:
+            del self._context
+            self._context = None
+        if self._engine is not None:
+            del self._engine
+            self._engine = None
+        self._runtime = None
+        self._trt_logger = None
+        self._hs_buffer = None
+        self._te_buffer = None
+        self._stream = None
+        self._shared_memory_getter = None
+        torch.cuda.empty_cache()
+        log.debug(f"  TRT: TE2 runner unloaded from {self.device}")

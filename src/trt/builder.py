@@ -109,6 +109,71 @@ def _parse_onnx(parser, onnx_path: str) -> bool:
         return False
 
 
+def build_te_engine(
+    onnx_path: str,
+    engine_path: str,
+    component_type: str,
+    device_id: int,
+    max_workspace_gb: float = 0,
+) -> bool:
+    """Build a TensorRT engine for a text encoder (TE1 or TE2).
+
+    Text encoders have no spatial dimensions — only the batch axis
+    (number of 77-token chunks) is dynamic, ranging from 1 to 4.
+    A single engine per text encoder covers all use cases.
+
+    Args:
+        onnx_path: Path to the ONNX model file.
+        engine_path: Where to write the serialized engine.
+        component_type: "te1" or "te2".
+        device_id: CUDA device index to build on.
+        max_workspace_gb: Maximum workspace size in GB.
+
+    Returns:
+        True if engine was built successfully, False on failure.
+    """
+    import tensorrt as trt
+
+    os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    try:
+        explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    except AttributeError:
+        explicit_batch_flag = 0
+    network = builder.create_network(explicit_batch_flag)
+    parser = trt.OnnxParser(network, logger)
+
+    config = None
+    try:
+        log.info(f"  TRT: Parsing ONNX for {component_type} (text encoder)...")
+
+        if not _parse_onnx(parser, onnx_path):
+            return False
+
+        config = builder.create_builder_config()
+        config.set_flag(trt.BuilderFlag.GPU_FALLBACK)
+        config.set_flag(trt.BuilderFlag.FP16)
+
+        profile = builder.create_optimization_profile()
+
+        # Dynamic batch: 1 to 4 chunks, seq_len fixed at 77
+        profile.set_shape("input_ids",      (1, 77), (1, 77), (4, 77))
+        profile.set_shape("attention_mask",  (1, 77), (1, 77), (4, 77))
+
+        config.add_optimization_profile(profile)
+
+        return _do_build(builder, network, config, engine_path, component_type,
+                         "text encoder", device_id, max_workspace_gb)
+    finally:
+        del parser, network, builder
+        if config is not None:
+            del config
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 def build_static_engine(
     onnx_path: str,
     engine_path: str,
@@ -404,7 +469,14 @@ def has_trt_coverage(
 
     Returns True if a static engine exists for the exact resolution OR
     a dynamic engine exists whose range covers the resolution.
+    For text encoders (te1/te2), resolution is irrelevant — just check
+    if the single "default" engine exists.
     """
+    # Text encoders: no spatial dimensions, single engine per component
+    if component_type in ("te1", "te2"):
+        return os.path.isfile(
+            get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, "default"))
+
     # Static exact match
     if os.path.isfile(get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)):
         return True
@@ -424,6 +496,11 @@ def all_engines_exist(
     arch_key: str,
 ) -> bool:
     """Check if all required engines (static + dynamic) exist for a component."""
+    # Text encoders: single "default" engine per component
+    if component_type in ("te1", "te2"):
+        return os.path.isfile(
+            get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, "default"))
+
     for w, h in _get_static_resolutions(component_type):
         path = get_engine_path(cache_dir, model_hash, component_type, arch_key, w, h)
         if not os.path.isfile(path):
@@ -456,17 +533,35 @@ def build_all_engines(
     Returns:
         Dict mapping component_type -> list of successfully built engine labels.
     """
-    results: dict[str, list[str]] = {"unet": [], "vae": []}
+    results: dict[str, list[str]] = {"unet": [], "vae": [], "te1": [], "te2": []}
 
     # Set CUDA device for the entire build pipeline — TRT's Builder and
     # OnnxParser bind to the current CUDA context at creation time.
     # Without this, parallel builds on different GPUs all target device 0,
     # causing memory contention and corrupt parser state.
     with torch.cuda.device(device_id):
-        for component_type in ("unet", "vae"):
+        for component_type in ("te1", "te2", "unet", "vae"):
             onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
             if not os.path.isfile(onnx_path):
                 log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")
+                continue
+
+            # Text encoders: single engine per component (dynamic batch only)
+            if component_type in ("te1", "te2"):
+                te_path = get_dynamic_engine_path(
+                    cache_dir, model_hash, component_type, arch_key, "default")
+                if os.path.isfile(te_path):
+                    log.debug(f"  TRT: TE engine exists, skipping: {component_type}")
+                    results[component_type].append("default")
+                else:
+                    ok = build_te_engine(
+                        onnx_path=onnx_path,
+                        engine_path=te_path,
+                        component_type=component_type,
+                        device_id=device_id,
+                    )
+                    if ok:
+                        results[component_type].append("default")
                 continue
 
             # Static engines for all configured resolutions

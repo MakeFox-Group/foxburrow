@@ -486,37 +486,55 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     _tracer = get_current_tracer()
     _model_name = _get_model_name(job)
 
-    # Get models from GPU cache
-    te1 = _get_cached_model(gpu, "sdxl_te1", job)
-    te2 = _get_cached_model(gpu, "sdxl_te2", job)
-
     device = gpu.device
+
+    # Try TRT text encoders first
+    trt_te1 = _get_trt_te1_runner(gpu, job)
+    trt_te2 = _get_trt_te2_runner(gpu, job)
+    use_trt = trt_te1 is not None and trt_te2 is not None
+
+    if use_trt:
+        log.debug(f"  SDXL: Using TRT text encoders")
+        run_te1 = lambda ids, masks: _run_trt_te1(trt_te1, ids, masks, device)
+        run_te2 = lambda ids, masks: _run_trt_te2(trt_te2, ids, masks, device)
+    else:
+        # Fall back to PyTorch models
+        te1 = _get_cached_model_optional(gpu, "sdxl_te1", job)
+        te2 = _get_cached_model_optional(gpu, "sdxl_te2", job)
+        if te1 is None or te2 is None:
+            # PyTorch models not cached (TRT was expected but failed) — load fallback
+            log.warning(f"  SDXL: TRT unavailable and TE not cached — loading PyTorch fallback")
+            te1 = te1 or load_component("sdxl_te1", inp.model_dir, device)
+            te2 = te2 or load_component("sdxl_te2", inp.model_dir, device)
+        run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
+        run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
     _te_start = _time.monotonic()
 
     # TextEncoder1: hidden states [1, 77*N, 768]
     _t = _time.monotonic()
-    p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
+    p_h1 = run_te1(tok.prompt_tokens_1, tok.prompt_mask_1)
     if _tracer:
         _tracer.text_encode(job.job_id, _model_name, "te1", n_chunks, "prompt", _time.monotonic() - _t)
     _t = _time.monotonic()
-    n_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
+    n_h1 = run_te1(tok.neg_tokens_1, tok.neg_mask_1)
     if _tracer:
         _tracer.text_encode(job.job_id, _model_name, "te1", n_neg_chunks_1, "negative", _time.monotonic() - _t)
 
     # TextEncoder2: hidden states [1, 77*N, 1280] + pooled [1, 1280]
     _t = _time.monotonic()
-    p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
+    p_h2, p_pooled = run_te2(tok.prompt_tokens_2, tok.prompt_mask_2)
     if _tracer:
         _tracer.text_encode(job.job_id, _model_name, "te2", n_chunks, "prompt", _time.monotonic() - _t)
     _t = _time.monotonic()
-    n_h2, n_pooled = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
+    n_h2, n_pooled = run_te2(tok.neg_tokens_2, tok.neg_mask_2)
     if _tracer:
         _tracer.text_encode(job.job_id, _model_name, "te2", n_neg_chunks_2, "negative", _time.monotonic() - _t)
 
     _te_elapsed = _time.monotonic() - _te_start
+    _backend = "TRT" if use_trt else "PyTorch"
     log.debug(f"  SDXL: Encoder forward passes took {_te_elapsed:.3f}s "
-              f"({n_chunks} chunks, 4 passes)")
+              f"({n_chunks} chunks, 4 passes, {_backend})")
 
     # Apply emphasis weights to hidden states (not pooled) — flatten chunk weights
     _apply_token_weights(p_h1, _flatten_chunks(tok.prompt_weights_1))
@@ -557,17 +575,34 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
     log.debug(f"  SDXL: Running regional text encoders ({len(region_toks)} regions)...")
 
-    te1 = _get_cached_model(gpu, "sdxl_te1", job)
-    te2 = _get_cached_model(gpu, "sdxl_te2", job)
     device = gpu.device
+
+    # Try TRT text encoders first
+    trt_te1 = _get_trt_te1_runner(gpu, job)
+    trt_te2 = _get_trt_te2_runner(gpu, job)
+    use_trt = trt_te1 is not None and trt_te2 is not None
+
+    if use_trt:
+        log.debug(f"  SDXL: Using TRT text encoders (regional)")
+        run_te1 = lambda ids, masks: _run_trt_te1(trt_te1, ids, masks, device)
+        run_te2 = lambda ids, masks: _run_trt_te2(trt_te2, ids, masks, device)
+    else:
+        te1 = _get_cached_model_optional(gpu, "sdxl_te1", job)
+        te2 = _get_cached_model_optional(gpu, "sdxl_te2", job)
+        if te1 is None or te2 is None:
+            log.warning(f"  SDXL: TRT unavailable and TE not cached — loading PyTorch fallback (regional)")
+            te1 = te1 or load_component("sdxl_te1", inp.model_dir, device)
+            te2 = te2 or load_component("sdxl_te2", inp.model_dir, device)
+        run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
+        run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
     region_embeds: list[torch.Tensor] = []
     first_pooled = None
 
     for i, tok in enumerate(region_toks):
         # Encode this region's prompt
-        p_h1 = _run_text_encoder_1(te1, tok.prompt_tokens_1, tok.prompt_mask_1, device)
-        p_h2, p_pooled = _run_text_encoder_2(te2, tok.prompt_tokens_2, tok.prompt_mask_2, device)
+        p_h1 = run_te1(tok.prompt_tokens_1, tok.prompt_mask_1)
+        p_h2, p_pooled = run_te2(tok.prompt_tokens_2, tok.prompt_mask_2)
 
         _apply_token_weights(p_h1, _flatten_chunks(tok.prompt_weights_1))
         _apply_token_weights(p_h2, _flatten_chunks(tok.prompt_weights_2))
@@ -582,8 +617,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     shared_neg_tok = job.regional_shared_neg_tokenize
     if shared_neg_tok is None:
         raise RuntimeError("regional_shared_neg_tokenize is required for regional text encoding.")
-    n_h1 = _run_text_encoder_1(te1, shared_neg_tok.neg_tokens_1, shared_neg_tok.neg_mask_1, device)
-    n_h2, n_pooled = _run_text_encoder_2(te2, shared_neg_tok.neg_tokens_2, shared_neg_tok.neg_mask_2, device)
+    n_h1 = run_te1(shared_neg_tok.neg_tokens_1, shared_neg_tok.neg_mask_1)
+    n_h2, n_pooled = run_te2(shared_neg_tok.neg_tokens_2, shared_neg_tok.neg_mask_2)
     _apply_token_weights(n_h1, _flatten_chunks(shared_neg_tok.neg_weights_1))
     _apply_token_weights(n_h2, _flatten_chunks(shared_neg_tok.neg_weights_2))
     neg_embeds = torch.cat([n_h1, n_h2], dim=2)
@@ -593,8 +628,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     if regional.has_per_region_neg:
         neg_region_embeds = []
         for tok in region_toks:
-            nr_h1 = _run_text_encoder_1(te1, tok.neg_tokens_1, tok.neg_mask_1, device)
-            nr_h2, _ = _run_text_encoder_2(te2, tok.neg_tokens_2, tok.neg_mask_2, device)
+            nr_h1 = run_te1(tok.neg_tokens_1, tok.neg_mask_1)
+            nr_h2, _ = run_te2(tok.neg_tokens_2, tok.neg_mask_2)
             _apply_token_weights(nr_h1, _flatten_chunks(tok.neg_weights_1))
             _apply_token_weights(nr_h2, _flatten_chunks(tok.neg_weights_2))
             neg_region_embeds.append(torch.cat([nr_h1, nr_h2], dim=2))
@@ -605,8 +640,8 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     base_pooled = None
     if regional.base_prompt and job.regional_base_tokenize is not None:
         bt = job.regional_base_tokenize
-        b_h1 = _run_text_encoder_1(te1, bt.prompt_tokens_1, bt.prompt_mask_1, device)
-        b_h2, b_pooled = _run_text_encoder_2(te2, bt.prompt_tokens_2, bt.prompt_mask_2, device)
+        b_h1 = run_te1(bt.prompt_tokens_1, bt.prompt_mask_1)
+        b_h2, b_pooled = run_te2(bt.prompt_tokens_2, bt.prompt_mask_2)
         _apply_token_weights(b_h1, _flatten_chunks(bt.prompt_weights_1))
         _apply_token_weights(b_h2, _flatten_chunks(bt.prompt_weights_2))
         base_embeds = torch.cat([b_h1, b_h2], dim=2)
@@ -2338,6 +2373,119 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
                 log.warning(f"  TRT: Failed to load VAE {label} engine: {ex}")
 
     return None
+
+
+def _get_trt_te1_runner(gpu: "GpuInstance", job: InferenceJob):
+    """Try to get a TRT TE1 (CLIP-L) runner.
+
+    Text encoders have a single "default" engine (no resolution variants).
+    Returns a TrtTe1Runner or None to fall back to PyTorch.
+    """
+    from trt.builder import get_arch_key, get_dynamic_engine_path
+    from trt.runner import TrtTe1Runner
+
+    fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te1")
+    if not fp:
+        return None
+
+    arch_key = get_arch_key(gpu.device_id)
+
+    from state import app_state
+    cache_dir = app_state.config.server.tensorrt_cache
+
+    engine_path = get_dynamic_engine_path(cache_dir, fp, "te1", arch_key, "default")
+    if not os.path.isfile(engine_path):
+        return None
+
+    trt_fp = f"{fp}:te1_trt:default"
+    cached = gpu.get_cached_model(trt_fp)
+    if cached is not None:
+        return cached.model
+
+    try:
+        engine_size = os.path.getsize(engine_path)
+        gpu.ensure_free_vram(engine_size, protect={trt_fp})
+        te_getter = lambda min_bytes: gpu.get_trt_shared_memory("te", min_bytes)
+        runner = TrtTe1Runner(engine_path, gpu.device, shared_memory_getter=te_getter)
+        gpu.cache_model(
+            trt_fp, "sdxl_te1_trt", runner,
+            estimated_vram=runner.vram_usage,
+            source="TRT-TE1",
+            evict_callback=runner.unload,
+        )
+        log.debug(f"  TRT: Loaded TE1 runner on GPU [{gpu.uuid}]")
+        return runner
+    except Exception as ex:
+        log.warning(f"  TRT: Failed to load TE1 engine: {ex}")
+        return None
+
+
+def _get_trt_te2_runner(gpu: "GpuInstance", job: InferenceJob):
+    """Try to get a TRT TE2 (CLIP-bigG) runner.
+
+    Returns a TrtTe2Runner or None to fall back to PyTorch.
+    """
+    from trt.builder import get_arch_key, get_dynamic_engine_path
+    from trt.runner import TrtTe2Runner
+
+    fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te2")
+    if not fp:
+        return None
+
+    arch_key = get_arch_key(gpu.device_id)
+
+    from state import app_state
+    cache_dir = app_state.config.server.tensorrt_cache
+
+    engine_path = get_dynamic_engine_path(cache_dir, fp, "te2", arch_key, "default")
+    if not os.path.isfile(engine_path):
+        return None
+
+    trt_fp = f"{fp}:te2_trt:default"
+    cached = gpu.get_cached_model(trt_fp)
+    if cached is not None:
+        return cached.model
+
+    try:
+        engine_size = os.path.getsize(engine_path)
+        gpu.ensure_free_vram(engine_size, protect={trt_fp})
+        te_getter = lambda min_bytes: gpu.get_trt_shared_memory("te", min_bytes)
+        runner = TrtTe2Runner(engine_path, gpu.device, shared_memory_getter=te_getter)
+        gpu.cache_model(
+            trt_fp, "sdxl_te2_trt", runner,
+            estimated_vram=runner.vram_usage,
+            source="TRT-TE2",
+            evict_callback=runner.unload,
+        )
+        log.debug(f"  TRT: Loaded TE2 runner on GPU [{gpu.uuid}]")
+        return runner
+    except Exception as ex:
+        log.warning(f"  TRT: Failed to load TE2 engine: {ex}")
+        return None
+
+
+def _run_trt_te1(
+    runner, chunks_ids: list[list[int]], chunks_masks: list[list[int]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Run TRT TE1 over multiple chunks (batched).
+    Returns hidden states [1, 77*N, 768]."""
+    input_ids = torch.tensor(chunks_ids, dtype=torch.long, device=device)        # [N, 77]
+    attention_mask = torch.tensor(chunks_masks, dtype=torch.long, device=device)  # [N, 77]
+    hidden = runner.run(input_ids, attention_mask)  # [N, 77, 768]
+    return hidden.reshape(1, -1, hidden.shape[-1])  # [1, 77*N, 768]
+
+
+def _run_trt_te2(
+    runner, chunks_ids: list[list[int]], chunks_masks: list[list[int]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run TRT TE2 over multiple chunks (batched).
+    Returns (hidden_states [1,77*N,1280], pooled [1,1280] from first chunk)."""
+    input_ids = torch.tensor(chunks_ids, dtype=torch.long, device=device)        # [N, 77]
+    attention_mask = torch.tensor(chunks_masks, dtype=torch.long, device=device)  # [N, 77]
+    hidden, text_embeds = runner.run(input_ids, attention_mask)  # [N,77,1280], [N,1280]
+    return hidden.reshape(1, -1, hidden.shape[-1]), text_embeds[0:1]  # [1,77*N,1280], [1,1280]
 
 
 def _get_cached_model(gpu: GpuInstance, category: str,
