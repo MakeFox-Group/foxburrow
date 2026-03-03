@@ -1,12 +1,18 @@
-"""Background TRT build manager.
+"""Background TRT build manager — pipelined architecture.
 
 Scans registered SDXL models, exports missing ONNX files, and builds
-TRT engines on drained GPUs.  Runs as an asyncio task alongside the
-scheduler, coordinating GPU access through the drain mechanism.
+TRT engines on drained GPUs.  Runs as a set of asyncio tasks alongside
+the scheduler, coordinating GPU access through the drain mechanism.
 
-Two-phase pipeline:
-  Phase 1 — ONNX export (CPU-bound, parallelized via thread pool)
-  Phase 2 — Engine build (GPU-bound, drain once per batch, sequential)
+Three-layer pipeline:
+  Layer 1 — ONNX export coordinator (CPU-bound, parallelized via thread pool)
+  Layer 2 — Per-architecture coordinators (drain GPUs on-demand as ONNX completes)
+  Layer 3 — Per-GPU build loops (pull from arch queue, build engines, linger, release)
+
+Key improvement over the old two-phase batch approach:
+  - ONNX exports feed directly into per-architecture build queues
+  - GPUs drain on-demand only when work arrives for their architecture
+  - Remaining GPUs stay available for inference throughout the build cycle
 """
 
 from __future__ import annotations
@@ -31,6 +37,14 @@ from trt.exporter import export_te1_onnx, export_te2_onnx, export_unet_onnx, exp
 if TYPE_CHECKING:
     from scheduling.worker import GpuWorker
 
+# Seconds a GPU lingers after finishing a build, waiting for more work
+# before releasing the drain.  Avoids repeated drain/release cycles when
+# ONNX exports complete in quick succession.
+_BUILD_LINGER_TIMEOUT = 5.0
+
+# Seconds between arch coordinator drain-escalation checks.
+_ARCH_CHECK_INTERVAL = 3.0
+
 
 class TrtBuildManager:
     """Manages background ONNX export and TRT engine compilation.
@@ -39,14 +53,12 @@ class TrtBuildManager:
     any missing engines.  When new models are registered at runtime (via
     filesystem watcher), they can be queued via ``queue_model()``.
 
-    Build flow (batched):
-    1. Collect all pending models from the queue
-    2. Export to ONNX in parallel (CPU work, thread pool)
-    3. For each unique GPU architecture in the pool:
-       a. Request a GPU of that arch to drain (once per batch)
-       b. Build engines for ALL models that have ONNX ready
-       c. Release the GPU back to the scheduler
-    4. Mark successful models as "TRT ready"
+    Pipeline flow:
+    1. ``queue_model()`` / ``scan_and_queue()`` → ``_export_queue``
+    2. ``_export_coordinator`` pulls from queue, exports ONNX in parallel
+    3. Completed ONNX → per-architecture build queues
+    4. ``_arch_coordinator(arch)`` drains GPUs on-demand, spawns build loops
+    5. ``_gpu_build_loop(worker)`` builds engines, lingers, releases GPU
     """
 
     def __init__(
@@ -58,61 +70,62 @@ class TrtBuildManager:
     ):
         self._cache_dir = os.path.abspath(cache_dir)
         self._workers = workers
-        self._task: asyncio.Task | None = None
-        self._build_queue: asyncio.Queue[_BuildRequest] = asyncio.Queue()
-        self._ready_models: set[str] = set()  # model_hashes with all engines built
-        self._lock = threading.Lock()
         self._one_at_a_time = one_at_a_time
+        self._ready_models: set[str] = set()
+        self._queued_models: set[str] = set()
+        self._lock = threading.Lock()
 
         # Thread pool for parallel ONNX export (CPU-bound).
-        # 0 = auto: use fingerprint threads config (resolved by caller).
         if export_threads <= 0:
             from config import _auto_threads
             export_threads = _auto_threads(0, 8)
         self._export_pool = ThreadPoolExecutor(
             max_workers=export_threads, thread_name_prefix="trt-export")
         self._export_threads = export_threads
-        self._startup_mode = True  # Use all GPUs in parallel for first batch
+
+        # Layer 1: input queue for models needing export+build
+        self._export_queue: asyncio.Queue[_BuildRequest] = asyncio.Queue()
+
+        # Layer 2: per-architecture build queues and wake events
+        self._arch_queues: dict[str, asyncio.Queue[_BuildRequest]] = {}
+        self._arch_work_available: dict[str, asyncio.Event] = {}
+        self._arch_workers: dict[str, list[GpuWorker]] = {}
+
+        # Precompute arch → workers mapping (stable for process lifetime)
+        for w in workers:
+            if w.gpu.is_failed:
+                continue
+            ak = get_arch_key(w.gpu.device_id)
+            if ak not in self._arch_workers:
+                self._arch_workers[ak] = []
+                self._arch_queues[ak] = asyncio.Queue()
+                self._arch_work_available[ak] = asyncio.Event()
+            self._arch_workers[ak].append(w)
+
+        # Task handles for cleanup
+        self._export_task: asyncio.Task | None = None
+        self._arch_tasks: dict[str, asyncio.Task] = {}
+        self._active_export_tasks: set[asyncio.Task] = set()
 
     def start(self) -> None:
-        """Start the background build loop as an asyncio task."""
-        self._task = asyncio.get_running_loop().create_task(self._run_loop())
-        mode = "one-at-a-time" if self._one_at_a_time else "batched"
+        """Start the pipeline as asyncio tasks."""
+        loop = asyncio.get_running_loop()
+
+        self._export_task = loop.create_task(self._export_coordinator())
+
+        self._arch_tasks = {}
+        for arch_key in self._arch_workers:
+            self._arch_tasks[arch_key] = loop.create_task(
+                self._arch_coordinator(arch_key))
+
+        archs = list(self._arch_workers.keys())
+        gpu_counts = {ak: len(ws) for ak, ws in self._arch_workers.items()}
+        mode = "one-at-a-time" if self._one_at_a_time else "pipelined"
         log.info(f"  TRT: Build manager started (cache: {self._cache_dir}, "
-                 f"export_threads: {self._export_threads}, mode: {mode})")
+                 f"export_threads: {self._export_threads}, mode: {mode}, "
+                 f"architectures: {gpu_counts})")
 
-    async def _run_loop(self) -> None:
-        """Main build loop — batches requests, exports in parallel, builds on GPU."""
-        try:
-            while True:
-                # Block until at least one request arrives
-                first = await self._build_queue.get()
-                batch = [first]
-
-                if self._one_at_a_time:
-                    # Test mode: process one model at a time (export + build)
-                    # so we can verify the pipeline quickly.
-                    pass
-                else:
-                    # Normal mode: drain queue into batch.
-                    # Short sleep lets scan_and_queue() finish queueing all models
-                    # before we start processing (avoids partial first batch).
-                    await asyncio.sleep(0.1)
-                    while not self._build_queue.empty():
-                        try:
-                            batch.append(self._build_queue.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
-
-                try:
-                    await self._process_batch(batch)
-                except Exception as ex:
-                    log.log_exception(ex, "TRT batch processing failed")
-                finally:
-                    for _ in batch:
-                        self._build_queue.task_done()
-        except asyncio.CancelledError:
-            log.debug("  TRT: Build manager stopped")
+    # ── Public API ────────────────────────────────────────────────────
 
     def queue_model(
         self,
@@ -130,8 +143,11 @@ class TrtBuildManager:
         with self._lock:
             if model_hash in self._ready_models:
                 return
+            if model_hash in self._queued_models:
+                return
+            self._queued_models.add(model_hash)
 
-        self._build_queue.put_nowait(_BuildRequest(
+        self._export_queue.put_nowait(_BuildRequest(
             model_hash=model_hash,
             model_dir=model_dir,
             checkpoint_path=checkpoint_path,
@@ -151,10 +167,7 @@ class TrtBuildManager:
         if not self._workers:
             return
 
-        # Determine unique architectures across all workers
-        arch_keys = set()
-        for w in self._workers:
-            arch_keys.add(get_arch_key(w.gpu.device_id))
+        arch_keys = set(self._arch_workers.keys())
 
         queued = 0
         for model_name, model_dir in sdxl_models.items():
@@ -162,15 +175,15 @@ class TrtBuildManager:
                 unet_comp = registry.get_sdxl_unet_component(model_dir)
                 vae_comp = registry.get_sdxl_vae_component(model_dir)
             except (KeyError, RuntimeError, IndexError):
-                continue  # model not yet registered/scanned
+                continue
 
             model_hash = unet_comp.fingerprint
 
-            # Check if all engines (static + dynamic) exist for all architectures
             all_exist = True
             for arch_key in arch_keys:
                 for component_type in ("te1", "te2", "unet", "vae"):
-                    if not all_engines_exist(self._cache_dir, model_hash, component_type, arch_key):
+                    if not all_engines_exist(self._cache_dir, model_hash,
+                                             component_type, arch_key):
                         all_exist = False
                         break
                 if not all_exist:
@@ -190,189 +203,260 @@ class TrtBuildManager:
         else:
             log.info(f"  TRT: All engines up to date")
 
-    async def _build_chunk_on_gpu(
-        self,
-        models: list[_BuildRequest],
-        arch_key: str,
-        device_id: int,
-    ) -> None:
-        """Build engines for a chunk of models on a single GPU.
+    # ── Layer 1: Export Coordinator ───────────────────────────────────
 
-        Used by both startup (parallel across GPUs) and runtime (single GPU)
-        build paths.
-        """
+    async def _export_coordinator(self) -> None:
+        """Continuously pulls models from _export_queue, runs ONNX export,
+        and feeds completed models into per-architecture build queues."""
+        try:
+            while True:
+                request = await self._export_queue.get()
+                # Fire off the export+dispatch as a concurrent task so
+                # multiple exports can run in parallel (bounded by thread pool)
+                task = asyncio.get_running_loop().create_task(
+                    self._handle_export(request))
+                self._active_export_tasks.add(task)
+                task.add_done_callback(self._active_export_tasks.discard)
+                task.add_done_callback(self._on_export_done)
+        except asyncio.CancelledError:
+            log.debug("  TRT: Export coordinator stopped")
+
+    async def _handle_export(self, request: _BuildRequest) -> None:
+        """Export a single model to ONNX (if needed), then dispatch to arch queues."""
+        short_hash = request.model_hash[:16]
         loop = asyncio.get_running_loop()
-        for i, req in enumerate(models):
-            short_hash = req.model_hash[:16]
-            log.info(f"  TRT: [GPU {device_id}] Building {short_hash} "
-                     f"[{i + 1}/{len(models)}]...")
+
+        # Check if ONNX files already exist (skip export if so)
+        missing_onnx = False
+        for ct in ("te1", "te2", "unet", "vae"):
+            if not os.path.isfile(get_onnx_path(self._cache_dir, request.model_hash, ct)):
+                missing_onnx = True
+                break
+
+        if missing_onnx:
             try:
-                results = await loop.run_in_executor(
-                    None,
-                    build_all_engines,
-                    req.model_hash,
-                    self._cache_dir,
-                    arch_key,
-                    device_id,
-                )
-                built_te1 = results.get("te1", [])
-                built_te2 = results.get("te2", [])
-                built_unet = results.get("unet", [])
-                built_vae = results.get("vae", [])
-                log.info(f"  TRT: {short_hash}: "
-                         f"TE1 [{', '.join(built_te1)}] + "
-                         f"TE2 [{', '.join(built_te2)}] + "
-                         f"UNet [{', '.join(built_unet)}] + "
-                         f"VAE [{', '.join(built_vae)}]")
+                await loop.run_in_executor(
+                    self._export_pool, self._do_export, request)
             except Exception as ex:
-                log.log_exception(
-                    ex, f"TRT: Engine build failed for {short_hash}")
+                log.log_exception(ex, f"TRT: ONNX export failed for {short_hash}")
+                with self._lock:
+                    self._queued_models.discard(request.model_hash)
+                return
 
-    async def _process_batch(self, batch: list[_BuildRequest]) -> None:
-        """Process a batch of models: parallel ONNX export, then batched engine build."""
-        log.info(f"  TRT: Processing batch of {len(batch)} model(s)...")
-
-        # ── Phase 1: Parallel ONNX export (CPU-bound) ────────────────────
-        needs_export = []
-        for req in batch:
-            missing_onnx = False
-            for ct in ("te1", "te2", "unet", "vae"):
-                if not os.path.isfile(get_onnx_path(self._cache_dir, req.model_hash, ct)):
-                    missing_onnx = True
-                    break
-            if missing_onnx:
-                needs_export.append(req)
-
-        if needs_export:
-            log.info(f"  TRT: Exporting ONNX for {len(needs_export)} model(s) "
-                     f"({self._export_threads} threads)...")
-            loop = asyncio.get_running_loop()
-            export_tasks = []
-            for req in needs_export:
-                export_tasks.append(
-                    loop.run_in_executor(self._export_pool, self._do_export, req))
-            results = await asyncio.gather(*export_tasks, return_exceptions=True)
-            for req, result in zip(needs_export, results):
-                if isinstance(result, Exception):
-                    log.log_exception(
-                        result, f"TRT: ONNX export failed for {req.model_hash[:16]}")
-
-        # ── Phase 2: Batched engine build (GPU-bound) ────────────────────
-        # Filter to models that have at least a UNet ONNX (required minimum)
-        buildable = []
-        for req in batch:
-            unet_onnx = get_onnx_path(self._cache_dir, req.model_hash, "unet")
-            if os.path.isfile(unet_onnx):
-                buildable.append(req)
-            else:
-                log.warning(f"  TRT: No UNet ONNX for {req.model_hash[:16]} — skipping build")
-
-        if not buildable:
-            log.warning("  TRT: No models ready for engine building")
+        # Verify UNet ONNX exists (required minimum for building)
+        unet_onnx = get_onnx_path(self._cache_dir, request.model_hash, "unet")
+        if not os.path.isfile(unet_onnx):
+            log.warning(f"  TRT: No UNet ONNX for {short_hash} after export — skipping")
+            with self._lock:
+                self._queued_models.discard(request.model_hash)
             return
 
-        # Determine unique GPU architectures
-        arch_workers: dict[str, GpuWorker] = {}
-        for w in self._workers:
-            if w.gpu.is_failed:
-                continue
-            ak = get_arch_key(w.gpu.device_id)
-            if ak not in arch_workers:
-                arch_workers[ak] = w
-
-        for arch_key in arch_workers:
-            # Find models that need engines for this arch
-            needs_build = []
-            for req in buildable:
-                missing = False
-                for component_type in ("te1", "te2", "unet", "vae"):
-                    onnx = get_onnx_path(self._cache_dir, req.model_hash, component_type)
-                    if not os.path.isfile(onnx):
-                        continue
-                    if not all_engines_exist(self._cache_dir, req.model_hash,
-                                             component_type, arch_key):
-                        missing = True
-                        break
-                if missing:
-                    needs_build.append(req)
-
-            if not needs_build:
-                log.debug(f"  TRT: All {arch_key} engines exist — no build needed")
-                continue
-
-            if self._startup_mode:
-                # ── Startup: drain ALL GPUs of this arch, build in parallel ──
-                arch_group = [w for w in self._workers
-                              if not w.gpu.is_failed
-                              and get_arch_key(w.gpu.device_id) == arch_key]
-
-                log.info(f"  TRT: Startup mode — draining {len(arch_group)} GPU(s) "
-                         f"for {arch_key} engine build ({len(needs_build)} models)...")
-
-                for w in arch_group:
-                    await w.request_drain()
-
-                try:
-                    log.info(f"  TRT: All {len(arch_group)} GPU(s) drained — "
-                             f"building {len(needs_build)} model(s) in parallel")
-
-                    # Round-robin split across GPUs
-                    chunks: list[list[_BuildRequest]] = [[] for _ in arch_group]
-                    for i, req in enumerate(needs_build):
-                        chunks[i % len(arch_group)].append(req)
-
-                    await asyncio.gather(*[
-                        self._build_chunk_on_gpu(chunk, arch_key, w.gpu.device_id)
-                        for w, chunk in zip(arch_group, chunks) if chunk
-                    ])
-                finally:
-                    for w in arch_group:
-                        await w.release_drain()
-                    log.info(f"  TRT: All {len(arch_group)} GPU(s) released from drain")
-
-                self._startup_mode = False
-            else:
-                # ── Runtime: drain a single GPU, build sequentially ──────────
-                worker = arch_workers[arch_key]
-                log.info(f"  TRT: Requesting drain on GPU [{worker.gpu.uuid}] "
-                         f"for {arch_key} engine build ({len(needs_build)} models)...")
-
-                try:
-                    await worker.request_drain()
-                    log.info(f"  TRT: GPU [{worker.gpu.uuid}] drained — building "
-                             f"{len(needs_build)} model(s)")
-
-                    await self._build_chunk_on_gpu(
-                        needs_build, arch_key, worker.gpu.device_id)
-                finally:
-                    await worker.release_drain()
-                    log.info(f"  TRT: GPU [{worker.gpu.uuid}] released from drain")
-
-        # ── Mark ready models ─────────────────────────────────────────────
-        for req in buildable:
-            model_hash = req.model_hash
-            all_built = True
-            for arch_key in arch_workers:
-                for component_type in ("te1", "te2", "unet", "vae"):
-                    onnx = get_onnx_path(self._cache_dir, model_hash, component_type)
-                    if not os.path.isfile(onnx):
-                        all_built = False
-                        break
-                    if not all_engines_exist(self._cache_dir, model_hash,
-                                             component_type, arch_key):
-                        all_built = False
-                        break
-                if not all_built:
+        # Dispatch to per-architecture build queues
+        dispatched = False
+        for arch_key in self._arch_workers:
+            needs_build = False
+            for component_type in ("te1", "te2", "unet", "vae"):
+                onnx = get_onnx_path(self._cache_dir, request.model_hash, component_type)
+                if not os.path.isfile(onnx):
+                    continue
+                if not all_engines_exist(self._cache_dir, request.model_hash,
+                                         component_type, arch_key):
+                    needs_build = True
                     break
 
-            short_hash = model_hash[:16]
-            if all_built:
-                with self._lock:
-                    self._ready_models.add(model_hash)
-                log.info(f"  TRT: Model {short_hash} — all engines ready")
-            else:
-                log.warning(f"  TRT: Model {short_hash} — some engines failed, "
-                            f"will retry on next startup")
+            if needs_build:
+                self._arch_queues[arch_key].put_nowait(request)
+                self._arch_work_available[arch_key].set()
+                dispatched = True
+                log.debug(f"  TRT: {short_hash} → {arch_key} build queue")
+
+        if not dispatched:
+            # All engines already exist for all architectures
+            self._check_model_ready(request.model_hash)
+            log.debug(f"  TRT: {short_hash} — all engines already exist, no build needed")
+
+    @staticmethod
+    def _on_export_done(task: asyncio.Task) -> None:
+        """Callback for fire-and-forget export tasks — log unhandled exceptions."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.log_exception(exc, "TRT: Unhandled error in export task")
+
+    # ── Layer 2: Per-Architecture Coordinator ─────────────────────────
+
+    async def _arch_coordinator(self, arch_key: str) -> None:
+        """Sleeps until work arrives for this architecture, then manages
+        GPU drain escalation and build loop lifecycle."""
+        queue = self._arch_queues[arch_key]
+        wake = self._arch_work_available[arch_key]
+        all_workers = self._arch_workers[arch_key]
+
+        try:
+            while True:
+                await wake.wait()
+                wake.clear()
+
+                if queue.empty():
+                    continue
+
+                # Build a fresh idle list (exclude failed GPUs)
+                idle_workers = [w for w in all_workers if not w.gpu.is_failed]
+
+                if not idle_workers:
+                    log.warning(f"  TRT: [{arch_key}] No healthy GPUs available for build")
+                    continue
+
+                active_loops: dict[asyncio.Task, GpuWorker] = {}
+
+                # Start first build loop
+                w = idle_workers.pop(0)
+                task = asyncio.get_running_loop().create_task(
+                    self._gpu_build_loop(w, arch_key))
+                active_loops[task] = w
+                log.info(f"  TRT: [{arch_key}] GPU [{w.gpu.uuid}] draining for build "
+                         f"({queue.qsize()} item(s) queued)")
+
+                # Monitor loop: escalate drain or wind down
+                while active_loops:
+                    done, _ = await asyncio.wait(
+                        active_loops.keys(),
+                        timeout=_ARCH_CHECK_INTERVAL,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    # Return completed workers to idle pool
+                    for t in done:
+                        w = active_loops.pop(t)
+                        idle_workers.append(w)
+                        if t.cancelled():
+                            continue
+                        exc = t.exception()
+                        if exc is not None:
+                            log.log_exception(
+                                exc, f"TRT: [{arch_key}] Build loop failed on "
+                                     f"GPU [{w.gpu.uuid}]")
+
+                    # Escalate: drain another GPU if work is accumulating
+                    if not queue.empty() and idle_workers:
+                        can_escalate = (not self._one_at_a_time
+                                        or len(active_loops) == 0)
+                        if can_escalate:
+                            w = idle_workers.pop(0)
+                            task = asyncio.get_running_loop().create_task(
+                                self._gpu_build_loop(w, arch_key))
+                            active_loops[task] = w
+                            log.info(f"  TRT: [{arch_key}] Escalating — "
+                                     f"GPU [{w.gpu.uuid}] draining for build "
+                                     f"({queue.qsize()} item(s) remaining)")
+
+                log.info(f"  TRT: [{arch_key}] All GPUs back to inference")
+
+        except asyncio.CancelledError:
+            log.debug(f"  TRT: [{arch_key}] Arch coordinator stopped")
+
+    # ── Layer 3: Per-GPU Build Loop ───────────────────────────────────
+
+    async def _gpu_build_loop(self, worker: GpuWorker, arch_key: str) -> None:
+        """Drain a GPU, build engines from the arch queue, linger for more
+        work, then release the GPU back to inference."""
+        queue = self._arch_queues[arch_key]
+        loop = asyncio.get_running_loop()
+        device_id = worker.gpu.device_id
+        drained = False
+
+        try:
+            await worker.request_drain()
+            drained = True
+
+            while True:
+                # Wait for work with linger timeout
+                try:
+                    request = await asyncio.wait_for(
+                        queue.get(), timeout=_BUILD_LINGER_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # No more work arrived within linger period — release GPU
+                    log.debug(f"  TRT: [{arch_key}] GPU [{worker.gpu.uuid}] "
+                              f"idle for {_BUILD_LINGER_TIMEOUT}s — releasing")
+                    break
+
+                short_hash = request.model_hash[:16]
+
+                # Skip if another GPU already built these engines
+                needs_build = False
+                for component_type in ("te1", "te2", "unet", "vae"):
+                    onnx = get_onnx_path(self._cache_dir, request.model_hash,
+                                         component_type)
+                    if not os.path.isfile(onnx):
+                        continue
+                    if not all_engines_exist(self._cache_dir, request.model_hash,
+                                             component_type, arch_key):
+                        needs_build = True
+                        break
+
+                if not needs_build:
+                    log.debug(f"  TRT: [{arch_key}] {short_hash} — "
+                              f"engines already built, skipping")
+                    self._check_model_ready(request.model_hash)
+                    continue
+
+                # Build engines
+                log.info(f"  TRT: [{arch_key}] GPU {device_id} building "
+                         f"{short_hash}...")
+                try:
+                    results = await loop.run_in_executor(
+                        None,
+                        build_all_engines,
+                        request.model_hash,
+                        self._cache_dir,
+                        arch_key,
+                        device_id,
+                    )
+                    built_te1 = results.get("te1", [])
+                    built_te2 = results.get("te2", [])
+                    built_unet = results.get("unet", [])
+                    built_vae = results.get("vae", [])
+                    log.info(f"  TRT: [{arch_key}] {short_hash}: "
+                             f"TE1 [{', '.join(built_te1)}] + "
+                             f"TE2 [{', '.join(built_te2)}] + "
+                             f"UNet [{', '.join(built_unet)}] + "
+                             f"VAE [{', '.join(built_vae)}]")
+                    self._check_model_ready(request.model_hash)
+                except Exception as ex:
+                    log.log_exception(
+                        ex, f"TRT: [{arch_key}] Engine build failed for "
+                            f"{short_hash} on GPU {device_id}")
+        finally:
+            if drained:
+                await worker.release_drain()
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _check_model_ready(self, model_hash: str) -> None:
+        """Check if all engines are ready across all architectures.
+        If so, mark the model as TRT-ready."""
+        short_hash = model_hash[:16]
+
+        if not self._arch_workers:
+            return
+
+        for arch_key in self._arch_workers:
+            for component_type in ("te1", "te2", "unet", "vae"):
+                onnx = get_onnx_path(self._cache_dir, model_hash, component_type)
+                if not os.path.isfile(onnx):
+                    # If no ONNX exists, engines can't exist either — not ready
+                    return
+                if not all_engines_exist(self._cache_dir, model_hash,
+                                         component_type, arch_key):
+                    return
+
+        with self._lock:
+            if model_hash not in self._ready_models:
+                self._ready_models.add(model_hash)
+                self._queued_models.discard(model_hash)
+                log.info(f"  TRT: Model {short_hash} — all engines ready "
+                         f"across all architectures")
 
     def _do_export(self, request: _BuildRequest) -> None:
         """Export a single model to ONNX (runs in thread pool)."""
@@ -410,13 +494,12 @@ class TrtBuildManager:
         if not os.path.isfile(unet_onnx):
             try:
                 unet = load_component("sdxl_unet", model_dir, torch.device("cpu"))
-                # Validate this is actually an SDXL UNet (cross_attention_dim=2048).
-                # SD 1.5 models (768) can be mis-classified as SDXL and will fail
-                # with a shape mismatch during tracing.
-                ca_dim = getattr(getattr(unet, "config", None), "cross_attention_dim", None)
+                ca_dim = getattr(getattr(unet, "config", None),
+                                 "cross_attention_dim", None)
                 if ca_dim is not None and ca_dim != 2048:
-                    log.warning(f"  TRT: Skipping {short_hash} — UNet cross_attention_dim "
-                                f"is {ca_dim}, expected 2048 (not SDXL?)")
+                    log.warning(f"  TRT: Skipping {short_hash} — UNet "
+                                f"cross_attention_dim is {ca_dim}, expected "
+                                f"2048 (not SDXL?)")
                     del unet
                     return
                 export_unet_onnx(unet, unet_onnx)
@@ -440,7 +523,8 @@ class _BuildRequest:
     """Internal build request."""
     __slots__ = ("model_hash", "model_dir", "checkpoint_path")
 
-    def __init__(self, model_hash: str, model_dir: str, checkpoint_path: str | None):
+    def __init__(self, model_hash: str, model_dir: str,
+                 checkpoint_path: str | None):
         self.model_hash = model_hash
         self.model_dir = model_dir
         self.checkpoint_path = checkpoint_path
