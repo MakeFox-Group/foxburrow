@@ -163,17 +163,32 @@ def _get_stage_pixels(stage_type: StageType, job: InferenceJob) -> int:
 
 def _update_working_memory(stage_type: StageType, working_bytes: int,
                            pixels: int) -> None:
-    """Record a working-memory measurement as a bytes-per-pixel ratio."""
+    """Record a working-memory measurement as a bytes-per-pixel ratio.
+
+    Uses a "damped max" approach: new peaks are tracked immediately, but
+    measurements that are significantly lower than the stored max cause the
+    stored value to decay by half each update.  This prevents permanent
+    inflation from outlier measurements (e.g. TRT engine deserialization
+    captured by peak memory tracking) while still tracking genuine peaks.
+    """
     if working_bytes <= 0 or pixels <= 0:
         return
     ratio = working_bytes / pixels
     with _bpp_lock:
         prev_ratio = _measured_bpp.get(stage_type, 0.0)
-        if ratio > prev_ratio:
+        if ratio >= prev_ratio:
             _measured_bpp[stage_type] = ratio
-            log.debug(f"  Working memory: new peak for {stage_type.value}: "
-                     f"{working_bytes // (1024**2)}MB @ {pixels} px "
-                     f"({ratio:.1f} B/px, prev {prev_ratio:.1f} B/px)")
+            if ratio > prev_ratio:
+                log.debug(f"  Working memory: new peak for {stage_type.value}: "
+                          f"{working_bytes // (1024**2)}MB @ {pixels} px "
+                          f"({ratio:.1f} B/px, prev {prev_ratio:.1f} B/px)")
+        elif prev_ratio > 0 and ratio < prev_ratio * 0.5:
+            # Measurement drastically lower — decay stored max toward actual.
+            new_ratio = max(ratio * 1.5, prev_ratio * 0.5)
+            _measured_bpp[stage_type] = new_ratio
+            log.debug(f"  Working memory: decaying {stage_type.value}: "
+                      f"{working_bytes // (1024**2)}MB @ {pixels} px "
+                      f"({new_ratio:.1f} B/px, was {prev_ratio:.1f} B/px)")
 
 
 def _get_min_free_vram(stage_type: StageType, job: InferenceJob,
@@ -803,11 +818,17 @@ class GpuWorker:
 
         finally:
             try:
-                # Remove ref-counted active fingerprints so these models become evictable
-                # when no other jobs are using them.
+                # Remove ref-counted active fingerprints (PyTorch + TRT) so models
+                # become evictable when no other jobs are using them.
+                # _trt_active_fps: stage's own TRT engines (added by _ensure_models_for_stage)
+                # _te_protect_fps: cross-stage TE protection (added by _load_sdxl_components)
                 active_fps = {c.fingerprint for c in stage.required_components}
+                active_fps.update(getattr(stage, '_trt_active_fps', set()))
                 if active_fps:
                     self._gpu.remove_active_fingerprints(active_fps)
+                te_protect = getattr(stage, '_te_protect_fps', set())
+                if te_protect:
+                    self._gpu.remove_active_fingerprints(te_protect)
 
                 became_idle = False
                 with self._state_lock:
@@ -917,8 +938,12 @@ class GpuWorker:
             self._gpu.ensure_session_group("bgremove")
             self._load_bgremove_model()
 
-        # Add active fingerprints for VRAM eviction protection (ref-counted)
+        # Add active fingerprints for VRAM eviction protection (ref-counted).
+        # Include both PyTorch fingerprints (from required_components) and TRT
+        # engine fingerprints (from pre-loading) so ensure_free_vram() won't
+        # evict engines we just loaded during the model-loading phase.
         active_fps = {c.fingerprint for c in stage.required_components}
+        active_fps.update(getattr(stage, '_trt_active_fps', set()))
         self._gpu.add_active_fingerprints(active_fps)
 
     def _trt_covers_component(self, stage: WorkStage, job: InferenceJob,
@@ -987,6 +1012,80 @@ class GpuWorker:
         except Exception:
             return False  # any error → fall back to PyTorch
 
+    def _preload_trt_engine(self, stage: WorkStage, job: InferenceJob,
+                            component) -> set[str]:
+        """Pre-load a TRT engine during the model-loading phase.
+
+        This ensures TRT engine deserialization (which allocates significant
+        GPU memory) happens BEFORE the per-stage peak memory measurement,
+        preventing engine loading from inflating the BPP working-memory
+        estimate used for VRAM budget calculations.
+
+        Returns the set of TRT cache fingerprints that were loaded, so they
+        can be added to active fingerprints for eviction protection.
+        """
+        from handlers.sdxl import (
+            _get_trt_unet_runner, _get_trt_vae_runner,
+            _get_trt_te1_runner, _get_trt_te2_runner,
+        )
+
+        inp = job.sdxl_input
+        if inp is None:
+            return set()
+
+        # Determine resolution (same logic as _trt_covers_component)
+        width, height = inp.width, inp.height
+        if stage.type in (StageType.GPU_DENOISE, StageType.GPU_VAE_DECODE):
+            if job.is_hires_pass and job.hires_input:
+                width, height = (job.hires_input.hires_width,
+                                 job.hires_input.hires_height)
+
+        try:
+            if component.category == "sdxl_unet":
+                _get_trt_unet_runner(self._gpu, job, width, height)
+            elif component.category in ("sdxl_vae", "sdxl_vae_enc"):
+                _get_trt_vae_runner(self._gpu, job, width, height)
+            elif component.category == "sdxl_te1":
+                _get_trt_te1_runner(self._gpu, job)
+            elif component.category == "sdxl_te2":
+                _get_trt_te2_runner(self._gpu, job)
+        except Exception as ex:
+            log.debug(f"  TRT pre-load for {component.category} failed: {ex}")
+            return set()
+
+        # Determine the TRT cache fingerprint so it can be protected from eviction.
+        # TRT engines use augmented fingerprints (e.g. "{fp}:vae_trt:640x768")
+        # which differ from the PyTorch fingerprints in the active set.
+        _fp_keys = {"sdxl_unet": "sdxl_unet", "sdxl_vae": "sdxl_vae",
+                    "sdxl_vae_enc": "sdxl_vae", "sdxl_te1": "sdxl_te1",
+                    "sdxl_te2": "sdxl_te2"}
+        _trt_comps = {"sdxl_unet": "unet", "sdxl_vae": "vae",
+                      "sdxl_vae_enc": "vae", "sdxl_te1": "te1",
+                      "sdxl_te2": "te2"}
+        fp_key = _fp_keys.get(component.category)
+        trt_comp = _trt_comps.get(component.category)
+        if not fp_key or not trt_comp:
+            return set()
+
+        base_fp = getattr(job, '_stage_model_fps', {}).get(fp_key)
+        if not base_fp:
+            return set()
+
+        # Check which fingerprint variant was cached (static, dynamic, or default)
+        candidates = []
+        if trt_comp in ("te1", "te2"):
+            candidates.append(f"{base_fp}:{trt_comp}_trt:default")
+        else:
+            candidates.append(f"{base_fp}:{trt_comp}_trt:{width}x{height}")
+            from trt.builder import DYNAMIC_STANDARD
+            candidates.append(f"{base_fp}:{trt_comp}_trt:{DYNAMIC_STANDARD['label']}")
+
+        loaded = set()
+        for c in candidates:
+            if self._gpu.is_component_loaded(c):
+                loaded.add(c)
+        return loaded
+
     def _load_sdxl_components(self, stage: WorkStage, model_dir: str | None,
                               job: InferenceJob) -> None:
         """Load SDXL sub-model components for a stage.
@@ -1002,12 +1101,42 @@ class GpuWorker:
                     source_name = source_name[:-len(ext)]
                     break
 
+        trt_fps: set[str] = set()
+
+        # For non-TE stages (Denoise, VaeDecode), protect the current model's
+        # cached TE TRT engines from eviction.  Without this, loading a 5GB
+        # UNet engine calls ensure_free_vram() which can evict the small TE
+        # engines (1.8GB combined) — forcing an expensive reload on the next
+        # text-encode stage for the same model.
+        #
+        # These are tracked separately from trt_fps to avoid ref-count leaks:
+        # trt_fps flows into stage._trt_active_fps → added/removed by the
+        # outer _ensure_models_for_stage / cleanup pair.  Cross-stage TE
+        # protection is added here and removed in the same cleanup block via
+        # stage._te_protect_fps.
+        te_protect_fps: set[str] = set()
+        if stage.type != StageType.GPU_TEXT_ENCODE:
+            fps = getattr(job, '_stage_model_fps', {})
+            for te_key, comp_name in (("sdxl_te1", "te1"), ("sdxl_te2", "te2")):
+                base = fps.get(te_key)
+                if base:
+                    te_fp = f"{base}:{comp_name}_trt:default"
+                    if self._gpu.is_component_loaded(te_fp):
+                        te_protect_fps.add(te_fp)
+            if te_protect_fps:
+                self._gpu.add_active_fingerprints(te_protect_fps)
+        stage._te_protect_fps = te_protect_fps
+
         for component in stage.required_components:
             if self._gpu.is_component_loaded(component.fingerprint):
                 continue
-            # Skip PyTorch model if TRT engine covers this resolution
+            # Skip PyTorch model if TRT engine covers this resolution.
+            # Pre-load the TRT engine NOW (during model-loading phase) so it
+            # doesn't inflate the per-stage working-memory (BPP) measurement
+            # that runs during execution.
             if self._trt_covers_component(stage, job, component):
                 log.debug(f"  Skipping PyTorch {component.category} — TRT engine available")
+                trt_fps.update(self._preload_trt_engine(stage, job, component))
                 continue
             # Ensure enough VRAM before loading (evicts non-current-group LRU first)
             active_fps = {c.fingerprint for c in stage.required_components}
@@ -1022,7 +1151,7 @@ class GpuWorker:
             after = torch.cuda.memory_allocated(self._gpu.device)
             actual_vram = after - before
             log.debug(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
-                     f"(estimated {component.estimated_vram_bytes // (1024*1024)}MB)")
+                      f"(estimated {component.estimated_vram_bytes // (1024*1024)}MB)")
             # Feed actual VRAM measurement back to the registry so future
             # ensure_free_vram() calls use the real value instead of the estimate
             if actual_vram > 0:
@@ -1054,6 +1183,10 @@ class GpuWorker:
                                 self._gpu.device, self._gpu_model_name)
             except Exception as ex:
                 log.warning(f"  WorkspaceProfiler: Failed to profile {component.category}: {ex}")
+
+        # Store TRT fingerprints on the stage so _ensure_models_for_stage can
+        # protect them from eviction, and the cleanup block can release them.
+        stage._trt_active_fps = trt_fps
 
     def _load_upscale_model(self) -> None:
         """Load the upscale model if not already cached."""
