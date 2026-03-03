@@ -130,6 +130,16 @@ class AdmissionControl:
         "BGRemove":            "bgremove",
     }
 
+    # Pipeline depth per capability: how many concurrent jobs can a single GPU
+    # handle via stage pipelining.  SDXL has 3 GPU stage types (TE, UNet, VAE)
+    # that can each run on a different job simultaneously, so up to 3 SDXL jobs
+    # can pipeline through one GPU.  Non-pipelined capabilities are 1.
+    _PIPELINE_DEPTH: dict[str, int] = {
+        "sdxl": 3,
+        "upscale": 1,
+        "bgremove": 1,
+    }
+
     def __init__(self, gpu_pool: GpuPool) -> None:
         self._gpu_pool = gpu_pool
         self._counts: dict[str, int] = {}  # capability -> in-flight count
@@ -144,15 +154,18 @@ class AdmissionControl:
             return None
 
         with self._lock:
-            # Per-capability limit: number of non-failed GPUs with this capability
-            cap_limit = self._gpu_pool.available_count(cap)
+            # Per-capability limit: GPUs × pipeline depth for stage pipelining.
+            # Worker-level controls (per-stage-type exclusivity, VRAM budget)
+            # handle the fine-grained scheduling decisions.
+            depth = self._PIPELINE_DEPTH.get(cap, 1)
+            cap_limit = self._gpu_pool.available_count(cap) * depth
             current = self._counts.get(cap, 0)
             if current >= cap_limit:
                 return f"No {cap} capacity: {current}/{cap_limit}"
 
-            # Global limit: active_gpus + floor(active_gpus / 2)
+            # Global limit: total pipeline capacity across all GPUs
             num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
-            global_limit = num_active + (num_active // 2)
+            global_limit = num_active * max(self._PIPELINE_DEPTH.values())
             if self._total >= global_limit:
                 return f"Server at capacity: {self._total}/{global_limit}"
 
@@ -180,9 +193,9 @@ class AdmissionControl:
 
     @property
     def max_concurrent(self) -> int:
-        """Current global limit: active_gpus + floor(active_gpus / 2)."""
+        """Current global limit: active_gpus × max pipeline depth."""
         num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
-        return num_active + (num_active // 2)
+        return num_active * max(self._PIPELINE_DEPTH.values())
 
     def snapshot(self) -> dict:
         """Return current admission state for the status endpoint."""
@@ -194,9 +207,10 @@ class AdmissionControl:
         num_active = len(non_failed)
         cap_limits = {
             cap: sum(1 for g in non_failed if g.supports_capability(cap))
+                 * self._PIPELINE_DEPTH.get(cap, 1)
             for cap in sorted(set(self._CAPABILITY_MAP.values()))
         }
-        max_conc = num_active + (num_active // 2)
+        max_conc = num_active * max(self._PIPELINE_DEPTH.values())
 
         with self._lock:
             return {
