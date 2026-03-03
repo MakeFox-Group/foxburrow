@@ -926,7 +926,8 @@ class GpuWorker:
         """Check if a TRT engine can handle this component for the job's resolution.
 
         Returns True if PyTorch loading can be skipped because TRT will handle it.
-        Only applies to sdxl_unet (when no LoRAs) and sdxl_vae/sdxl_vae_enc.
+        Applies to: sdxl_unet (when no LoRAs), sdxl_vae, sdxl_vae_enc, sdxl_te1, sdxl_te2.
+        Text encoders don't depend on resolution — just engine existence is checked.
         """
         inp = job.sdxl_input
         if inp is None:

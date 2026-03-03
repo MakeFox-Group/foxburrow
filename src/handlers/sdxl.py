@@ -2405,8 +2405,8 @@ def _get_trt_te1_runner(gpu: "GpuInstance", job: InferenceJob):
     try:
         engine_size = os.path.getsize(engine_path)
         gpu.ensure_free_vram(engine_size, protect={trt_fp})
-        te_getter = lambda min_bytes: gpu.get_trt_shared_memory("te", min_bytes)
-        runner = TrtTe1Runner(engine_path, gpu.device, shared_memory_getter=te_getter)
+        te1_getter = lambda min_bytes: gpu.get_trt_shared_memory("te1", min_bytes)
+        runner = TrtTe1Runner(engine_path, gpu.device, shared_memory_getter=te1_getter)
         gpu.cache_model(
             trt_fp, "sdxl_te1_trt", runner,
             estimated_vram=runner.vram_usage,
@@ -2449,8 +2449,8 @@ def _get_trt_te2_runner(gpu: "GpuInstance", job: InferenceJob):
     try:
         engine_size = os.path.getsize(engine_path)
         gpu.ensure_free_vram(engine_size, protect={trt_fp})
-        te_getter = lambda min_bytes: gpu.get_trt_shared_memory("te", min_bytes)
-        runner = TrtTe2Runner(engine_path, gpu.device, shared_memory_getter=te_getter)
+        te2_getter = lambda min_bytes: gpu.get_trt_shared_memory("te2", min_bytes)
+        runner = TrtTe2Runner(engine_path, gpu.device, shared_memory_getter=te2_getter)
         gpu.cache_model(
             trt_fp, "sdxl_te2_trt", runner,
             estimated_vram=runner.vram_usage,
