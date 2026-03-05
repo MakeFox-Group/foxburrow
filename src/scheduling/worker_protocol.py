@@ -196,6 +196,13 @@ class DrainComplete:
 
 
 @dataclass
+class TrtBuildProgress:
+    """Progress update during TRT engine building (sent before each engine)."""
+    component: str   # e.g. "te1", "unet", "vae"
+    engine: str      # e.g. "default", "static-640x768", "dynamic-standard"
+
+
+@dataclass
 class TrtBuildResult:
     """Result of TRT engine building."""
     success: bool

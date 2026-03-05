@@ -337,14 +337,20 @@ class TrtBuildManager:
                     continue
 
                 active_loops: dict[asyncio.Task, GpuWorker] = {}
+                loop = asyncio.get_running_loop()
 
-                # Start first build loop
-                w = idle_workers.pop(0)
-                task = asyncio.get_running_loop().create_task(
-                    self._gpu_build_loop(w, arch_key))
-                active_loops[task] = w
-                log.info(f"  TRT: [{arch_key}] GPU [{w.gpu.uuid}] draining for build "
-                         f"({queue.qsize()} item(s) queued)")
+                # Drain as many GPUs as we have queued work for
+                initial_count = (
+                    1 if self._one_at_a_time
+                    else min(len(idle_workers), max(1, queue.qsize()))
+                )
+                for _ in range(initial_count):
+                    w = idle_workers.pop(0)
+                    task = loop.create_task(
+                        self._gpu_build_loop(w, arch_key))
+                    active_loops[task] = w
+                    log.info(f"  TRT: [{arch_key}] GPU [{w.gpu.uuid}] draining "
+                             f"for build ({queue.qsize()} item(s) queued)")
 
                 # Monitor loop: escalate drain or wind down
                 while active_loops:
@@ -366,18 +372,24 @@ class TrtBuildManager:
                                 exc, f"TRT: [{arch_key}] Build loop failed on "
                                      f"GPU [{w.gpu.uuid}]")
 
-                    # Escalate: drain another GPU if work is accumulating
+                    # Escalate: drain all available idle GPUs if work remains
                     if not queue.empty() and idle_workers:
                         can_escalate = (not self._one_at_a_time
                                         or len(active_loops) == 0)
                         if can_escalate:
-                            w = idle_workers.pop(0)
-                            task = asyncio.get_running_loop().create_task(
-                                self._gpu_build_loop(w, arch_key))
-                            active_loops[task] = w
-                            log.info(f"  TRT: [{arch_key}] Escalating — "
-                                     f"GPU [{w.gpu.uuid}] draining for build "
-                                     f"({queue.qsize()} item(s) remaining)")
+                            escalate_count = (
+                                1 if self._one_at_a_time
+                                else min(len(idle_workers), max(1, queue.qsize()))
+                            )
+                            for _ in range(escalate_count):
+                                w = idle_workers.pop(0)
+                                task = loop.create_task(
+                                    self._gpu_build_loop(w, arch_key))
+                                active_loops[task] = w
+                                log.info(
+                                    f"  TRT: [{arch_key}] Escalating — "
+                                    f"GPU [{w.gpu.uuid}] draining for build "
+                                    f"({queue.qsize()} item(s) remaining)")
 
                 log.info(f"  TRT: [{arch_key}] All GPUs back to inference")
 
@@ -434,8 +446,12 @@ class TrtBuildManager:
                     continue
 
                 # Build engines via worker subprocess (true parallel per GPU)
+                model_name = os.path.basename(request.model_dir.rstrip("/\\"))
                 log.info(f"  TRT: [{arch_key}] GPU {device_id} building "
-                         f"{short_hash}...")
+                         f"{model_name} ({short_hash})...")
+                worker.trt_build_model = model_name
+                worker.trt_build_component = None
+                worker.trt_build_engine = None
                 try:
                     trt_result = await worker.trt_build(
                         model_hash=request.model_hash,
@@ -464,6 +480,9 @@ class TrtBuildManager:
                         ex, f"TRT: [{arch_key}] Engine build failed for "
                             f"{short_hash} on GPU {device_id}")
         finally:
+            worker.trt_build_model = None
+            worker.trt_build_component = None
+            worker.trt_build_engine = None
             if drained:
                 await worker.release_drain()
 

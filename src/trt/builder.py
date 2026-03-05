@@ -14,10 +14,47 @@ from __future__ import annotations
 import gc
 import os
 import time as _time
+from typing import Callable
 
 import torch
 
 import log
+
+
+# ── Custom TRT logger ─────────────────────────────────────────────
+# TensorRT's default trt.Logger prints directly to stderr with its own
+# timestamp format.  Subclassing trt.ILogger routes all TRT and ONNX
+# parser messages through our logging system instead.
+
+_trt_logger = None
+
+
+def _get_trt_logger():
+    """Lazily create a singleton TRT logger (requires tensorrt import)."""
+    global _trt_logger
+    if _trt_logger is not None:
+        return _trt_logger
+
+    import tensorrt as trt
+
+    class _FoxburrowTrtLogger(trt.ILogger):
+        """Routes TensorRT log messages through foxburrow's log module."""
+
+        def log(self, severity, msg):
+            msg = msg.strip()
+            if not msg:
+                return
+            if severity == trt.ILogger.INTERNAL_ERROR or severity == trt.ILogger.ERROR:
+                log.error(f"  TRT(native): {msg}")
+            elif severity == trt.ILogger.WARNING:
+                log.warning(f"  TRT(native): {msg}")
+            elif severity == trt.ILogger.INFO:
+                log.info(f"  TRT(native): {msg}")
+            else:
+                log.debug(f"  TRT(native): {msg}")
+
+    _trt_logger = _FoxburrowTrtLogger()
+    return _trt_logger
 
 
 # UNet static engines for the highest-traffic resolutions.
@@ -136,7 +173,7 @@ def build_te_engine(
 
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
 
-    logger = trt.Logger(trt.Logger.WARNING)
+    logger = _get_trt_logger()
     builder = trt.Builder(logger)
     try:
         explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
@@ -207,7 +244,7 @@ def build_static_engine(
 
     lat_h, lat_w = _latent_shape(width, height)
 
-    logger = trt.Logger(trt.Logger.WARNING)
+    logger = _get_trt_logger()
     builder = trt.Builder(logger)
     try:
         explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
@@ -292,7 +329,7 @@ def build_dynamic_engine(
     opt_lat_h, opt_lat_w = _latent_shape(*opt_res)
     max_lat_h, max_lat_w = _latent_shape(*max_res)
 
-    logger = trt.Logger(trt.Logger.WARNING)
+    logger = _get_trt_logger()
     builder = trt.Builder(logger)
     try:
         explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
@@ -517,6 +554,7 @@ def build_all_engines(
     arch_key: str,
     device_id: int,
     max_workspace_gb: float = 0,
+    progress_cb: Callable[[str, str], None] | None = None,
 ) -> dict[str, list[str]]:
     """Build all missing TRT engines for a model on a specific GPU architecture.
 
@@ -530,6 +568,8 @@ def build_all_engines(
         cache_dir: Root TRT cache directory.
         arch_key: GPU architecture key (e.g. "sm_120_cu128").
         device_id: CUDA device index to build on.
+        progress_cb: Optional callback(component_type, engine_label) called
+            before each engine build starts, for TUI progress display.
 
     Returns:
         Dict mapping component_type -> list of successfully built engine labels.
@@ -555,6 +595,8 @@ def build_all_engines(
                     log.debug(f"  TRT: TE engine exists, skipping: {component_type}")
                     results[component_type].append("default")
                 else:
+                    if progress_cb:
+                        progress_cb(component_type, "default")
                     ok = build_te_engine(
                         onnx_path=onnx_path,
                         engine_path=te_path,
@@ -573,6 +615,8 @@ def build_all_engines(
                     log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
                     results[component_type].append(f"static-{sw}x{sh}")
                 else:
+                    if progress_cb:
+                        progress_cb(component_type, f"static-{sw}x{sh}")
                     ok = build_static_engine(
                         onnx_path=onnx_path,
                         engine_path=static_path,
@@ -593,6 +637,8 @@ def build_all_engines(
                 log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type} {label}")
                 results[component_type].append(label)
             else:
+                if progress_cb:
+                    progress_cb(component_type, label)
                 ok = build_dynamic_engine(
                     onnx_path=onnx_path,
                     engine_path=dyn_path,

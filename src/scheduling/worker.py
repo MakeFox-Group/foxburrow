@@ -321,6 +321,10 @@ def estimate_gpu_slots(worker: GpuWorkerProxy) -> dict[str, int]:
     if gpu.is_failed:
         return {}
 
+    # GPU is drained for TRT build — no inference capacity
+    if worker._draining or worker._building:
+        return {}
+
     # Use cached GPU model name (avoids CUDA driver call on every scheduling cycle)
     gpu_model = worker._gpu_model_name
 

@@ -92,8 +92,16 @@ class GpuPanel(Static):
         proxy_gpu = worker.gpu if worker else gpu
 
         # Header: name, status, capabilities
-        status = "BUSY" if proxy_gpu.is_busy else "IDLE"
-        status_style = "bold red" if proxy_gpu.is_busy else "bold green"
+        is_building = worker and (worker._draining or worker._building)
+        if is_building:
+            status = "TRT BUILD"
+            status_style = "bold magenta"
+        elif proxy_gpu.is_busy:
+            status = "BUSY"
+            status_style = "bold red"
+        else:
+            status = "IDLE"
+            status_style = "bold green"
         caps = ", ".join(sorted(gpu.capabilities))
 
         text.append(f"{gpu.name}", style="bold")
@@ -139,6 +147,20 @@ class GpuPanel(Static):
         else:
             text.append("Loaded: ", style="dim")
             text.append("(none)", style="dim italic")
+            text.append("\n")
+
+        # TRT build status
+        if is_building and worker.trt_build_model:
+            text.append("TRT: ", style="bold magenta")
+            text.append(worker.trt_build_model, style="bold")
+            if worker.trt_build_component:
+                text.append(f" — {worker.trt_build_component}", style="magenta")
+                if worker.trt_build_engine:
+                    text.append(f" ({worker.trt_build_engine})", style="dim magenta")
+            text.append("\n")
+        elif is_building:
+            text.append("TRT: ", style="bold magenta")
+            text.append("draining...", style="magenta italic")
             text.append("\n")
 
         # Active jobs

@@ -164,7 +164,8 @@ class AdmissionControl:
                 return f"No {cap} capacity: {current}/{cap_limit}"
 
             # Global limit: total pipeline capacity across all GPUs
-            num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
+            num_active = sum(1 for g in self._gpu_pool.gpus
+                             if not g.is_failed and not g._trt_building)
             global_limit = num_active * max(self._PIPELINE_DEPTH.values(), default=1)
             if self._total >= global_limit:
                 return f"Server at capacity: {self._total}/{global_limit}"
@@ -194,7 +195,8 @@ class AdmissionControl:
     @property
     def max_concurrent(self) -> int:
         """Current global limit: active_gpus × max pipeline depth."""
-        num_active = sum(1 for g in self._gpu_pool.gpus if not g.is_failed)
+        num_active = sum(1 for g in self._gpu_pool.gpus
+                         if not g.is_failed and not g._trt_building)
         return num_active * max(self._PIPELINE_DEPTH.values(), default=1)
 
     def snapshot(self) -> dict:
@@ -203,7 +205,7 @@ class AdmissionControl:
         # derived values (limits, max_concurrent).  GpuPool.gpus is unsynchronized,
         # so we iterate once and derive everything from that single read.
         gpus = self._gpu_pool.gpus
-        non_failed = [g for g in gpus if not g.is_failed]
+        non_failed = [g for g in gpus if not g.is_failed and not g._trt_building]
         num_active = len(non_failed)
         cap_limits = {
             cap: sum(1 for g in non_failed if g.supports_capability(cap))

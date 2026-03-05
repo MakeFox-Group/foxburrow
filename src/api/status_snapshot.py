@@ -76,7 +76,9 @@ def compute_status_snapshot() -> dict[str, Any]:
         admission_snapshot = app_state.admission.snapshot()
         max_concurrent = app_state.admission.max_concurrent
     else:
-        num_active_gpus = sum(1 for w in workers if not w.gpu.is_failed)
+        num_active_gpus = sum(1 for w in workers
+                              if not w.gpu.is_failed
+                              and not w._draining and not w._building)
         max_concurrent = num_active_gpus + (num_active_gpus // 2)
 
     return {

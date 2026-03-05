@@ -43,6 +43,7 @@ from scheduling.worker_protocol import (
     TagImageCmd,
     TagResult,
     TrtBuildCmd,
+    TrtBuildProgress,
     TrtBuildResult,
     WorkerReady,
 )
@@ -256,6 +257,10 @@ class GpuWorkerProxy:
 
         # TRT build state
         self._trt_build_future: asyncio.Future | None = None
+        # TRT build info for TUI display (set by TrtBuildManager._gpu_build_loop)
+        self.trt_build_model: str | None = None      # human-readable model name
+        self.trt_build_component: str | None = None   # e.g. "te1", "unet", "vae"
+        self.trt_build_engine: str | None = None      # e.g. "static-640x768"
 
         # Tag state
         self._tag_future: asyncio.Future | None = None
@@ -541,6 +546,9 @@ class GpuWorkerProxy:
         await self._drain_future  # Wait for DrainComplete from worker
 
         self._building = True
+        # Sync to pool's GpuInstance so AdmissionControl sees reduced capacity
+        if self._gpu_proxy._pool_gpu is not None:
+            self._gpu_proxy._pool_gpu._trt_building = True
         log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Drained — GPU ready for TRT build")
 
     async def release_drain(self) -> None:
@@ -549,6 +557,9 @@ class GpuWorkerProxy:
         self._building = False
         self._draining = False
         self._drain_event = None
+        # Sync to pool's GpuInstance so AdmissionControl restores capacity
+        if self._gpu_proxy._pool_gpu is not None:
+            self._gpu_proxy._pool_gpu._trt_building = False
 
         log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Drain released")
         if self._scheduler_wake:
@@ -643,6 +654,10 @@ class GpuWorkerProxy:
                 elif isinstance(msg, DrainComplete):
                     if self._drain_future and not self._drain_future.done():
                         self._drain_future.set_result(True)
+
+                elif isinstance(msg, TrtBuildProgress):
+                    self.trt_build_component = msg.component
+                    self.trt_build_engine = msg.engine
 
                 elif isinstance(msg, TrtBuildResult):
                     if self._trt_build_future and not self._trt_build_future.done():
@@ -879,7 +894,7 @@ class GpuWorkerProxy:
 
     def _fail_pending_futures(self, error: str) -> None:
         """Fail any pending futures on process error."""
-        for future_attr in ("_trt_build_future", "_tag_future", "_onload_future"):
+        for future_attr in ("_drain_future", "_trt_build_future", "_tag_future", "_onload_future"):
             future = getattr(self, future_attr, None)
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(error))

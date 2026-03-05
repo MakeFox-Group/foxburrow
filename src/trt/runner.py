@@ -34,6 +34,7 @@ from typing import Callable
 import torch
 
 import log
+from trt.builder import _get_trt_logger
 
 
 def _trt_dtype_to_torch(trt_dtype) -> torch.dtype:
@@ -88,7 +89,7 @@ class TrtUNetRunner:
 
         # Deserialize engine from disk.  Runtime and logger must be kept alive
         # as long as the engine exists — TRT may reference them internally.
-        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._trt_logger = _get_trt_logger()
         self._runtime = trt.Runtime(self._trt_logger)
 
         with open(engine_path, "rb") as f:
@@ -257,7 +258,7 @@ class TrtVaeRunner:
         self._stream = torch.cuda.Stream(device=device)
         self._shared_memory_getter = shared_memory_getter
 
-        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._trt_logger = _get_trt_logger()
         self._runtime = trt.Runtime(self._trt_logger)
 
         with open(engine_path, "rb") as f:
@@ -386,7 +387,7 @@ class TrtTe1Runner:
         self._stream = torch.cuda.Stream(device=device)
         self._shared_memory_getter = shared_memory_getter
 
-        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._trt_logger = _get_trt_logger()
         self._runtime = trt.Runtime(self._trt_logger)
 
         with open(engine_path, "rb") as f:
@@ -516,7 +517,7 @@ class TrtTe2Runner:
         self._stream = torch.cuda.Stream(device=device)
         self._shared_memory_getter = shared_memory_getter
 
-        self._trt_logger = trt.Logger(trt.Logger.WARNING)
+        self._trt_logger = _get_trt_logger()
         self._runtime = trt.Runtime(self._trt_logger)
 
         with open(engine_path, "rb") as f:

@@ -35,6 +35,7 @@ from scheduling.worker_protocol import (
     TagImageCmd,
     TagResult,
     TrtBuildCmd,
+    TrtBuildProgress,
     TrtBuildResult,
     WorkerReady,
 )
@@ -238,7 +239,7 @@ def gpu_worker_main(
                 log.info(f"  GPU worker [{gpu_uuid}]: Drain released")
 
             elif isinstance(cmd, TrtBuildCmd):
-                trt_result = _handle_trt_build(cmd)
+                trt_result = _handle_trt_build(cmd, result_queue)
                 result_queue.put(trt_result)
 
             elif isinstance(cmd, TagImageCmd):
@@ -1050,15 +1051,19 @@ def _drain(gpu) -> None:
 
 # ── TRT build handling ────────────────────────────────────────────
 
-def _handle_trt_build(cmd: TrtBuildCmd) -> TrtBuildResult:
+def _handle_trt_build(cmd: TrtBuildCmd, result_queue) -> TrtBuildResult:
     """Build TRT engines for a model."""
     import log
+
+    def _progress(component: str, engine: str) -> None:
+        result_queue.put(TrtBuildProgress(component=component, engine=engine))
 
     try:
         from trt.builder import build_all_engines
         results = build_all_engines(
             cmd.model_hash, cmd.cache_dir, cmd.arch_key, device_id=0,
-            max_workspace_gb=cmd.max_workspace_gb)
+            max_workspace_gb=cmd.max_workspace_gb,
+            progress_cb=_progress)
         return TrtBuildResult(success=True, results=results)
     except Exception as ex:
         log.log_exception(ex, f"TRT build failed for {cmd.model_hash[:16]}")
