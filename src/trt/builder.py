@@ -38,7 +38,11 @@ def _get_trt_logger():
     import tensorrt as trt
 
     class _FoxburrowTrtLogger(trt.ILogger):
-        """Routes TensorRT log messages through foxburrow's log module."""
+        """Routes TensorRT log messages through foxburrow's log module.
+
+        Only routes WARNING and above by default — TRT's INFO/VERBOSE
+        output is extremely noisy during engine builds.
+        """
 
         def log(self, severity, msg):
             msg = msg.strip()
@@ -48,10 +52,7 @@ def _get_trt_logger():
                 log.error(f"  TRT(native): {msg}")
             elif severity == trt.ILogger.WARNING:
                 log.warning(f"  TRT(native): {msg}")
-            elif severity == trt.ILogger.INFO:
-                log.info(f"  TRT(native): {msg}")
-            else:
-                log.debug(f"  TRT(native): {msg}")
+            # TRT INFO/VERBOSE are extremely verbose — skip them
 
     _trt_logger = _FoxburrowTrtLogger()
     return _trt_logger
