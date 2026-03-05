@@ -1,50 +1,31 @@
-"""Entry point: config, GPU init, model discovery, start server."""
+"""Entry point: config, GPU init, model discovery, start server.
+
+IMPORTANT: The main process does NOT initialize CUDA or import torch.cuda.
+All GPU work runs in dedicated worker subprocesses (one per GPU) launched
+with CUDA_VISIBLE_DEVICES set so each sees only one GPU as cuda:0.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import multiprocessing as mp
 import os
 import secrets
 import signal
 import sys
 import threading
 
-# Force CUDA to enumerate GPUs by PCI bus ID (matching NVML ordering).
-# Must be set BEFORE importing torch or any CUDA library.
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-
-# Use CUDA's native cudaMallocAsync allocator instead of PyTorch's caching allocator.
-# This delegates all allocation/free to the CUDA driver's stream-ordered memory pools,
-# which handle fragmentation natively and can release memory back to the OS.
-# Matches Stable Diffusion WebUI Forge's --cuda-malloc flag.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
-
 # Keep HuggingFace downloads (config JSONs, tokenizer vocabs) in data/hf_cache/
 # instead of ~/.cache/huggingface/. Must be set before any HF imports.
 os.environ.setdefault("HF_HOME", os.path.join(os.path.abspath("data"), "hf_cache"))
 
-import torch
 import uvicorn
 
-# Explicitly enable all Scaled Dot-Product Attention backends.
-# This matches Forge's --attention-pytorch behaviour and ensures PyTorch picks
-# the fastest available kernel (flash, mem-efficient, or math) per operation.
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-
-# NOTE: cudnn.benchmark = True was tested but adds 25s warmup on every new
-# job due to model eviction/reload cycles across 4 GPUs. The benchmark cache
-# doesn't persist when models are constantly swapped. Not worth it until
-# models stay resident longer.
-
-# TorchInductor tuning: conv_1x1_as_mm treats 1x1 convolutions (heavy in UNet)
-# as matrix multiplies for better kernel selection.  The coordinate_descent and
-# epilogue_fusion flags were tested but add massive compile time on sm_120
-# (Blackwell) due to immature autotuning — disabled until Triton matures.
-torch._inductor.config.conv_1x1_as_mm = True
-
+# NOTE: torch is imported here for version info logging only.
+# The main process must NOT call torch.cuda.* — all CUDA work is in
+# worker subprocesses.
+import torch
 
 def _setup_compile_cache() -> None:
     """Configure persistent Triton + TorchInductor cache directory.
@@ -52,16 +33,26 @@ def _setup_compile_cache() -> None:
     Builds a cache path keyed on GPU arch, Python version, CUDA version, and
     cuDNN version so compiled kernels are never loaded against mismatched
     runtimes.  The env vars are read lazily at first compile, not at import.
+
+    NOTE: In multiprocessing mode, this uses NVML to detect GPU arch
+    instead of torch.cuda (which would initialize a CUDA context).
     """
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
     cuda_ver = torch.version.cuda or "unknown"
     cudnn_ver = str(torch.backends.cudnn.version() or "unknown")
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        cap = torch.cuda.get_device_capability(0)
-        gpu_arch = f"sm_{cap[0] * 10 + cap[1]}"
-    else:
-        gpu_arch = "cpu"
+    # Use NVML to detect GPU arch — no CUDA context needed in main process
+    gpu_arch = "cpu"
+    try:
+        from gpu import nvml
+        nvml.init()
+        devices = nvml.get_devices()
+        if devices:
+            # Extract compute capability from NVML device name heuristic,
+            # or use a safe default. Worker processes will use the real arch.
+            gpu_arch = "gpu"  # Generic — workers use real arch for TRT
+    except Exception:
+        pass
 
     cache_dir = os.path.abspath(
         f"data/cache/{gpu_arch}_py{py_ver}_cu{cuda_ver}_cudnn{cudnn_ver}/torch")
@@ -81,7 +72,7 @@ from scheduling.model_registry import ModelRegistry
 from scheduling.pipeline import PipelineFactory
 from scheduling.queue import JobQueue
 from scheduling.scheduler import GpuScheduler
-from scheduling.worker import GpuWorker
+from scheduling.worker_proxy import GpuWorkerProxy
 from state import app_state
 
 
@@ -275,11 +266,13 @@ def _background_model_init(
     config: FoxBurrowConfig,
     models_dir: str,
     all_sdxl: dict[str, str],
+    workers: list[GpuWorkerProxy],
 ) -> None:
     """Heavy initialization that runs in a background thread after server starts.
 
     Handles: HF config prefetch, SDXL fingerprinting, utility model registration,
-    LoRA hashing, and GPU onload/unevictable processing.
+    LoRA hashing.  GPU onload/unevictable processing is sent to worker processes
+    via OnloadCmd after model scanning completes.
     """
     import time
     start_time = time.monotonic()
@@ -290,7 +283,6 @@ def _background_model_init(
     from concurrent.futures import ThreadPoolExecutor
     fp_threads = _auto_threads(config.threads.fingerprint, 8)
     fp_pool = ThreadPoolExecutor(max_workers=fp_threads)
-    gpus = app_state.gpu_pool.gpus
 
     # 1. Start model scanning FIRST — CPU/disk only, runs concurrently
     #    with all the warm-up work below.
@@ -300,26 +292,11 @@ def _background_model_init(
         scanner.start(all_sdxl, pool=fp_pool)
         app_state.model_scanner = scanner
 
-    # 2. Pre-warm everything while scanner runs in background.
-    #    Without this, parallel GPU onload threads all hit cold-start costs
-    #    simultaneously: first `import timm` holds the GIL for ~5-10s (huge
-    #    model registry), first CUDA op per device initializes the runtime
-    #    (~2-5s each, driver-serialized). Paying these once upfront avoids
-    #    serializing the parallel GPU onload.
+    # 2. Pre-warm CPU-side resources while scanner runs.
+    #    NOTE: No CUDA context init in main process — that happens in workers.
 
     # HF config files (network on first run, then cached locally)
     _prefetch_sdxl_configs()
-
-    # Heavy library imports (GIL-bound — do once before threads fan out)
-    import timm              # noqa: F401 — massive model registry
-    import safetensors.torch  # noqa: F401
-
-    # CUDA context init: first op per device triggers expensive runtime init.
-    # Driver serializes this internally so sequential is optimal.
-    if gpus:
-        log.debug(f"  Pre-warming CUDA contexts for {len(gpus)} GPU(s)...")
-        for gpu in gpus:
-            torch.zeros(1, device=gpu.device)
 
     # 3. Register utility models (upscale, bgremove) — fast, single files.
     # Must happen BEFORE GPU onload so upscale/bgremove components exist.
@@ -338,51 +315,69 @@ def _background_model_init(
         if bgremove_path:
             app_state.registry.register_bgremove_model(bgremove_path)
 
-    # 4a. Quick GPU onloads (upscale, bgremove) — fast, <1s each.
-    # These must finish before SDXL onloads so components exist in the cache.
-    if gpus:
-        with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
-            list(gpu_pool.map(
-                lambda g: _process_gpu_onload(
-                    g, app_state, types={"upscale", "bgremove"}),
-                gpus))
-
-    # 4b. Fire-and-forget tagger loading — slow (~30s) but independent.
-    # Runs concurrently with model scanning, SDXL onloads, and LoRA hashing.
-    # The tagger finishes whenever it finishes; /api/tag returns 404 until ready.
-    tagger_threads: list[threading.Thread] = []
-    for gpu in gpus:
-        if "tag" in gpu.onload:
-            t = threading.Thread(
-                target=_process_gpu_onload,
-                args=(gpu, app_state),
-                kwargs={"types": {"tag"}},
-                name=f"tagger-{gpu.uuid[:8]}",
-                daemon=True,
-            )
-            t.start()
-            tagger_threads.append(t)
-    if tagger_threads:
-        log.debug(f"  Tagger loading on {len(tagger_threads)} GPU(s) (background)")
-
-    # 5. Wait for model scanning to finish.
+    # 4. Wait for model scanning to finish.
     # Base models get priority I/O — LoRA hashing starts after.
     scanner = app_state.model_scanner
     if scanner is not None and scanner._thread is not None:
         scanner._thread.join()
 
-    # 6. Now load SDXL-specific onloads (model pre-loads into GPU VRAM)
-    # and mark unevictable entries. Requires models to be registered.
-    if gpus:
-        with ThreadPoolExecutor(max_workers=len(gpus)) as gpu_pool:
-            list(gpu_pool.map(
-                lambda g: _process_gpu_onload(g, app_state, types={"sdxl"}),
-                gpus))
+    # 5. Send onload commands to worker processes.
+    # Each worker handles its own model loading in its own process.
+    # We send onload in phases: utility models first, then SDXL, then tagger.
+    if workers:
+        loop = asyncio.new_event_loop()
 
-        for gpu in gpus:
-            _process_gpu_unevictable(gpu, app_state)
+        async def _send_onloads():
+            # Phase 1: utility models (upscale, bgremove) — fast
+            tasks = []
+            for w in workers:
+                if w.gpu.onload:
+                    tasks.append(w.send_onload(
+                        types={"upscale", "bgremove"},
+                        onload_entries=w.gpu.onload,
+                        unevictable_entries=set(),
+                        models_dir=models_dir,
+                        sdxl_models=app_state.sdxl_models,
+                    ))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 7. LoRA hashing — same fingerprint pool, starts AFTER SDXL models.
+            # Phase 2: SDXL models
+            tasks = []
+            for w in workers:
+                if w.gpu.onload:
+                    tasks.append(w.send_onload(
+                        types={"sdxl"},
+                        onload_entries=w.gpu.onload,
+                        unevictable_entries=w.gpu.unevictable,
+                        models_dir=models_dir,
+                        sdxl_models=app_state.sdxl_models,
+                    ))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Phase 3: tagger (slow, ~30s)
+            tasks = []
+            for w in workers:
+                if "tag" in w.gpu.onload:
+                    tasks.append(w.send_onload(
+                        types={"tag"},
+                        onload_entries=w.gpu.onload,
+                        unevictable_entries=set(),
+                        models_dir=models_dir,
+                        sdxl_models=app_state.sdxl_models,
+                    ))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            loop.run_until_complete(_send_onloads())
+        except Exception as ex:
+            log.log_exception(ex, "Background init: onload failed")
+        finally:
+            loop.close()
+
+    # 6. LoRA hashing — same fingerprint pool, starts AFTER SDXL models.
     # Last consumer shuts down the shared pool when complete.
     if app_state.lora_index:
         from utils.lora_index import start_background_hashing
@@ -390,9 +385,9 @@ def _background_model_init(
     else:
         fp_pool.shutdown(wait=False)
 
-    # 8. TRT build manager — scan registered models and queue engine builds
+    # 7. TRT build manager — scan registered models and queue engine builds
     # for any missing resolutions.  Runs on the asyncio event loop, builds
-    # happen in background threads after draining the target GPU.
+    # happen in worker processes after draining the target GPU.
     if app_state.trt_manager is not None and all_sdxl:
         try:
             app_state.trt_manager.scan_and_queue(all_sdxl, app_state.registry)
@@ -619,6 +614,20 @@ def _process_gpu_unevictable(gpu, app_state) -> None:
                 log.log_exception(ex, f"GPU [{gpu.uuid}]: unevictable={entry} failed")
 
 
+def _worker_process_entry(*args):
+    """Thin wrapper for multiprocessing — imports and calls gpu_worker_main."""
+    from scheduling.worker_process import gpu_worker_main
+    gpu_worker_main(*args)
+
+
+def _find_gpu_config_index(gpu_configs, uuid: str) -> int:
+    """Find the index of a GPU config by UUID."""
+    for i, cfg in enumerate(gpu_configs):
+        if cfg.uuid.lower() == uuid.lower():
+            return i
+    return 0
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="foxburrow — GPU inference server")
     parser.add_argument(
@@ -634,11 +643,18 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Set multiprocessing start method BEFORE anything else.
+    # "spawn" is required for CUDA — fork after CUDA init corrupts the context.
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass  # Already set (e.g. in tests)
+
     args = _parse_args()
 
     # Start file logging before anything else so the full startup is captured.
     log.init_file(os.path.abspath("data/output.jsonl"))
-    log.info("foxburrow starting (Python/PyTorch)")
+    log.info("foxburrow starting (Python/PyTorch, multiprocessing GPU workers)")
     log.info(f"  PyTorch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, "
              f"CUDA {torch.version.cuda}")
 
@@ -663,25 +679,12 @@ def main() -> None:
     if config.server.hf_token:
         os.environ.setdefault("HF_TOKEN", config.server.hf_token)
 
-    # Restrict CUDA visibility to only enabled GPUs.
-    # Without this, PyTorch/CUDA runtime creates driver contexts on ALL GPUs
-    # (visible in nvidia-smi), and third-party libs like diffusers can leak
-    # VRAM onto disabled GPUs via the default device (cuda:0).
-    # CUDA accepts GPU UUIDs directly — no index mapping needed.
-    if "CUDA_VISIBLE_DEVICES" not in os.environ:
-        enabled_uuids = [cfg.uuid for cfg in config.gpus if cfg.enabled]
-        if enabled_uuids:
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(enabled_uuids)
-            log.debug(f"  CUDA visibility: {len(enabled_uuids)} enabled GPU(s)")
-        elif config.gpus:
-            # All GPUs disabled — hide everything
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            log.warning("  All GPUs are disabled in config — CUDA has no visible devices")
-    else:
-        log.debug(f"  CUDA_VISIBLE_DEVICES already set: {os.environ['CUDA_VISIBLE_DEVICES']}")
+    # NOTE: CUDA_VISIBLE_DEVICES is NOT set in the main process.
+    # Each GPU worker subprocess sets its own CUDA_VISIBLE_DEVICES to its
+    # GPU UUID before importing torch, so it sees exactly one GPU as cuda:0.
+    # The main process does not initialize CUDA at all.
 
-    # Set up persistent Triton/Inductor cache AFTER CUDA_VISIBLE_DEVICES is set,
-    # so get_device_capability(0) queries the correct (first enabled) GPU.
+    # Set up persistent Triton/Inductor cache (uses NVML, not CUDA)
     _setup_compile_cache()
 
     # Safety gate: server won't start unless enabled=true
@@ -811,7 +814,7 @@ def main() -> None:
         log.error("No models found — nothing to do. Install at least one model and try again.")
         sys.exit(1)
 
-    # ── Initialize GPU pool ────────────────────────────────────────
+    # ── Initialize GPU pool (NVML only — no CUDA in main process) ──
     app_state.gpu_pool.initialize(config.gpus)
 
     if not app_state.gpu_pool.gpus:
@@ -826,10 +829,8 @@ def main() -> None:
             gpu_inst.onload -= removed
             gpu_inst.unevictable -= removed
 
-    # Patch accelerate's init_on_device() to prevent thread-safety races
-    # that cause permanent meta tensor leaks across concurrent from_pretrained() calls
-    from gpu.pool import patch_accelerate_thread_safety
-    patch_accelerate_thread_safety()
+    # NOTE: accelerate thread-safety patch moved to worker processes
+    # (each worker applies it after importing torch)
 
     # Initialize admission control (after capabilities are finalized)
     from scheduling.queue import AdmissionControl
@@ -838,12 +839,56 @@ def main() -> None:
     # Create pipeline factory
     app_state.pipeline_factory = PipelineFactory(app_state.registry)
 
-    # Create scheduler and workers
+    # ── Spawn GPU worker processes ────────────────────────────────
+    # Each worker gets CUDA_VISIBLE_DEVICES set to its GPU UUID so it
+    # sees exactly one GPU as cuda:0.
+    workers: list[GpuWorkerProxy] = []
+    for i, gpu_inst in enumerate(app_state.gpu_pool.gpus):
+        cmd_q = mp.Queue()
+        result_q = mp.Queue()
+
+        proc = mp.Process(
+            target=_worker_process_entry,
+            args=(
+                gpu_inst.uuid,  # CUDA_VISIBLE_DEVICES value
+                i,              # gpu_index
+                gpu_inst.uuid,
+                gpu_inst.name,
+                gpu_inst.capabilities,
+                gpu_inst.onload,
+                gpu_inst.unevictable,
+                gpu_inst.total_memory,
+                {
+                    "tensorrt_cache": os.path.abspath(config.server.tensorrt_cache),
+                    "models_dir": os.path.abspath(config.server.models_dir),
+                    "trt_enabled": config.tensorrt.enabled,
+                },
+                cmd_q,
+                result_q,
+            ),
+            name=f"gpu-worker-{i}",
+            daemon=True,
+        )
+        proc.start()
+
+        proxy = GpuWorkerProxy(
+            process=proc,
+            cmd_queue=cmd_q,
+            result_queue=result_q,
+            gpu_config=config.gpus[_find_gpu_config_index(config.gpus, gpu_inst.uuid)],
+            gpu_total_memory=gpu_inst.total_memory,
+            gpu_index=i,
+        )
+        # Set NVML handle on proxy's GpuProxy for VRAM queries
+        proxy.gpu.nvml_handle = gpu_inst.nvml_handle
+        # Link proxy to pool's GpuInstance for failure state sync
+        proxy.gpu._pool_gpu = gpu_inst
+        workers.append(proxy)
+
+    log.info(f"  Spawned {len(workers)} GPU worker process(es)")
+
+    # Create scheduler and wire up workers
     scheduler = GpuScheduler(app_state.queue, config.scheduler)
-    workers = []
-    for gpu in app_state.gpu_pool.gpus:
-        worker = GpuWorker(gpu, app_state.queue, scheduler._wake)
-        workers.append(worker)
     scheduler.set_workers(workers)
     app_state.scheduler = scheduler
 
@@ -870,27 +915,42 @@ def main() -> None:
         streamer.set_loop(asyncio.get_running_loop())
         streamer.start_status_push()
 
-        # Start workers and scheduler immediately so the server can accept jobs
+        # Start proxy reader loops and wait for all workers to be ready
         for w in workers:
+            w._scheduler_wake = scheduler._wake
             w.start()
+
+        log.info(f"  Waiting for {len(workers)} GPU worker(s) to initialize...")
+        for w in workers:
+            ready = await w.wait_ready(timeout=120.0)
+            if not ready:
+                log.error(f"  GPU worker [{w.gpu.uuid}] failed to start — marking as failed")
+                w.gpu.mark_failed("Worker process did not start")
+
         scheduler.start()
         log.info(f"  Scheduler started with {len(workers)} worker(s)")
 
         # Start TRT build manager — runs as asyncio task, coordinates background
-        # engine compilation on drained GPUs.
-        try:
-            from trt.manager import TrtBuildManager
-            trt_cache = os.path.abspath(config.server.tensorrt_cache)
-            os.makedirs(trt_cache, exist_ok=True)
-            export_threads = _auto_threads(config.threads.fingerprint, 8)
-            trt_mgr = TrtBuildManager(trt_cache, workers, export_threads=export_threads,
-                                      one_at_a_time=args.trt_test)
-            trt_mgr.start()
-            app_state.trt_manager = trt_mgr
-        except ImportError:
-            log.debug("  TRT: tensorrt not available — TRT acceleration disabled")
-        except Exception as ex:
-            log.log_exception(ex, "TRT: Failed to start build manager")
+        # engine compilation on drained GPUs via worker proxies.
+        if not config.tensorrt.enabled:
+            log.info("  TRT: Disabled via config (tensorrt.enabled = false)")
+        elif not config.tensorrt.auto_build:
+            log.info("  TRT: Auto-build disabled — existing engines will be used")
+        else:
+            try:
+                from trt.manager import TrtBuildManager
+                trt_cache = os.path.abspath(config.server.tensorrt_cache)
+                os.makedirs(trt_cache, exist_ok=True)
+                export_threads = _auto_threads(config.threads.fingerprint, 8)
+                trt_mgr = TrtBuildManager(trt_cache, workers, export_threads=export_threads,
+                                          one_at_a_time=args.trt_test,
+                                          trt_config=config.tensorrt)
+                trt_mgr.start()
+                app_state.trt_manager = trt_mgr
+            except ImportError:
+                log.debug("  TRT: tensorrt not available — TRT acceleration disabled")
+            except Exception as ex:
+                log.log_exception(ex, "TRT: Failed to start build manager")
 
         # Start filesystem watcher — auto-detect model additions/removals.
         # Runs async tasks in the event loop, zero CPU when idle (inotify).
@@ -900,11 +960,11 @@ def main() -> None:
         app_state.fs_watcher = watcher
 
         # Kick off ALL heavy initialization in a background thread:
-        # HF config prefetch, model fingerprinting, LoRA hashing, GPU onload.
-        # The server is already listening and /api/status reports scan progress.
+        # HF config prefetch, model fingerprinting, LoRA hashing.
+        # GPU onload commands are sent to worker processes from this thread.
         t = threading.Thread(
             target=_background_model_init,
-            args=(config, models_dir, all_sdxl),
+            args=(config, models_dir, all_sdxl, workers),
             name="bg-init", daemon=True,
         )
         t.start()

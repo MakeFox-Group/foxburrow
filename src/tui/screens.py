@@ -151,11 +151,20 @@ class GpuDetailScreen(ModalScreen):
         from gpu import nvml
         from state import app_state
 
+        # Build worker proxy lookup for VRAM/cache data
+        workers_by_uuid = {}
+        if app_state.scheduler and app_state.scheduler.workers:
+            for w in app_state.scheduler.workers:
+                workers_by_uuid[w.gpu.uuid] = w
+
         for gpu in app_state.gpu_pool.gpus:
             try:
                 card = self.query_one(f"#gpu-card-{gpu.device_id}", Static)
             except Exception:
                 continue
+
+            worker = workers_by_uuid.get(gpu.uuid)
+            proxy_gpu = worker.gpu if worker else None
 
             text = Text()
 
@@ -176,28 +185,30 @@ class GpuDetailScreen(ModalScreen):
             except Exception:
                 text.append("(NVML stats unavailable)\n", style="dim")
 
-            # VRAM breakdown
-            vram = gpu.get_vram_stats()
+            # VRAM breakdown — use proxy's cached stats (no CUDA calls in main)
+            vram = proxy_gpu.get_vram_stats() if proxy_gpu else {}
             text.append("\n")
             text.append("VRAM: ")
-            text.append_text(_vram_bar(vram["used"], vram["total"], width=30))
+            used_nvml = vram.get("used", 0)
+            total_vram = vram.get("total", gpu.total_memory)
+            text.append_text(_vram_bar(used_nvml, total_vram, width=30))
             text.append("\n")
-            text.append(f"  Allocated (tensors): {_format_bytes(vram['allocated'])}\n")
-            text.append(f"  Reserved (cache):    {_format_bytes(vram['reserved'])}\n")
-            text.append(f"  Used (NVML):         {_format_bytes(vram['used'])}\n")
-            text.append(f"  Total:               {_format_bytes(vram['total'])}\n")
-            text.append(f"  Free (NVML):         {_format_bytes(vram['free'])}\n")
+            text.append(f"  Allocated (tensors): {_format_bytes(vram.get('allocated', 0))}\n")
+            text.append(f"  Reserved (cache):    {_format_bytes(vram.get('reserved', 0))}\n")
+            text.append(f"  Used (NVML):         {_format_bytes(used_nvml)}\n")
+            text.append(f"  Total:               {_format_bytes(total_vram)}\n")
+            text.append(f"  Free (NVML):         {_format_bytes(vram.get('free', 0))}\n")
 
-            # Cache contents
-            cached = gpu.get_cached_models_info()
+            # Cache contents — use proxy's cached model info
+            cached = proxy_gpu.get_cached_models_info() if proxy_gpu else []
             text.append(f"\nModel Cache ({len(cached)} entries):\n")
             if cached:
                 for m in cached:
-                    vram_str = _format_bytes(m["vram"])
-                    text.append(f"  {m['category']:<12}", style="bold")
-                    text.append(f" {m['source'] or '?':<20}")
+                    vram_str = _format_bytes(m.get("vram", 0))
+                    text.append(f"  {m.get('category', '?'):<12}", style="bold")
+                    text.append(f" {m.get('source', '?') or '?':<20}")
                     text.append(f" {vram_str:>8}")
-                    if m["actual_vram"] > 0:
+                    if m.get("actual_vram", 0) > 0:
                         text.append("  (measured)", style="dim")
                     else:
                         text.append("  (estimated)", style="dim italic")

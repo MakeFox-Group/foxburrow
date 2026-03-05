@@ -624,28 +624,18 @@ class GpuPool:
                             f"NVML devices — skipping")
                 continue
 
-            # Map NVML device to CUDA index via PCI bus ID bridge
-            cuda_idx = _cuda_index_from_pci_bus_id(nvml_dev.pci_bus_id)
-            if cuda_idx is None:
-                # Fallback: with CUDA_DEVICE_ORDER=PCI_BUS_ID, NVML index
-                # should match CUDA index
-                log.warning(f"  GpuPool: Could not resolve CUDA index for "
-                            f"GPU [{cfg.uuid}] via PCI bus ID "
-                            f"({nvml_dev.pci_bus_id}), falling back to "
-                            f"NVML index {nvml_dev.index}")
-                cuda_idx = nvml_dev.index
+            # Use NVML index as placeholder — workers always use cuda:0 via
+            # CUDA_VISIBLE_DEVICES, so the main process doesn't need to resolve
+            # the real CUDA index (which would require touching libcudart).
+            cuda_idx = nvml_dev.index
 
             gpu = GpuInstance(cfg, nvml_dev, cuda_idx)
             self.gpus.append(gpu)
 
-            # Cap VRAM allocation at 98% — turns fatal Xid 31 MMU faults into
-            # recoverable torch.cuda.OutOfMemoryError when cuDNN overcommits.
-            try:
-                torch.cuda.set_per_process_memory_fraction(0.98, gpu.device)
-                cap_mb = int(nvml_dev.total_memory * 0.98 / (1024 * 1024))
-                log.debug(f"  GpuPool: VRAM cap set to 98% ({cap_mb}MB) on CUDA:{cuda_idx}")
-            except Exception as e:
-                log.warning(f"  GpuPool: Could not set VRAM cap on CUDA:{cuda_idx}: {e}")
+            # NOTE: In the multiprocessing architecture, these GpuInstance objects
+            # are config/NVML holders only.  Workers create their own GpuInstance
+            # internally (with real cuda:0 device).  VRAM caps, runtime feature
+            # checks, and model caching all happen inside worker subprocesses.
 
             log.debug(f"  GpuPool: Registered GPU [{cfg.uuid}] = {nvml_dev.name} "
                      f"(CUDA:{cuda_idx}, PCI={nvml_dev.pci_bus_id}, "
@@ -658,12 +648,6 @@ class GpuPool:
                 "total_memory": nvml_dev.total_memory,
                 "capabilities": sorted(cfg.capabilities),
             })
-
-        # Probe fork features against the actual CUDA allocator backend.
-        # Must run after at least one GPU is registered (CUDA context ready).
-        if self.gpus:
-            from gpu.torch_ext import check_runtime_support
-            check_runtime_support(self.gpus[0].device)
 
     def remove_gpu(self, uuid: str) -> bool:
         """Remove a GPU by UUID and fire a ``gpu_removed`` event.

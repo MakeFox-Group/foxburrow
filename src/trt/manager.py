@@ -28,14 +28,13 @@ import torch
 import log
 from trt.builder import (
     all_engines_exist,
-    build_all_engines,
     get_arch_key,
     get_onnx_path,
 )
 from trt.exporter import export_te1_onnx, export_te2_onnx, export_unet_onnx, export_vae_onnx
 
 if TYPE_CHECKING:
-    from scheduling.worker import GpuWorker
+    from scheduling.worker_proxy import GpuWorkerProxy as GpuWorker
 
 # Seconds a GPU lingers after finishing a build, waiting for more work
 # before releasing the drain.  Avoids repeated drain/release cycles when
@@ -67,10 +66,13 @@ class TrtBuildManager:
         workers: list[GpuWorker],
         export_threads: int = 0,
         one_at_a_time: bool = False,
+        trt_config: "TensorrtConfig | None" = None,
     ):
+        from config import TensorrtConfig
         self._cache_dir = os.path.abspath(cache_dir)
         self._workers = workers
         self._one_at_a_time = one_at_a_time
+        self._trt_config = trt_config or TensorrtConfig()
         self._ready_models: set[str] = set()
         self._queued_models: set[str] = set()
         self._lock = threading.Lock()
@@ -91,11 +93,17 @@ class TrtBuildManager:
         self._arch_work_available: dict[str, asyncio.Event] = {}
         self._arch_workers: dict[str, list[GpuWorker]] = {}
 
-        # Precompute arch → workers mapping (stable for process lifetime)
+        # Precompute arch → workers mapping (stable for process lifetime).
+        # With multiprocessing workers, arch_key comes from the worker's
+        # cached status (set after WorkerReady).
         for w in workers:
             if w.gpu.is_failed:
                 continue
-            ak = get_arch_key(w.gpu.device_id)
+            # Use the proxy's cached arch_key from the worker process
+            ak = w._arch_key
+            if not ak:
+                # Worker may not be ready yet — use device_id as fallback
+                ak = get_arch_key(w.gpu.device_id)
             if ak not in self._arch_workers:
                 self._arch_workers[ak] = []
                 self._arch_queues[ak] = asyncio.Queue()
@@ -121,9 +129,29 @@ class TrtBuildManager:
         archs = list(self._arch_workers.keys())
         gpu_counts = {ak: len(ws) for ak, ws in self._arch_workers.items()}
         mode = "one-at-a-time" if self._one_at_a_time else "pipelined"
+        ws_default = self._trt_config.workspace_gb
+        ws_overrides = self._trt_config.workspace_gb_per_arch
+        ws_info = f"workspace={ws_default:.0f}GB"
+        if ws_overrides:
+            ws_info += " (" + ", ".join(f"{k}={v:.0f}GB" for k, v in ws_overrides.items()) + ")"
         log.info(f"  TRT: Build manager started (cache: {self._cache_dir}, "
                  f"export_threads: {self._export_threads}, mode: {mode}, "
-                 f"architectures: {gpu_counts})")
+                 f"architectures: {gpu_counts}, {ws_info})")
+
+    def _get_workspace_gb(self, arch_key: str) -> float:
+        """Resolve workspace GB for an architecture from config.
+
+        Priority: per-arch override > default workspace_gb.
+        A value of 0 passes through to the builder, which will
+        auto-detect from available GPU VRAM in that case.
+        """
+        # Check per-arch override first (strip _cuXXX suffix for matching)
+        # e.g. arch_key "sm_89_cu130" should match config key "sm_89"
+        arch_base = arch_key.rsplit("_cu", 1)[0] if "_cu" in arch_key else arch_key
+        ws = self._trt_config.workspace_gb_per_arch.get(arch_base)
+        if ws is not None:
+            return ws
+        return self._trt_config.workspace_gb
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -360,9 +388,13 @@ class TrtBuildManager:
 
     async def _gpu_build_loop(self, worker: GpuWorker, arch_key: str) -> None:
         """Drain a GPU, build engines from the arch queue, linger for more
-        work, then release the GPU back to inference."""
+        work, then release the GPU back to inference.
+
+        With multiprocessing workers, TRT builds run inside the worker
+        subprocess via the trt_build() proxy method — true parallel execution
+        across GPUs with no GIL contention.
+        """
         queue = self._arch_queues[arch_key]
-        loop = asyncio.get_running_loop()
         device_id = worker.gpu.device_id
         drained = False
 
@@ -401,28 +433,32 @@ class TrtBuildManager:
                     self._check_model_ready(request.model_hash)
                     continue
 
-                # Build engines
+                # Build engines via worker subprocess (true parallel per GPU)
                 log.info(f"  TRT: [{arch_key}] GPU {device_id} building "
                          f"{short_hash}...")
                 try:
-                    results = await loop.run_in_executor(
-                        None,
-                        build_all_engines,
-                        request.model_hash,
-                        self._cache_dir,
-                        arch_key,
-                        device_id,
+                    trt_result = await worker.trt_build(
+                        model_hash=request.model_hash,
+                        model_dir=request.model_dir,
+                        cache_dir=self._cache_dir,
+                        arch_key=arch_key,
+                        max_workspace_gb=self._get_workspace_gb(arch_key),
                     )
-                    built_te1 = results.get("te1", [])
-                    built_te2 = results.get("te2", [])
-                    built_unet = results.get("unet", [])
-                    built_vae = results.get("vae", [])
-                    log.info(f"  TRT: [{arch_key}] {short_hash}: "
-                             f"TE1 [{', '.join(built_te1)}] + "
-                             f"TE2 [{', '.join(built_te2)}] + "
-                             f"UNet [{', '.join(built_unet)}] + "
-                             f"VAE [{', '.join(built_vae)}]")
-                    self._check_model_ready(request.model_hash)
+                    if trt_result.success:
+                        results = trt_result.results
+                        built_te1 = results.get("te1", [])
+                        built_te2 = results.get("te2", [])
+                        built_unet = results.get("unet", [])
+                        built_vae = results.get("vae", [])
+                        log.info(f"  TRT: [{arch_key}] {short_hash}: "
+                                 f"TE1 [{', '.join(built_te1)}] + "
+                                 f"TE2 [{', '.join(built_te2)}] + "
+                                 f"UNet [{', '.join(built_unet)}] + "
+                                 f"VAE [{', '.join(built_vae)}]")
+                        self._check_model_ready(request.model_hash)
+                    else:
+                        log.error(f"  TRT: [{arch_key}] Engine build failed for "
+                                  f"{short_hash}: {trt_result.error}")
                 except Exception as ex:
                     log.log_exception(
                         ex, f"TRT: [{arch_key}] Engine build failed for "

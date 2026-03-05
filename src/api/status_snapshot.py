@@ -23,42 +23,36 @@ def compute_status_snapshot() -> dict[str, Any]:
     pool = app_state.gpu_pool
     scheduler = app_state.scheduler
 
-    workers_by_uuid: dict[str, Any] = {}
-    if scheduler and scheduler.workers:
-        for w in scheduler.workers:
-            workers_by_uuid[w.gpu.uuid] = w
+    workers = list(scheduler.workers) if scheduler and scheduler.workers else []
 
     # Per-GPU info (lightweight: no active_jobs detail)
     gpus = []
-    for g in pool.gpus:
+    for w in workers:
         gpu_info: dict[str, Any] = {
-            "uuid": g.uuid,
-            "busy": g.is_busy,
-            "active_count": 0,
-            "loaded_models": g.get_cached_models_info(),
-            "vram": g.get_vram_stats(),
+            "uuid": w.gpu.uuid,
+            "busy": w.gpu.is_busy,
+            "active_count": w.active_count,
+            "loaded_models": w.gpu.get_cached_models_info(),
+            "vram": w.gpu.get_vram_stats(),
         }
 
-        worker = workers_by_uuid.get(g.uuid)
-        if worker:
-            gpu_info["active_count"] = worker.active_count
-            from scheduling.worker import estimate_gpu_slots
-            try:
-                gpu_info["slots"] = estimate_gpu_slots(worker)
-            except Exception as ex:
-                log.log_exception(ex, f"status_snapshot: slots for GPU [{g.uuid}]")
-                gpu_info["slots"] = {}
+        from scheduling.worker import estimate_gpu_slots
+        try:
+            gpu_info["slots"] = estimate_gpu_slots(w)
+        except Exception as ex:
+            log.log_exception(ex, f"status_snapshot: slots for GPU [{w.gpu.uuid}]")
+            gpu_info["slots"] = {}
 
         gpus.append(gpu_info)
 
     # Readiness scores
     readiness = {}
     sdxl_models_snapshot = dict(app_state.sdxl_models)
-    if scheduler and scheduler.workers:
+    if workers:
         from scheduling.readiness import compute_readiness
         try:
             readiness = compute_readiness(
-                pool, scheduler.workers, app_state.registry, sdxl_models_snapshot)
+                pool, workers, app_state.registry, sdxl_models_snapshot)
         except Exception as ex:
             log.log_exception(ex, "status_snapshot: readiness")
 
@@ -70,10 +64,10 @@ def compute_status_snapshot() -> dict[str, Any]:
         except Exception as ex:
             log.log_exception(ex, "status_snapshot: available_slots")
 
-    # Tag slots
-    from handlers.tagger import is_loaded_on
-    tag_count = sum(1 for g in pool.gpus
-                    if g.supports_capability("tag") and is_loaded_on(g.device))
+    # Tag slots — check via proxy cached categories
+    tag_count = sum(1 for w in workers
+                    if w.gpu.supports_capability("tag")
+                    and "tagger" in w.gpu.get_cached_categories())
     available_slots["tag"] = tag_count
 
     # Max concurrent + admission
@@ -82,7 +76,7 @@ def compute_status_snapshot() -> dict[str, Any]:
         admission_snapshot = app_state.admission.snapshot()
         max_concurrent = app_state.admission.max_concurrent
     else:
-        num_active_gpus = sum(1 for g in pool.gpus if not g.is_failed)
+        num_active_gpus = sum(1 for w in workers if not w.gpu.is_failed)
         max_concurrent = num_active_gpus + (num_active_gpus // 2)
 
     return {

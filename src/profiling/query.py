@@ -29,13 +29,13 @@ _CHUNK_SIZE = 65536
 
 # ── File helpers ─────────────────────────────────────────────────────
 
-def _get_trace_paths(arch: str | None = None) -> list[str]:
-    """Get paths to trace files, optionally filtered by arch."""
+def _get_trace_paths(gpu_uuid: str | None = None) -> list[str]:
+    """Get paths to trace files, optionally filtered by GPU UUID."""
     if not os.path.isdir(_TRACES_DIR):
         return []
 
-    if arch:
-        path = os.path.join(_TRACES_DIR, f"{arch}.jsonl")
+    if gpu_uuid:
+        path = os.path.join(_TRACES_DIR, f"{gpu_uuid}.jsonl")
         return [path] if os.path.isfile(path) else []
 
     return sorted(
@@ -123,7 +123,7 @@ def _matches_filters(
 # ── Public API ───────────────────────────────────────────────────────
 
 def list_trace_files() -> list[dict[str, Any]]:
-    """List available trace files with metadata (arch, size, event count)."""
+    """List available trace files with metadata (gpu_uuid, size, event count)."""
     if not os.path.isdir(_TRACES_DIR):
         return []
 
@@ -133,7 +133,7 @@ def list_trace_files() -> list[dict[str, Any]]:
             continue
         path = os.path.join(_TRACES_DIR, name)
         result.append({
-            "arch": name.removesuffix(".jsonl"),
+            "gpu_uuid": name.removesuffix(".jsonl"),
             "file": name,
             "size_bytes": os.path.getsize(path),
             "event_count": _count_lines(path),
@@ -142,11 +142,10 @@ def list_trace_files() -> list[dict[str, Any]]:
 
 
 def search_events(
-    arch: str | None = None,
+    gpu_uuid: str | None = None,
     job_id: str | None = None,
     event_type: str | None = None,
     model: str | None = None,
-    gpu_uuid: str | None = None,
     after: str | None = None,
     before: str | None = None,
     limit: int = 500,
@@ -157,7 +156,7 @@ def search_events(
     Uses reverse file reading for efficient recent-event queries. Stops early
     once enough matching events are collected.
     """
-    paths = _get_trace_paths(arch)
+    paths = _get_trace_paths(gpu_uuid)
     if not paths:
         return []
 
@@ -178,9 +177,10 @@ def search_events(
 
             if _matches_filters(ev, job_id, event_type, model, gpu_uuid, after, before):
                 filtered.append(ev)
+                if len(filtered) >= needed:
+                    break
 
-        # For single-file queries, we can stop if we have enough
-        if len(paths) == 1 and len(filtered) >= needed:
+        if len(filtered) >= needed:
             break
 
     # For multi-file, sort globally by timestamp (each file is internally ordered)
@@ -194,6 +194,7 @@ def aggregate_stats(
     group_by: str = "model",
     event_type: str | None = None,
     model: str | None = None,
+    gpu_uuid: str | None = None,
     after: str | None = None,
     before: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -207,7 +208,7 @@ def aggregate_stats(
             f"Invalid group_by={group_by!r}. "
             f"Valid values: {', '.join(sorted(_VALID_GROUP_BY))}")
 
-    paths = _get_trace_paths()
+    paths = _get_trace_paths(gpu_uuid)
 
     # Stream through events, grouping durations
     groups: dict[str, list[float]] = {}
@@ -215,6 +216,8 @@ def aggregate_stats(
         if event_type and ev.get("type") != event_type:
             continue
         if model and model.lower() not in (ev.get("model") or "").lower():
+            continue
+        if gpu_uuid and ev.get("gpu_uuid") != gpu_uuid:
             continue
         if after and ev.get("ts", "") < after:
             continue

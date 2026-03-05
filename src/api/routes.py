@@ -106,21 +106,22 @@ def _release_admission(job_type) -> None:
         state.admission.release(job_type)
 
 
-def _find_gpu_with_tagger(state) -> "GpuInstance | None":
-    """Find a GPU with the tagger loaded.
+def _find_proxy_with_tagger(state):
+    """Find a worker proxy with the tagger loaded.
 
     Taggers can always run regardless of other GPU work (tiny VRAM footprint,
     fast inference), so we don't filter by busyness — just pick the first
     loaded tagger, preferring idle GPUs for best latency.
     """
-    from handlers.tagger import is_loaded_on
+    if state.scheduler is None:
+        return None
     best = None
-    for g in state.gpu_pool.gpus:
-        if g.supports_capability("tag") and is_loaded_on(g.device):
-            if not g.is_busy:
-                return g  # prefer idle for best latency
+    for proxy in state.scheduler.workers:
+        if proxy.gpu.supports_capability("tag") and "tagger" in proxy.gpu.get_cached_categories():
+            if proxy.is_idle:
+                return proxy  # prefer idle for best latency
             if best is None:
-                best = g
+                best = proxy
     return best
 
 
@@ -213,9 +214,9 @@ async def status():
         gpu_info["name"] = g.name
         gpu_info["device_id"] = g.device_id
         gpu_info["capabilities"] = sorted(g.capabilities)
-        gpu_info["session_cache_count"] = g.session_cache_count
-
         worker = workers_by_uuid.get(g.uuid)
+        gpu_info["session_cache_count"] = worker.gpu.session_cache_count if worker else 0
+
         if worker:
             active_jobs = []
             for job in worker.active_jobs:
@@ -494,13 +495,12 @@ async def add_gpu(uuid: str):
         "capabilities": sorted(gpu.capabilities),
     })
 
-    # Create and start a worker for this GPU
-    if scheduler:
-        from scheduling.worker import GpuWorker
-        worker = GpuWorker(gpu, state.queue, scheduler._wake)
-        scheduler.workers.append(worker)
-        worker.start()
-        log.debug(f"  GPU [{gpu.uuid}] re-added with worker")
+    # TODO: hot-add needs rework for multiprocessing architecture.
+    # Previously created a GpuWorker (thread-based); now needs to spawn a
+    # worker subprocess + GpuWorkerProxy.  For now, GPU is added to pool
+    # but has no worker — it won't receive dispatched work.
+    log.warning(f"  GPU [{gpu.uuid}] added to pool but no worker spawned "
+                f"(hot-add not yet supported with multiprocessing workers)")
 
     return {
         "added": True,
@@ -1230,11 +1230,9 @@ async def bgremove(request: Request):
 
 @router.post("/tag")
 async def tag(request: Request):
-    from handlers.tagger import process_image, is_loaded_on
-
     state = _get_state()
-    gpu = _find_gpu_with_tagger(state)
-    if gpu is None:
+    proxy = _find_proxy_with_tagger(state)
+    if proxy is None:
         return _error(404, "No GPUs with tagger loaded on this worker.")
 
     body = await request.body()
@@ -1243,12 +1241,14 @@ async def tag(request: Request):
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    log.debug(f"Tag request: {input_image.width}x{input_image.height} on GPU [{gpu.uuid}]")
+    log.debug(f"Tag request: {input_image.width}x{input_image.height} on GPU [{proxy.gpu.uuid}]")
 
     try:
-        tags = process_image(input_image, gpu)
-        log.debug(f"Tag complete: {len(tags)} tags")
-        return {"tags": tags}
+        result = await proxy.tag_image(input_image)
+        if result.error:
+            return _error(500, result.error)
+        log.debug(f"Tag complete: {len(result.tags)} tags")
+        return {"tags": result.tags}
     except Exception as ex:
         log.log_exception(ex, "Tag failed")
         return _error(500, str(ex))
@@ -1532,11 +1532,9 @@ async def enqueue_bgremove(request: Request):
 
 @router.post("/enqueue/tag")
 async def enqueue_tag(request: Request):
-    from handlers.tagger import process_image as _tag_process
-
     state = _get_state()
-    gpu = _find_gpu_with_tagger(state)
-    if gpu is None:
+    proxy = _find_proxy_with_tagger(state)
+    if proxy is None:
         return _error(404, "No GPUs with tagger loaded on this worker.")
 
     body = await request.body()
@@ -1556,15 +1554,17 @@ async def enqueue_tag(request: Request):
 
     _register_job(job)
 
-    # Run in executor to avoid blocking the event loop
     try:
-        loop = asyncio.get_running_loop()
-        tags = await loop.run_in_executor(None, _tag_process, input_image, gpu)
-        tag_bytes = json.dumps({"tags": tags}).encode("utf-8")
-        state.job_results[job.job_id] = (tag_bytes, "application/json")
-        job.completed_at = datetime.utcnow()
-        job.set_result(JobResult(success=True))
-        log.debug(f"Enqueue tag complete: {len(tags)} tags, job_id={job.job_id}")
+        result = await proxy.tag_image(input_image)
+        if result.error:
+            job.completed_at = datetime.utcnow()
+            job.set_result(JobResult(success=False, error=result.error))
+        else:
+            tag_bytes = json.dumps({"tags": result.tags}).encode("utf-8")
+            state.job_results[job.job_id] = (tag_bytes, "application/json")
+            job.completed_at = datetime.utcnow()
+            job.set_result(JobResult(success=True))
+            log.debug(f"Enqueue tag complete: {len(result.tags)} tags, job_id={job.job_id}")
     except Exception as ex:
         job.completed_at = datetime.utcnow()
         job.set_result(JobResult(success=False, error=str(ex)))
@@ -1988,7 +1988,6 @@ async def profiling_traces():
 
 @router.get("/profiling/search")
 async def profiling_search(
-    arch: str | None = None,
     job_id: str | None = None,
     type: str | None = None,
     model: str | None = None,
@@ -2003,8 +2002,8 @@ async def profiling_search(
     loop = asyncio.get_running_loop()
     events = await loop.run_in_executor(
         None, lambda: search_events(
-            arch=arch, job_id=job_id, event_type=type, model=model,
-            gpu_uuid=gpu_uuid, after=after, before=before,
+            gpu_uuid=gpu_uuid, job_id=job_id, event_type=type, model=model,
+            after=after, before=before,
             limit=limit, offset=offset,
         ))
     return {"events": events, "count": len(events)}
@@ -2015,6 +2014,7 @@ async def profiling_stats(
     group_by: str = Query(default="model"),
     type: str | None = None,
     model: str | None = None,
+    gpu_uuid: str | None = None,
     after: str | None = None,
     before: str | None = None,
 ):
@@ -2025,7 +2025,7 @@ async def profiling_stats(
         groups = await loop.run_in_executor(
             None, lambda: aggregate_stats(
                 group_by=group_by, event_type=type, model=model,
-                after=after, before=before,
+                gpu_uuid=gpu_uuid, after=after, before=before,
             ))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})

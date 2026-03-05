@@ -15,7 +15,7 @@ from scheduling.queue import JobQueue, WorkGroup
 from scheduling.readiness import _estimate_remaining_s
 
 if TYPE_CHECKING:
-    from scheduling.worker import GpuWorker
+    from scheduling.worker_proxy import GpuWorkerProxy as GpuWorker
 
 
 # Session key/group mappings
@@ -69,9 +69,6 @@ class GpuScheduler:
 
     def set_workers(self, workers: list[GpuWorker]) -> None:
         self._workers = workers
-        # Give each worker a reference to all workers for cross-GPU failure propagation
-        for w in workers:
-            w._all_workers = workers
 
     def start(self) -> None:
         self._task = asyncio.get_running_loop().create_task(self._run_loop())

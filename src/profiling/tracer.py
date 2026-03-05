@@ -1,4 +1,4 @@
-"""GPU profiling tracer — appends structured JSONL events to per-architecture trace files.
+"""GPU profiling tracer — appends structured JSONL events to per-GPU-UUID trace files.
 
 Delivery guarantee: at-most-once for in-flight events. A reader opening
 the same file may see a partial trailing line if a write is in progress;
@@ -21,7 +21,8 @@ _TRACES_DIR = os.path.join(
     "data", "profiling", "traces",
 )
 
-# Per-file locks to prevent interleaving from concurrent workers on the same arch
+# One lock per GPU UUID file path. Bounded by the number of distinct GPU UUIDs
+# ever registered in this process lifetime.
 _file_locks: dict[str, threading.Lock] = {}
 _file_locks_guard = threading.Lock()
 
@@ -42,7 +43,7 @@ class GpuTracer:
         self.gpu_name = gpu_name
 
         os.makedirs(_TRACES_DIR, exist_ok=True)
-        self._path = os.path.join(_TRACES_DIR, f"{gpu_arch}.jsonl")
+        self._path = os.path.join(_TRACES_DIR, f"{gpu_uuid}.jsonl")
         self._lock = _get_file_lock(self._path)
         self._file = open(self._path, "a", encoding="utf-8")
 
@@ -50,10 +51,11 @@ class GpuTracer:
         """Flush and close the underlying file handle."""
         try:
             with self._lock:
-                self._file.flush()
-                self._file.close()
-        except Exception:
-            pass
+                if not self._file.closed:
+                    self._file.flush()
+                    self._file.close()
+        except Exception as ex:
+            log.warning(f"GpuTracer.close failed for {self._path}: {ex}")
 
     def record(self, event_type: str, job_id: str, model: str | None,
                duration_s: float, **extra: Any) -> None:
@@ -71,6 +73,8 @@ class GpuTracer:
 
         line = json.dumps(event, separators=(",", ":")) + "\n"
         with self._lock:
+            if self._file.closed:
+                return
             self._file.write(line)
             self._file.flush()
 

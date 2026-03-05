@@ -16,9 +16,9 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from gpu.pool import GpuInstance, GpuPool
+    from gpu.pool import GpuPool
     from scheduling.model_registry import ModelRegistry
-    from scheduling.worker import GpuWorker
+    from scheduling.worker_proxy import GpuProxy, GpuWorkerProxy as GpuWorker
 
 
 # Default model load rate (bytes/sec) for estimated_ready_s calculations.
@@ -84,50 +84,51 @@ def _estimate_remaining_s(worker: GpuWorker) -> float:
     return max_remaining
 
 
-def _would_evict_for_vram(gpu: GpuInstance, target_group: str, needed_vram: int) -> list[str]:
+def _would_evict_for_vram(gpu: GpuProxy, target_group: str, needed_vram: int) -> list[str]:
     """Return categories that would actually need evicting to free needed_vram.
 
-    Only counts models from non-target groups that LRU eviction would remove,
-    stopping once enough VRAM would be freed.  Returns empty list if enough
-    free VRAM exists without eviction.
+    Uses the proxy's cached_models_info (LRU-ordered) to estimate which models
+    would be evicted.  Returns empty list if enough free VRAM exists without
+    eviction.
+
+    Note: active/unevictable filtering is approximate since that data lives
+    in the worker process.  Slightly optimistic but acceptable for advisory scoring.
     """
     vram = gpu.get_vram_stats()
-    deficit = needed_vram - vram["free"]
+    if not vram:
+        return []
+    deficit = needed_vram - vram.get("free", 0)
     if deficit <= 0:
         return []
 
+    models = gpu.get_cached_models_info()  # LRU-ordered list of dicts
     evicted = []
     freed = 0
-    with gpu._cache_lock:
-        active_fps = gpu.get_active_fingerprints()
-        # Walk LRU order (oldest first), matching evict_lru's two-pass strategy:
-        # Pass 1: non-current-group models
-        for fp in list(gpu._cache.keys()):
+
+    # Pass 1: non-target-group models (prefer evicting cross-group first)
+    for m in models:
+        if freed >= deficit:
+            break
+        cat = m.get("category", "")
+        if _get_group_for_category(cat) != target_group:
+            evicted.append(cat)
+            freed += m.get("vram", 0)
+
+    # Pass 2: any model (if still short)
+    if freed < deficit:
+        for m in models:
             if freed >= deficit:
                 break
-            if fp in active_fps or fp in gpu._unevictable_fingerprints:
-                continue
-            m = gpu._cache[fp]
-            if _get_group_for_category(m.category) != target_group:
-                evicted.append(m.category)
-                freed += m.actual_vram if m.actual_vram > 0 else m.estimated_vram
-        # Pass 2: any evictable model (if still short)
-        if freed < deficit:
-            for fp in list(gpu._cache.keys()):
-                if freed >= deficit:
-                    break
-                if fp in active_fps or fp in gpu._unevictable_fingerprints:
-                    continue
-                m = gpu._cache[fp]
-                cat = m.category
-                if cat not in evicted:
-                    evicted.append(cat)
-                    freed += m.actual_vram if m.actual_vram > 0 else m.estimated_vram
+            cat = m.get("category", "")
+            if cat not in evicted:
+                evicted.append(cat)
+                freed += m.get("vram", 0)
+
     return evicted
 
 
 def _score_simple_task(
-    gpu: GpuInstance,
+    gpu: GpuProxy,
     worker: GpuWorker,
     target_category: str,
     target_group: str,
@@ -137,15 +138,7 @@ def _score_simple_task(
     Returns dict with score, estimated_wait_s, model_loaded, would_evict.
     """
     score = 0
-    model_loaded = False
-
-    # Check if the model is already loaded (single lock acquisition for both
-    # model_loaded check and eviction analysis)
-    with gpu._cache_lock:
-        for m in gpu._cache.values():
-            if m.category == target_category:
-                model_loaded = True
-                break
+    model_loaded = target_category in gpu.get_cached_categories()
 
     if model_loaded:
         score += 500
@@ -193,7 +186,7 @@ def _score_simple_task(
 
 
 def _score_sdxl_checkpoint(
-    gpu: GpuInstance,
+    gpu: GpuProxy,
     worker: GpuWorker,
     model_dir: str,
     registry: ModelRegistry,
@@ -247,16 +240,18 @@ def _score_sdxl_checkpoint(
         score -= int(15 * wait_s)
 
     # Session group affinity
-    if gpu._current_group == "sdxl":
+    current_group = gpu.current_group
+    if current_group == "sdxl":
         score += 50
-    elif gpu._current_group is not None:
+    elif current_group is not None:
         score -= 50
 
     # VRAM eviction penalty — 30 points per 100MB of deficit,
     # so a full 3.5GB deficit = ~1050 penalty (competitive with component bonuses)
     if missing_vram > 0:
         vram = gpu.get_vram_stats()
-        deficit = max(0, missing_vram - vram["free"])
+        free = vram.get("free", 0) if vram else 0
+        deficit = max(0, missing_vram - free)
         if deficit > 0:
             score -= (deficit // (100 * 1024 * 1024)) * 30
 
@@ -269,7 +264,7 @@ def _score_sdxl_checkpoint(
         "components_loaded": loaded_count,
         "components_needed": len(scoring_components),
         "missing_vram_bytes": missing_vram,
-        "cached_lora_count": len(gpu._loaded_lora_adapters),
+        "cached_lora_count": gpu.loaded_lora_count,
     }
 
 
@@ -282,8 +277,8 @@ def compute_readiness(
     """Compute readiness scores for all task types and SDXL checkpoints.
 
     Args:
-        pool: GPU pool with all GPU instances
-        workers: list of GpuWorker (one per GPU)
+        pool: GPU pool (unused, kept for API compatibility)
+        workers: list of GpuWorkerProxy (one per GPU)
         registry: model registry with SDXL checkpoint info
         sdxl_models: dict of model_name -> model_dir
 
@@ -292,11 +287,6 @@ def compute_readiness(
     """
     # Snapshot worker list to avoid iteration-during-mutation
     workers = list(workers)
-
-    # Build GPU UUID -> worker lookup
-    worker_by_uuid: dict[str, GpuWorker] = {}
-    for w in workers:
-        worker_by_uuid[w.gpu.uuid] = w
 
     result: dict = {}
 
@@ -310,15 +300,11 @@ def compute_readiness(
     for task_key, (category, group) in simple_tasks.items():
         best: dict | None = None
 
-        for gpu in pool.gpus:
-            if not gpu.supports_capability(task_key):
+        for worker in workers:
+            if not worker.gpu.supports_capability(task_key):
                 continue
 
-            worker = worker_by_uuid.get(gpu.uuid)
-            if worker is None:
-                continue
-
-            entry = _score_simple_task(gpu, worker, category, group)
+            entry = _score_simple_task(worker.gpu, worker, category, group)
             if best is None or entry["score"] > best["score"]:
                 best = entry
 
@@ -331,15 +317,11 @@ def compute_readiness(
     for model_name, model_dir in sdxl_models.items():
         best: dict | None = None
 
-        for gpu in pool.gpus:
-            if not gpu.supports_capability("sdxl"):
+        for worker in workers:
+            if not worker.gpu.supports_capability("sdxl"):
                 continue
 
-            worker = worker_by_uuid.get(gpu.uuid)
-            if worker is None:
-                continue
-
-            entry = _score_sdxl_checkpoint(gpu, worker, model_dir, registry)
+            entry = _score_sdxl_checkpoint(worker.gpu, worker, model_dir, registry)
             if best is None or entry["score"] > best["score"]:
                 best = entry
 

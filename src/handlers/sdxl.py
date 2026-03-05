@@ -219,13 +219,10 @@ def _ensure_checkpoint_extracted(checkpoint_path: str) -> dict[str, object]:
         # kernels are optimized for NHWC and avoid implicit format transposes.
         components["sdxl_unet"].to(memory_format=torch.channels_last)
 
-        # Force math attention (AttnProcessor) instead of SDPA.  SDPA dispatches
-        # to Triton flash-attention kernels that JIT-compile per unique shape,
-        # causing multi-second GIL holds and 30x step-time variance on multi-GPU.
-        # TRT handles the fast path; PyTorch fallback prioritizes consistency.
-        from diffusers.models.attention_processor import AttnProcessor
-        components["sdxl_unet"].set_attn_processor(AttnProcessor())
-        log.debug(f"  SDXL: UNet attention processors: AttnProcessor (non-SDPA)")
+        # SDPA (AttnProcessor2_0) is the default — uses F.scaled_dot_product_attention
+        # which fuses Q/K/V and dispatches to flash-attention or memory-efficient kernels.
+        # Previously forced math-only AttnProcessor due to Triton JIT GIL contention
+        # in threaded workers; multiprocessing eliminates that issue.
 
         # Detect prediction type: safetensors header is the authoritative source
         # (checks v_pred marker tensor, ModelSpec metadata, kohya metadata,
@@ -333,10 +330,7 @@ def load_component(category: str, model_dir: str | None, device: torch.device) -
         _fix_from_pretrained(model, "UNet")
         model.to(device, memory_format=torch.channels_last)
         model.eval()
-        # Force math attention — see comment in _ensure_checkpoint_extracted()
-        from diffusers.models.attention_processor import AttnProcessor
-        model.set_attn_processor(AttnProcessor())
-        log.debug(f"  SDXL: Loaded UNet (non-SDPA) to {device}")
+        log.debug(f"  SDXL: Loaded UNet (SDPA) to {device}")
         return model
 
     elif category in ("sdxl_vae", "sdxl_vae_enc"):

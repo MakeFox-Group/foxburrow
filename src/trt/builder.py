@@ -516,6 +516,7 @@ def build_all_engines(
     cache_dir: str,
     arch_key: str,
     device_id: int,
+    max_workspace_gb: float = 0,
 ) -> dict[str, list[str]]:
     """Build all missing TRT engines for a model on a specific GPU architecture.
 
@@ -559,6 +560,7 @@ def build_all_engines(
                         engine_path=te_path,
                         component_type=component_type,
                         device_id=device_id,
+                        max_workspace_gb=max_workspace_gb,
                     )
                     if ok:
                         results[component_type].append("default")
@@ -578,6 +580,7 @@ def build_all_engines(
                         width=sw,
                         height=sh,
                         device_id=device_id,
+                        max_workspace_gb=max_workspace_gb,
                     )
                     if ok:
                         results[component_type].append(f"static-{sw}x{sh}")
@@ -598,6 +601,7 @@ def build_all_engines(
                     min_res=dyn["min"],
                     opt_res=dyn["opt"],
                     max_res=dyn["max"],
+                    max_workspace_gb=max_workspace_gb,
                 )
                 if ok:
                     results[component_type].append(label)

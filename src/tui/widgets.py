@@ -78,12 +78,22 @@ class GpuPanel(Static):
         self.gpu_uuid = gpu_uuid
 
     def render_gpu(self, gpu, workers) -> None:
-        """Update this panel from a GpuInstance and its active worker jobs."""
+        """Update this panel from a GpuInstance/GpuProxy and its active worker jobs."""
         text = Text()
 
+        # Find the matching worker proxy for this GPU
+        worker = None
+        for w in workers:
+            if w.gpu.uuid == gpu.uuid:
+                worker = w
+                break
+
+        # Use proxy data for status if available, fall back to GpuInstance
+        proxy_gpu = worker.gpu if worker else gpu
+
         # Header: name, status, capabilities
-        status = "BUSY" if gpu.is_busy else "IDLE"
-        status_style = "bold red" if gpu.is_busy else "bold green"
+        status = "BUSY" if proxy_gpu.is_busy else "IDLE"
+        status_style = "bold red" if proxy_gpu.is_busy else "bold green"
         caps = ", ".join(sorted(gpu.capabilities))
 
         text.append(f"{gpu.name}", style="bold")
@@ -95,11 +105,11 @@ class GpuPanel(Static):
         text.append(cap_str, style="dim")
         text.append("\n")
 
-        # VRAM bar
-        vram = gpu.get_vram_stats()
-        used = vram["allocated"]
-        total = vram["total"]
-        free = vram["free"]
+        # VRAM bar — use proxy's cached stats (no CUDA calls in main process)
+        vram = proxy_gpu.get_vram_stats() if worker else {}
+        used = vram.get("allocated", 0)
+        total = vram.get("total", gpu.total_memory)
+        free = vram.get("free", 0)
         pct = (used / total * 100) if total > 0 else 0
 
         text.append("VRAM: ")
@@ -108,8 +118,8 @@ class GpuPanel(Static):
         text.append(f"  free: {_format_bytes(free)}", style="dim")
         text.append("\n")
 
-        # Loaded models
-        cached_info = gpu.get_cached_models_info()
+        # Loaded models — use proxy's cached model info
+        cached_info = proxy_gpu.get_cached_models_info() if worker else []
         if cached_info:
             # Group by source
             by_source: dict[str, list[dict]] = {}
@@ -132,11 +142,7 @@ class GpuPanel(Static):
             text.append("\n")
 
         # Active jobs
-        active_jobs = []
-        for w in workers:
-            if w.gpu.uuid == gpu.uuid:
-                active_jobs = w.active_jobs
-                break
+        active_jobs = worker.active_jobs if worker else []
 
         if active_jobs:
             for job in active_jobs:
