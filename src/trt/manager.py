@@ -265,6 +265,14 @@ class TrtBuildManager:
                 needs_export = True
                 break
 
+        # Even if all files exist, validate UNet external data integrity
+        if not needs_export:
+            unet_onnx = get_onnx_path(self._cache_dir, request.model_hash, "unet")
+            if not validate_onnx(unet_onnx):
+                log.warning(f"  TRT: UNet ONNX for {short_hash} has invalid "
+                            f"external data — forcing re-export")
+                needs_export = True
+
         if needs_export:
             try:
                 await loop.run_in_executor(

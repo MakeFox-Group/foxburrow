@@ -162,11 +162,10 @@ def _remove_onnx_with_data(onnx_path: str) -> None:
     except Exception:
         pass  # Best-effort cleanup
 
-    # Also remove the common consolidated data file pattern
-    for suffix in (".data", "_data"):
-        data_file = onnx_path + suffix
-        if os.path.isfile(data_file):
-            os.remove(data_file)
+    # Also remove the consolidated data file if present
+    data_file = onnx_path + ".data"
+    if os.path.isfile(data_file):
+        os.remove(data_file)
 
     os.remove(onnx_path)
 
