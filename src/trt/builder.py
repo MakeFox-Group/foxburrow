@@ -113,11 +113,69 @@ def _latent_shape(width: int, height: int) -> tuple[int, int]:
     return height // 8, width // 8
 
 
+def validate_onnx(onnx_path: str) -> bool:
+    """Check that an ONNX file is valid and all external data files are accessible.
+
+    Returns True if the ONNX file exists and all external data references
+    can be resolved, False otherwise.  Does NOT load the full tensor data
+    (fast check).
+    """
+    if not os.path.isfile(onnx_path):
+        return False
+
+    try:
+        import onnx
+        model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as ex:
+        log.warning(f"  TRT: Cannot load ONNX graph: {onnx_path}: {ex}")
+        return False
+
+    onnx_dir = os.path.dirname(onnx_path)
+    for init in model.graph.initializer:
+        if init.data_location == onnx.TensorProto.EXTERNAL:
+            for entry in init.external_data:
+                if entry.key == "location":
+                    data_path = os.path.join(onnx_dir, entry.value)
+                    if not os.path.isfile(data_path):
+                        log.warning(f"  TRT: Missing external data file: "
+                                    f"{entry.value} (referenced by {init.name})")
+                        return False
+    return True
+
+
+def _remove_onnx_with_data(onnx_path: str) -> None:
+    """Remove an ONNX file and its associated external data files."""
+    if not os.path.isfile(onnx_path):
+        return
+
+    onnx_dir = os.path.dirname(onnx_path)
+    try:
+        import onnx
+        model = onnx.load(onnx_path, load_external_data=False)
+        for init in model.graph.initializer:
+            if init.data_location == onnx.TensorProto.EXTERNAL:
+                for entry in init.external_data:
+                    if entry.key == "location":
+                        data_path = os.path.join(onnx_dir, entry.value)
+                        if os.path.isfile(data_path):
+                            os.remove(data_path)
+    except Exception:
+        pass  # Best-effort cleanup
+
+    # Also remove the common consolidated data file pattern
+    for suffix in (".data", "_data"):
+        data_file = onnx_path + suffix
+        if os.path.isfile(data_file):
+            os.remove(data_file)
+
+    os.remove(onnx_path)
+
+
 def _parse_onnx(parser, onnx_path: str) -> bool:
     """Parse an ONNX model, handling external data (weights > 2GB protobuf limit).
 
-    Large models (e.g. SDXL UNet FP16 ~5GB) are exported by torch.onnx.export
-    with external weight files.  The 4MB .onnx file contains only the graph
+    Large models (e.g. SDXL UNet FP32 ~5GB) are exported by torch.onnx.export
+    with external weight files.  The .onnx file contains only the graph
     structure.  TRT's ``parse_from_file()`` resolves these external references
     automatically; a raw ``parse(bytes)`` cannot.
     """
@@ -586,6 +644,15 @@ def build_all_engines(
             onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
             if not os.path.isfile(onnx_path):
                 log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")
+                continue
+
+            # Validate external data accessibility before attempting build
+            if not validate_onnx(onnx_path):
+                log.error(f"  TRT: ONNX validation failed for {component_type} — "
+                          f"external data missing or corrupt: {onnx_path}")
+                log.error(f"  TRT: Deleting invalid ONNX so it will be re-exported "
+                          f"on next run: {onnx_path}")
+                _remove_onnx_with_data(onnx_path)
                 continue
 
             # Text encoders: single engine per component (dynamic batch only)

@@ -7,6 +7,12 @@ TensorRT optimization profiles.
 torch.onnx.export() is NOT thread-safe — it uses a global flag
 (GLOBALS.in_onnx_export) that asserts False on entry.  All exports
 must be serialized via _onnx_lock.
+
+Large models (SDXL UNet ~5GB FP32) exceed the 2GB protobuf limit.
+PyTorch's TorchScript exporter auto-detects this and writes hundreds
+of individual per-tensor files alongside the .onnx graph stub.  After
+export, _consolidate_external_data() merges these into a single .data
+file for reliable TRT parsing.
 """
 
 from __future__ import annotations
@@ -22,6 +28,95 @@ import log
 # Serializes all torch.onnx.export() calls — the TorchScript exporter
 # uses a module-global GLOBALS.in_onnx_export flag that is not thread-safe.
 _onnx_lock = threading.Lock()
+
+
+def _consolidate_external_data(onnx_path: str, component_name: str) -> None:
+    """Merge per-tensor external data files into a single .data file.
+
+    PyTorch's TorchScript ONNX exporter (dynamo=False) creates one file per
+    tensor when the model exceeds the 2GB protobuf limit.  This produces
+    hundreds of individual files (e.g. ``unet.down_blocks.0.resnets.0.conv1.weight``).
+
+    TRT's ``parse_from_file()`` can handle these, but they're fragile:
+    if ANY file is missing (interrupted export, filesystem issue), the entire
+    parse fails silently.  Consolidating into a single ``{component}.onnx.data``
+    file makes validation trivial and is the standard ONNX convention.
+    """
+    import onnx
+    from onnx.external_data_helper import convert_model_to_external_data
+
+    file_size = os.path.getsize(onnx_path)
+    # If the file is large (>500MB), it's self-contained — no external data
+    if file_size > 500 * 1024 * 1024:
+        return
+
+    # Load the graph WITHOUT external data to check if external refs exist
+    model = onnx.load(onnx_path, load_external_data=False)
+    has_external = any(
+        init.data_location == onnx.TensorProto.EXTERNAL
+        for init in model.graph.initializer
+    )
+    if not has_external:
+        return
+
+    # Collect the list of old per-tensor external data files for cleanup
+    onnx_dir = os.path.dirname(onnx_path)
+    old_locations: set[str] = set()
+    for init in model.graph.initializer:
+        if init.data_location == onnx.TensorProto.EXTERNAL:
+            for entry in init.external_data:
+                if entry.key == "location":
+                    old_locations.add(entry.value)
+
+    data_filename = f"{component_name}.onnx.data"
+
+    # Skip consolidation if already pointing to a single consolidated file
+    if old_locations == {data_filename}:
+        log.debug(f"  TRT: {component_name} ONNX already consolidated")
+        return
+
+    log.info(f"  TRT: Consolidating {len(old_locations)} external data files "
+             f"for {component_name} into {data_filename}...")
+
+    # Reload WITH external data (loads all weights into memory)
+    del model
+    model = onnx.load(onnx_path, load_external_data=True)
+
+    # Convert all tensor data to reference a single external file
+    convert_model_to_external_data(
+        model,
+        all_tensors_to_one_file=True,
+        location=data_filename,
+        size_threshold=1024,
+        convert_attribute=False,
+    )
+
+    # Save the consolidated model (overwrites the .onnx + creates .data file)
+    onnx.save(model, onnx_path)
+    del model
+
+    consolidated_data_path = os.path.join(onnx_dir, data_filename)
+    if os.path.isfile(consolidated_data_path):
+        data_size_mb = os.path.getsize(consolidated_data_path) / (1024 * 1024)
+        log.info(f"  TRT: Consolidated {component_name} external data "
+                 f"({data_size_mb:.0f}MB): {consolidated_data_path}")
+    else:
+        log.error(f"  TRT: Consolidation failed — data file not created: "
+                  f"{consolidated_data_path}")
+        return
+
+    # Clean up old per-tensor files
+    cleaned = 0
+    for old_name in old_locations:
+        if old_name == data_filename:
+            continue
+        old_path = os.path.join(onnx_dir, old_name)
+        if os.path.isfile(old_path):
+            os.remove(old_path)
+            cleaned += 1
+    if cleaned:
+        log.debug(f"  TRT: Cleaned up {cleaned} old external data files "
+                  f"for {component_name}")
 
 
 class _UNetOnnxWrapper(nn.Module):
@@ -286,6 +381,11 @@ def export_unet_onnx(
 
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     log.info(f"  TRT: UNet ONNX exported ({file_size_mb:.0f}MB): {output_path}")
+
+    # UNet FP32 (~5GB) exceeds the 2GB protobuf limit, so PyTorch creates
+    # hundreds of individual per-tensor files.  Consolidate into one .data
+    # file for reliable TRT parsing.
+    _consolidate_external_data(output_path, "unet")
 
 
 def export_vae_onnx(

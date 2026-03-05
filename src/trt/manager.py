@@ -30,6 +30,7 @@ from trt.builder import (
     all_engines_exist,
     get_arch_key,
     get_onnx_path,
+    validate_onnx,
 )
 from trt.exporter import export_te1_onnx, export_te2_onnx, export_unet_onnx, export_vae_onnx
 
@@ -254,14 +255,17 @@ class TrtBuildManager:
         short_hash = request.model_hash[:16]
         loop = asyncio.get_running_loop()
 
-        # Check if ONNX files already exist (skip export if so)
-        missing_onnx = False
+        # Check if ONNX files already exist and are valid (skip export if so).
+        # UNet uses external data (>2GB protobuf) that can be incomplete from
+        # interrupted exports — validate before skipping.
+        needs_export = False
         for ct in ("te1", "te2", "unet", "vae"):
-            if not os.path.isfile(get_onnx_path(self._cache_dir, request.model_hash, ct)):
-                missing_onnx = True
+            onnx_path = get_onnx_path(self._cache_dir, request.model_hash, ct)
+            if not os.path.isfile(onnx_path):
+                needs_export = True
                 break
 
-        if missing_onnx:
+        if needs_export:
             try:
                 await loop.run_in_executor(
                     self._export_pool, self._do_export, request)
@@ -545,8 +549,14 @@ class TrtBuildManager:
             except Exception as ex:
                 log.log_exception(ex, f"TRT: TE2 ONNX export failed for {short_hash}")
 
-        # Export UNet
-        if not os.path.isfile(unet_onnx):
+        # Export UNet — also validate existing exports since UNet uses external
+        # data (>2GB) that can be incomplete from interrupted previous exports
+        need_unet_export = not os.path.isfile(unet_onnx)
+        if not need_unet_export and not validate_onnx(unet_onnx):
+            log.warning(f"  TRT: Existing UNet ONNX for {short_hash} has missing "
+                        f"external data — re-exporting")
+            need_unet_export = True
+        if need_unet_export:
             try:
                 unet = load_component("sdxl_unet", model_dir, torch.device("cpu"))
                 ca_dim = getattr(getattr(unet, "config", None),
