@@ -250,6 +250,9 @@ class TrtBuildManager:
                     if not all_engines_exist(self._cache_dir, model_hash,
                                              component_type, arch_key,
                                              dynamic_only=self._trt_config.dynamic_only):
+                        # vae_enc is optional — don't block readiness if missing
+                        if component_type == "vae_enc":
+                            continue
                         all_exist = False
                         break
                 if not all_exist:
