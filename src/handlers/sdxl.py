@@ -1829,12 +1829,16 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
 
     # Try TRT encoder for the encode step
     trt_enc = _get_trt_vae_enc_runner(gpu, job, target_w, target_h)
-    enc_tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
-    enc_tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
-    if trt_enc is None and (target_w >= VAE_TILE_THRESHOLD or target_h >= VAE_TILE_THRESHOLD):
-        enc_tile_w, enc_tile_h = _pick_vae_tile_size(target_w, target_h, gpu, job,
-                                                      component_type="vae_enc")
-        trt_enc = _get_trt_vae_enc_runner(gpu, job, enc_tile_w, enc_tile_h)
+    if trt_enc is not None:
+        # TRT covers full image — no tiling needed
+        enc_tile_w, enc_tile_h = 0, 0
+    else:
+        enc_tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
+        enc_tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
+        if target_w >= VAE_TILE_THRESHOLD or target_h >= VAE_TILE_THRESHOLD:
+            enc_tile_w, enc_tile_h = _pick_vae_tile_size(target_w, target_h, gpu, job,
+                                                          component_type="vae_enc")
+            trt_enc = _get_trt_vae_enc_runner(gpu, job, enc_tile_w, enc_tile_h)
 
     # Only load PyTorch VAE for encode if TRT is not available and not already loaded
     enc_vae = None if trt_enc is not None else vae
@@ -2097,6 +2101,9 @@ def _vae_encode(image: Image.Image, vae: "AutoencoderKL | None", device: torch.d
     When trt_runner is provided, uses TRT for encoding (output is already
     scaled by VAE_SCALE_FACTOR). Either vae or trt_runner must be provided.
     """
+    if vae is None and trt_runner is None:
+        raise ValueError("_vae_encode requires either vae or trt_runner")
+
     img_w, img_h = image.size
 
     if tile_w > 0 and tile_h > 0:

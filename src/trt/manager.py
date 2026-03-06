@@ -567,11 +567,15 @@ class TrtBuildManager:
             for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
                 onnx = get_onnx_path(self._cache_dir, model_hash, component_type)
                 if not os.path.isfile(onnx):
-                    # If no ONNX exists, engines can't exist either — not ready
+                    # vae_enc is optional — don't block all TRT if it's missing
+                    if component_type == "vae_enc":
+                        continue
                     return
                 if not all_engines_exist(self._cache_dir, model_hash,
                                          component_type, arch_key,
                                          dynamic_only=self._trt_config.dynamic_only):
+                    if component_type == "vae_enc":
+                        continue
                     return
 
         with self._lock:
@@ -637,23 +641,25 @@ class TrtBuildManager:
             except Exception as ex:
                 log.log_exception(ex, f"TRT: UNet ONNX export failed for {short_hash}")
 
-        # Export VAE decoder
-        if not os.path.isfile(vae_onnx):
+        # Export VAE decoder and/or encoder (share one load)
+        need_vae_dec = not os.path.isfile(vae_onnx)
+        need_vae_enc = not os.path.isfile(vae_enc_onnx)
+        if need_vae_dec or need_vae_enc:
             try:
                 vae = load_component("sdxl_vae", model_dir, torch.device("cpu"))
-                export_vae_onnx(vae, vae_onnx)
+                if need_vae_dec:
+                    try:
+                        export_vae_onnx(vae, vae_onnx)
+                    except Exception as ex:
+                        log.log_exception(ex, f"TRT: VAE decoder ONNX export failed for {short_hash}")
+                if need_vae_enc:
+                    try:
+                        export_vae_enc_onnx(vae, vae_enc_onnx)
+                    except Exception as ex:
+                        log.log_exception(ex, f"TRT: VAE encoder ONNX export failed for {short_hash}")
                 del vae
             except Exception as ex:
-                log.log_exception(ex, f"TRT: VAE decoder ONNX export failed for {short_hash}")
-
-        # Export VAE encoder
-        if not os.path.isfile(vae_enc_onnx):
-            try:
-                vae = load_component("sdxl_vae", model_dir, torch.device("cpu"))
-                export_vae_enc_onnx(vae, vae_enc_onnx)
-                del vae
-            except Exception as ex:
-                log.log_exception(ex, f"TRT: VAE encoder ONNX export failed for {short_hash}")
+                log.log_exception(ex, f"TRT: VAE load failed for {short_hash}")
 
         log.info(f"  TRT: ONNX export complete for {short_hash}")
 
