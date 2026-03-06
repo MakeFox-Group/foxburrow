@@ -120,7 +120,6 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
     dynamic_only = app_state.config.tensorrt.dynamic_only
 
@@ -2455,7 +2454,7 @@ _SDXL_NONBLOCK_LORA_MAP = {
     "label_emb_0_2": "add_embedding.linear_2",
     "time_embed_0": "time_embedding.linear_1",
     "time_embed_2": "time_embedding.linear_2",
-    "out_0": "conv_norm_out",
+    # out_0 → conv_norm_out is GroupNorm — PEFT cannot inject LoRA into GroupNorm
     "out_2": "conv_out",
 }
 
