@@ -699,7 +699,7 @@ def has_trt_coverage(
     arch_key: str,
     width: int,
     height: int,
-    dynamic_only: bool = False,
+    dynamic_only: bool = True,
 ) -> bool:
     """Check if a TRT engine can handle the given resolution.
 
@@ -728,7 +728,7 @@ def all_engines_exist(
     model_hash: str,
     component_type: str,
     arch_key: str,
-    dynamic_only: bool = False,
+    dynamic_only: bool = True,
 ) -> bool:
     """Check if all required engines (static + dynamic) exist for a component.
 
@@ -758,7 +758,7 @@ def build_all_engines(
     device_id: int,
     max_workspace_gb: float = 0,
     progress_cb: Callable[[str, str], None] | None = None,
-    dynamic_only: bool = False,
+    dynamic_only: bool = True,
 ) -> dict[str, list[str]]:
     """Build all missing TRT engines for a model on a specific GPU architecture.
 

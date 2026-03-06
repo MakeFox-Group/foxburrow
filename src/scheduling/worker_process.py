@@ -193,6 +193,7 @@ def gpu_worker_main(
     from config import TensorrtConfig
     _trt_cfg = TensorrtConfig()
     _trt_cfg.enabled = server_config_dict.get("trt_enabled", True)
+    _trt_cfg.dynamic_only = server_config_dict.get("trt_dynamic_only", True)
     app_state.config = FoxBurrowConfig(
         server=_server_cfg, gpus=[gpu_config], tensorrt=_trt_cfg)
 

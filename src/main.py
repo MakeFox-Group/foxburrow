@@ -869,6 +869,7 @@ def main() -> None:
                     "tensorrt_cache": os.path.abspath(config.server.tensorrt_cache),
                     "models_dir": os.path.abspath(config.server.models_dir),
                     "trt_enabled": config.tensorrt.enabled,
+                    "trt_dynamic_only": config.tensorrt.dynamic_only,
                 },
                 cmd_q,
                 result_q,

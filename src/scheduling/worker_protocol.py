@@ -94,7 +94,7 @@ class TrtBuildCmd:
     cache_dir: str
     arch_key: str
     max_workspace_gb: float = 0  # 0 = auto (total_vram - 1GB)
-    dynamic_only: bool = False   # True = skip static engines
+    dynamic_only: bool = True    # True = skip static engines
 
 
 @dataclass

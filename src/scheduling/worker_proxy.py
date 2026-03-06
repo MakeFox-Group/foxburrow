@@ -248,7 +248,12 @@ class GpuProxy:
 
         # Check dynamic engines
         from trt.builder import DYNAMIC_PROFILES
+        has_relevant = False
         for label_suffix in cached_trt:
+            # Skip stale static-resolution cache entries under dynamic_only
+            if dynamic_only and "x" in label_suffix and label_suffix.replace("x", "").isdigit():
+                continue
+            has_relevant = True
             for profile in DYNAMIC_PROFILES:
                 if profile["label"] != label_suffix:
                     continue
@@ -258,7 +263,7 @@ class GpuProxy:
                     return 1
 
         # Has TRT engines but none cover this resolution
-        return -1
+        return -1 if has_relevant else 0
 
     def get_active_fingerprints(self) -> set[str]:
         # In the proxy, active fingerprints are tracked locally

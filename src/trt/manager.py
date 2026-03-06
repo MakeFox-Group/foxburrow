@@ -497,7 +497,8 @@ class TrtBuildManager:
                     if not os.path.isfile(onnx):
                         continue
                     if not all_engines_exist(self._cache_dir, request.model_hash,
-                                             component_type, arch_key):
+                                             component_type, arch_key,
+                                             dynamic_only=self._trt_config.dynamic_only):
                         needs_build = True
                         break
 
@@ -566,7 +567,8 @@ class TrtBuildManager:
                     # If no ONNX exists, engines can't exist either — not ready
                     return
                 if not all_engines_exist(self._cache_dir, model_hash,
-                                         component_type, arch_key):
+                                         component_type, arch_key,
+                                         dynamic_only=self._trt_config.dynamic_only):
                     return
 
         with self._lock:
