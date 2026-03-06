@@ -99,6 +99,20 @@ class OnloadCmd:
     unevictable_entries: set[str]
     models_dir: str
     sdxl_models: dict[str, str]
+    lora_index: dict | None = None   # name -> LoraEntry (initial population)
+    loras_dir: str | None = None
+
+
+@dataclass
+class UpdateLoraIndexCmd:
+    """Replace the worker's LoRA index after a rescan in the main process."""
+    lora_index: dict  # name -> LoraEntry
+
+
+@dataclass
+class UpdateSdxlModelsCmd:
+    """Replace the worker's SDXL model map after a rescan in the main process."""
+    sdxl_models: dict[str, str]  # name -> path
 
 
 @dataclass

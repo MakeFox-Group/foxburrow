@@ -316,6 +316,10 @@ async def rescan_loras():
     summary = await asyncio.get_running_loop().run_in_executor(
         None, do_rescan, loras_dir, state.lora_index)
 
+    # Propagate updated index to GPU worker processes
+    from state import propagate_lora_index
+    propagate_lora_index()
+
     return summary
 
 
@@ -359,6 +363,11 @@ async def rescan_models():
         path = state.sdxl_models.pop(name)
         streamer.fire_event("model_removed", {
             "model_type": "sdxl", "name": name, "path": path})
+
+    # Propagate removals to GPU worker processes immediately
+    if removed:
+        from state import propagate_sdxl_models
+        propagate_sdxl_models()
 
     # Register new models via ModelScanner (handles fingerprinting)
     if added:

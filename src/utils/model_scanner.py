@@ -130,6 +130,25 @@ class ModelScanner:
             log.debug(f"  ModelScanner: Background scan complete "
                      f"({self._completed}/{self._total} in {elapsed:.1f}s)")
 
+            # Propagate updated model map to GPU worker processes
+            from state import propagate_sdxl_models
+            propagate_sdxl_models()
+
+            # Queue newly discovered models for TRT engine building
+            from state import app_state
+            trt_mgr = app_state.trt_manager
+            if trt_mgr is not None:
+                for name, path in discovered_models.items():
+                    if name not in self._app_state.sdxl_models:
+                        continue  # Registration failed
+                    try:
+                        unet_comp = self._registry.get_sdxl_unet_component(path)
+                        model_hash = unet_comp.fingerprint
+                        checkpoint_path = path if os.path.isfile(path) else None
+                        trt_mgr.queue_model(model_hash, path, checkpoint_path)
+                    except Exception:
+                        pass  # Model may not have UNet component registered
+
         t = threading.Thread(target=_background, name="model-scanner", daemon=True)
         t.start()
         self._thread = t

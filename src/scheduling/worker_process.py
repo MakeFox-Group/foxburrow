@@ -37,6 +37,8 @@ from scheduling.worker_protocol import (
     TrtBuildCmd,
     TrtBuildProgress,
     TrtBuildResult,
+    UpdateLoraIndexCmd,
+    UpdateSdxlModelsCmd,
     WorkerReady,
 )
 
@@ -249,6 +251,24 @@ def gpu_worker_main(
             elif isinstance(cmd, OnloadCmd):
                 _handle_onload(gpu, cmd, server_config_dict)
                 result_queue.put(OnloadComplete())
+
+            elif isinstance(cmd, UpdateLoraIndexCmd):
+                from state import app_state
+                app_state.lora_index = cmd.lora_index
+                log.debug(f"  GPU worker [{gpu_uuid}]: LoRA index updated "
+                          f"({len(cmd.lora_index)} entries)")
+
+            elif isinstance(cmd, UpdateSdxlModelsCmd):
+                from state import app_state
+                app_state.sdxl_models = dict(cmd.sdxl_models)
+                # Re-register any new checkpoints in the worker's registry
+                for model_name, model_dir in cmd.sdxl_models.items():
+                    try:
+                        app_state.registry.register_sdxl_checkpoint(model_dir)
+                    except Exception:
+                        pass
+                log.debug(f"  GPU worker [{gpu_uuid}]: SDXL models updated "
+                          f"({len(cmd.sdxl_models)} entries)")
 
             elif isinstance(cmd, GetStatusCmd):
                 pass  # Status is sent below after every command
@@ -1098,6 +1118,12 @@ def _handle_onload(gpu, cmd: OnloadCmd, server_config_dict: dict) -> None:
     # passes the authoritative model map, but the worker's app_state starts empty.
     if cmd.sdxl_models:
         app_state.sdxl_models.update(cmd.sdxl_models)
+
+    # Populate LoRA index and directory — needed for _ensure_loras() in handlers
+    if cmd.lora_index is not None:
+        app_state.lora_index = cmd.lora_index
+    if cmd.loras_dir is not None:
+        app_state.loras_dir = cmd.loras_dir
 
     # Register SDXL checkpoints in the worker's registry so that
     # get_sdxl_components() works for onload and unevictable resolution.

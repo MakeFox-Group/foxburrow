@@ -132,6 +132,9 @@ class FileSystemWatcher:
                     await loop.run_in_executor(
                         None, rescan_loras,
                         loras_dir, self._app_state.lora_index)
+                    # Propagate updated index to GPU worker processes
+                    from state import propagate_lora_index
+                    propagate_lora_index()
                 except Exception as ex:
                     log.log_exception(ex, "FileWatcher: LoRA rescan failed")
 
@@ -200,6 +203,11 @@ class FileSystemWatcher:
             path = state.sdxl_models.pop(name)
             streamer.fire_event("model_removed", {
                 "model_type": "sdxl", "name": name, "path": path})
+
+        # Propagate removals to GPU worker processes immediately
+        if removed:
+            from state import propagate_sdxl_models
+            propagate_sdxl_models()
 
         # Register new models (fingerprinting in background thread pool)
         if added:

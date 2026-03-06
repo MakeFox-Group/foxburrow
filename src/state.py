@@ -39,3 +39,21 @@ class AppState:
 
 
 app_state = AppState()
+
+
+def propagate_lora_index() -> None:
+    """Push the current LoRA index to all GPU worker processes."""
+    scheduler = app_state.scheduler
+    if scheduler and scheduler.workers:
+        snapshot = dict(app_state.lora_index)
+        for w in scheduler.workers:
+            w.update_lora_index(snapshot)
+
+
+def propagate_sdxl_models() -> None:
+    """Push the current SDXL model map to all GPU worker processes."""
+    scheduler = app_state.scheduler
+    if scheduler and scheduler.workers:
+        snapshot = dict(app_state.sdxl_models)
+        for w in scheduler.workers:
+            w.update_sdxl_models(snapshot)

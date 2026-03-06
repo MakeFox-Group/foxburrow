@@ -328,6 +328,12 @@ def _background_model_init(
         loop = asyncio.new_event_loop()
 
         async def _send_onloads():
+            # Phase 0: send LoRA index + loras_dir to ALL workers (even those
+            # without onload entries) so _ensure_loras() can find LoRAs.
+            lora_snapshot = dict(app_state.lora_index)
+            for w in workers:
+                w.update_lora_index(lora_snapshot)
+
             # Phase 1: utility models (upscale, bgremove) — fast
             tasks = []
             for w in workers:
@@ -338,6 +344,7 @@ def _background_model_init(
                         unevictable_entries=set(),
                         models_dir=models_dir,
                         sdxl_models=app_state.sdxl_models,
+                        loras_dir=app_state.loras_dir,
                     ))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)

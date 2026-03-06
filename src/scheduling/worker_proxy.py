@@ -45,6 +45,8 @@ from scheduling.worker_protocol import (
     TrtBuildCmd,
     TrtBuildProgress,
     TrtBuildResult,
+    UpdateLoraIndexCmd,
+    UpdateSdxlModelsCmd,
     WorkerReady,
 )
 
@@ -587,7 +589,9 @@ class GpuWorkerProxy:
 
     async def send_onload(self, types: set[str], onload_entries: set[str],
                           unevictable_entries: set[str], models_dir: str,
-                          sdxl_models: dict[str, str]) -> None:
+                          sdxl_models: dict[str, str],
+                          lora_index: dict | None = None,
+                          loras_dir: str | None = None) -> None:
         """Send onload command and wait for completion."""
         self._onload_future = self._loop.create_future()
         self._cmd_queue.put(OnloadCmd(
@@ -596,8 +600,18 @@ class GpuWorkerProxy:
             unevictable_entries=unevictable_entries,
             models_dir=models_dir,
             sdxl_models=sdxl_models,
+            lora_index=lora_index,
+            loras_dir=loras_dir,
         ))
         await self._onload_future
+
+    def update_lora_index(self, lora_index: dict) -> None:
+        """Push an updated LoRA index to the worker process (fire-and-forget)."""
+        self._cmd_queue.put(UpdateLoraIndexCmd(lora_index=lora_index))
+
+    def update_sdxl_models(self, sdxl_models: dict[str, str]) -> None:
+        """Push an updated SDXL model map to the worker process (fire-and-forget)."""
+        self._cmd_queue.put(UpdateSdxlModelsCmd(sdxl_models=sdxl_models))
 
     def request_status(self) -> None:
         """Request a fresh status snapshot from the worker."""
