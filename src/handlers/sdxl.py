@@ -78,31 +78,16 @@ def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
 def _optimal_tile_for_axis(dim: int, min_tile: int, max_tile: int) -> int | None:
     """Find the optimal tile size for one axis within [min_tile, max_tile].
 
-    Minimizes the number of tiles (and thus overlap).  Returns a multiple
-    of 8, or None if no valid tile size exists within the engine range.
+    Always uses max_tile when tiling is needed.  Tile overlap is a fixed
+    cost per tile boundary, so larger tiles = fewer boundaries = fewer
+    total tiles.  Dividing evenly into smaller tiles is always worse
+    because each extra boundary adds a full overlap region.
     """
     if dim < min_tile:
         return None  # image dimension below engine minimum
-
     if dim <= max_tile:
         return dim  # fits in one tile — no splitting needed
-
-    # Multiple tiles needed — find fewest
-    min_n = math.ceil(dim / max_tile)
-    max_n = dim // min_tile if min_tile > 0 else min_n
-
-    for n in range(min_n, max_n + 1):
-        raw = math.ceil(dim / n)
-        # Try rounding up to multiple of 8 first (ensures full coverage)
-        tile_up = math.ceil(raw / 8) * 8
-        if min_tile <= tile_up <= max_tile:
-            return tile_up
-        # Try rounding down (tiling overlap handles residual)
-        tile_down = (raw // 8) * 8
-        if min_tile <= tile_down <= max_tile:
-            return tile_down
-
-    return None
+    return max_tile  # largest tile minimizes overlap-inflated tile count
 
 
 def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
@@ -178,8 +163,12 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
         if tile_w is None or tile_h is None:
             continue
 
-        n_w = max(1, math.ceil(img_w / tile_w))
-        n_h = max(1, math.ceil(img_h / tile_h))
+        # Estimate actual tile count accounting for overlap
+        ovl = LATENT_TILE_OVERLAP * 8  # pixel overlap
+        stride_w = max(1, tile_w - ovl)
+        stride_h = max(1, tile_h - ovl)
+        n_w = max(1, math.ceil(max(1, img_w - ovl) / stride_w))
+        n_h = max(1, math.ceil(max(1, img_h - ovl) / stride_h))
         total = n_w * n_h
 
         trt_fp = f"{fp}:vae_trt:{eng['label']}"
