@@ -540,10 +540,18 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
 
     device = gpu.device
 
-    # Try TRT text encoders first
-    trt_te1 = _get_trt_te1_runner(gpu, job)
-    trt_te2 = _get_trt_te2_runner(gpu, job)
-    use_trt = trt_te1 is not None and trt_te2 is not None
+    # Check if any LoRA has TE weights — if so, must use PyTorch TEs
+    has_te_lora = False
+    if inp.loras:
+        from state import app_state
+        has_te_lora = _any_lora_has_te(inp.loras, app_state.lora_index)
+
+    # Try TRT text encoders first (but not when LoRA has TE weights)
+    use_trt = False
+    if not has_te_lora:
+        trt_te1 = _get_trt_te1_runner(gpu, job)
+        trt_te2 = _get_trt_te2_runner(gpu, job)
+        use_trt = trt_te1 is not None and trt_te2 is not None
 
     if use_trt:
         log.debug(f"  SDXL: Using TRT text encoders")
@@ -551,13 +559,30 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         run_te2 = lambda ids, masks: _run_trt_te2(trt_te2, ids, masks, device)
     else:
         # Fall back to PyTorch models
+        if has_te_lora:
+            log.debug(f"  SDXL: Using PyTorch text encoders (LoRA has TE weights)")
         te1 = _get_cached_model_optional(gpu, "sdxl_te1", job)
         te2 = _get_cached_model_optional(gpu, "sdxl_te2", job)
         if te1 is None or te2 is None:
-            # PyTorch models not cached (TRT was expected but failed) — load fallback
-            log.warning(f"  SDXL: TRT unavailable and TE not cached — loading PyTorch fallback")
-            te1 = te1 or load_component("sdxl_te1", inp.model_dir, device)
-            te2 = te2 or load_component("sdxl_te2", inp.model_dir, device)
+            # PyTorch models not cached (TRT was expected but failed, or
+            # LoRA has TE weights and TRT was skipped) — load fallback
+            _reason = "LoRA has TE weights" if has_te_lora else "TRT unavailable"
+            log.warning(f"  SDXL: {_reason} and TE not cached — loading PyTorch TEs")
+            if te1 is None:
+                te1 = load_component("sdxl_te1", inp.model_dir, device)
+                _te1_fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te1", "sdxl_te1_fallback")
+                gpu.cache_model(_te1_fp, "sdxl_te1", te1,
+                                estimated_vram=250 * 1024 * 1024, source="PyTorch-fallback")
+            if te2 is None:
+                te2 = load_component("sdxl_te2", inp.model_dir, device)
+                _te2_fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te2", "sdxl_te2_fallback")
+                gpu.cache_model(_te2_fp, "sdxl_te2", te2,
+                                estimated_vram=1400 * 1024 * 1024, source="PyTorch-fallback")
+        # Apply TE LoRA adapters if present
+        if has_te_lora:
+            _ensure_te_loras(te1, te2, inp.loras, gpu, app_state.lora_index)
+        elif hasattr(te1, 'peft_config') and te1.peft_config:
+            te1.disable_adapters()
         run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
         run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
@@ -629,22 +654,45 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
     device = gpu.device
 
-    # Try TRT text encoders first
-    trt_te1 = _get_trt_te1_runner(gpu, job)
-    trt_te2 = _get_trt_te2_runner(gpu, job)
-    use_trt = trt_te1 is not None and trt_te2 is not None
+    # Check if any LoRA has TE weights — if so, must use PyTorch TEs
+    has_te_lora = False
+    if inp.loras:
+        from state import app_state
+        has_te_lora = _any_lora_has_te(inp.loras, app_state.lora_index)
+
+    # Try TRT text encoders first (but not when LoRA has TE weights)
+    use_trt = False
+    if not has_te_lora:
+        trt_te1 = _get_trt_te1_runner(gpu, job)
+        trt_te2 = _get_trt_te2_runner(gpu, job)
+        use_trt = trt_te1 is not None and trt_te2 is not None
 
     if use_trt:
         log.debug(f"  SDXL: Using TRT text encoders (regional)")
         run_te1 = lambda ids, masks: _run_trt_te1(trt_te1, ids, masks, device)
         run_te2 = lambda ids, masks: _run_trt_te2(trt_te2, ids, masks, device)
     else:
+        if has_te_lora:
+            log.debug(f"  SDXL: Using PyTorch text encoders (regional, LoRA has TE weights)")
         te1 = _get_cached_model_optional(gpu, "sdxl_te1", job)
         te2 = _get_cached_model_optional(gpu, "sdxl_te2", job)
         if te1 is None or te2 is None:
-            log.warning(f"  SDXL: TRT unavailable and TE not cached — loading PyTorch fallback (regional)")
-            te1 = te1 or load_component("sdxl_te1", inp.model_dir, device)
-            te2 = te2 or load_component("sdxl_te2", inp.model_dir, device)
+            _reason = "LoRA has TE weights" if has_te_lora else "TRT unavailable"
+            log.warning(f"  SDXL: {_reason} and TE not cached — loading PyTorch TEs (regional)")
+            if te1 is None:
+                te1 = load_component("sdxl_te1", inp.model_dir, device)
+                _te1_fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te1", "sdxl_te1_fallback")
+                gpu.cache_model(_te1_fp, "sdxl_te1", te1,
+                                estimated_vram=250 * 1024 * 1024, source="PyTorch-fallback")
+            if te2 is None:
+                te2 = load_component("sdxl_te2", inp.model_dir, device)
+                _te2_fp = getattr(job, '_stage_model_fps', {}).get("sdxl_te2", "sdxl_te2_fallback")
+                gpu.cache_model(_te2_fp, "sdxl_te2", te2,
+                                estimated_vram=1400 * 1024 * 1024, source="PyTorch-fallback")
+        if has_te_lora:
+            _ensure_te_loras(te1, te2, inp.loras, gpu, app_state.lora_index)
+        elif hasattr(te1, 'peft_config') and te1.peft_config:
+            te1.disable_adapters()
         run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
         run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
@@ -2190,6 +2238,14 @@ class _LoraSkipped(Exception):
     pass
 
 
+def _detect_has_te_keys(raw_sd: dict) -> bool:
+    """Check if a raw LoRA state dict has text encoder keys (A1111/Kohya or diffusers)."""
+    for k in raw_sd:
+        if k.startswith("lora_te") or k.startswith("text_encoder"):
+            return True
+    return False
+
+
 def _detect_lora_arch(state_dict: dict) -> str:
     """Detect LoRA architecture from weight shapes.
 
@@ -2260,10 +2316,12 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
     else:
         raw_sd = torch.load(lora_path, map_location=load_device, weights_only=True)
 
-    # ── Detect and cache architecture if not yet cached ─────────────
+    # ── Detect and cache architecture + TE presence if not yet cached ──
     if need_detect:
         detected_arch = _detect_lora_arch(raw_sd)
-        fp_cache.set_extra(lora_path, lora_arch=detected_arch)
+        has_te = _detect_has_te_keys(raw_sd)
+        fp_cache.set_extra(lora_path, lora_arch=detected_arch,
+                           has_te_lora="1" if has_te else "0")
         if detected_arch != _EXPECTED_LORA_ARCH and detected_arch != "unknown":
             log.warning(f"  LoRA: Skipping '{adapter_name}' — architecture mismatch "
                         f"(LoRA is {detected_arch}, model expects {_EXPECTED_LORA_ARCH})")
@@ -2311,8 +2369,169 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     n_unet_keys = sum(1 for k in converted_sd if k.startswith("unet."))
+    n_te_keys = sum(1 for k in converted_sd if k.startswith("text_encoder"))
+    parts = [f"{n_unet_keys} unet"]
+    if n_te_keys:
+        parts.append(f"{n_te_keys} te")
     log.debug(f"  LoRA: Loaded adapter '{adapter_name}' from {os.path.basename(lora_path)} "
-             f"({n_unet_keys} unet params, {lora_size // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
+             f"({' + '.join(parts)} params, {lora_size // (1024*1024)}MB, {elapsed_ms:.0f}ms)")
+
+
+# ── TE LoRA Support ───────────────────────────────────────────────
+
+def _any_lora_has_te(lora_specs: list, lora_index: dict) -> bool:
+    """Check if any requested LoRA has text encoder weights (cached check)."""
+    from utils import fingerprint as fp_cache
+    for spec in lora_specs:
+        entry = lora_index.get(spec.name)
+        if entry is None:
+            continue
+        cached = fp_cache.get_extra(entry.path, "has_te_lora")
+        if cached == "1":
+            return True
+        if cached is None:
+            # Not yet scanned — peek at safetensors header keys
+            try:
+                if entry.path.endswith(".safetensors"):
+                    from safetensors import safe_open
+                    with safe_open(entry.path, framework="pt") as f:
+                        keys = f.keys()
+                    has_te = any(k.startswith("lora_te") or k.startswith("text_encoder") for k in keys)
+                else:
+                    # For .pt files we can't peek without loading — assume no TE
+                    has_te = False
+                fp_cache.set_extra(entry.path, has_te_lora="1" if has_te else "0")
+                if has_te:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
+    """Load/activate PEFT LoRA adapters on the text encoders.
+
+    Mirrors _ensure_loras() for UNet but operates on TE1 (CLIP-L) and TE2 (CLIP-bigG).
+    Only loads TE weights from LoRA files that actually contain them.
+    """
+    from diffusers.loaders.lora_base import _load_lora_into_text_encoder
+    from diffusers.loaders.lora_pipeline import _convert_non_diffusers_lora_to_diffusers
+    from diffusers.loaders.lora_conversion_utils import _maybe_map_sgm_blocks_to_diffusers
+    from safetensors.torch import load_file as load_safetensors
+    from utils import fingerprint as fp_cache
+
+    adapter_names = []
+    adapter_weights = []
+
+    for spec in lora_specs:
+        entry = lora_index.get(spec.name)
+        if entry is None:
+            continue
+
+        adapter_name = spec.name.replace(".", "_")
+
+        # Check if this LoRA has TE weights
+        cached_te = fp_cache.get_extra(entry.path, "has_te_lora")
+        if cached_te == "0":
+            continue  # No TE weights in this LoRA
+
+        # Check if already loaded on these TEs
+        te1_loaded = hasattr(te1, 'peft_config') and adapter_name in te1.peft_config
+        te2_loaded = hasattr(te2, 'peft_config') and adapter_name in te2.peft_config
+        if te1_loaded and te2_loaded:
+            adapter_names.append(adapter_name)
+            adapter_weights.append(spec.weight)
+            continue
+
+        # Load the LoRA file and convert keys
+        try:
+            lora_path = entry.path
+            if lora_path.endswith(".safetensors"):
+                raw_sd = load_safetensors(lora_path, device=str(gpu.device))
+            else:
+                raw_sd = torch.load(lora_path, map_location=str(gpu.device), weights_only=True)
+
+            is_a1111 = any(k.startswith("lora_unet_") or k.startswith("lora_te") for k in raw_sd)
+            if is_a1111:
+                # UNet config needed for SGM block mapping — get from cache if available
+                unet = _get_cached_model_optional(gpu, "sdxl_unet", None)
+                if unet is not None:
+                    raw_sd = _maybe_map_sgm_blocks_to_diffusers(raw_sd, unet.config)
+                try:
+                    converted_sd, network_alphas = _convert_non_diffusers_lora_to_diffusers(raw_sd)
+                except ValueError:
+                    # Conversion may fail if UNet block mapping was skipped — we only
+                    # need TE keys, so extract them manually before conversion
+                    te_keys = {k: v for k, v in raw_sd.items() if k.startswith("lora_te")}
+                    if not te_keys:
+                        continue
+                    # Minimal conversion: just TE keys
+                    converted_sd, network_alphas = _convert_non_diffusers_lora_to_diffusers(te_keys)
+            else:
+                converted_sd = raw_sd
+                network_alphas = None
+
+            # Check if there are actually TE keys after conversion
+            has_te1 = any(k.startswith("text_encoder.") for k in converted_sd)
+            has_te2 = any(k.startswith("text_encoder_2.") for k in converted_sd)
+
+            if not has_te1 and not has_te2:
+                fp_cache.set_extra(lora_path, has_te_lora="0")
+                continue
+
+            t0 = time.monotonic()
+
+            if has_te1 and not te1_loaded:
+                _load_lora_into_text_encoder(
+                    converted_sd, network_alphas, te1,
+                    prefix="text_encoder",
+                    text_encoder_name="text_encoder",
+                    adapter_name=adapter_name,
+                )
+                repair_accelerate_leak()
+                n = fix_meta_tensors(te1)
+                if n:
+                    log.warning(f"  LoRA: Fixed {n} meta tensor(s) in TE1 after adapter injection")
+
+            if has_te2 and not te2_loaded:
+                _load_lora_into_text_encoder(
+                    converted_sd, network_alphas, te2,
+                    prefix="text_encoder_2",
+                    text_encoder_name="text_encoder_2",
+                    adapter_name=adapter_name,
+                )
+                repair_accelerate_leak()
+                n = fix_meta_tensors(te2)
+                if n:
+                    log.warning(f"  LoRA: Fixed {n} meta tensor(s) in TE2 after adapter injection")
+
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            te_parts = []
+            if has_te1:
+                te_parts.append("TE1")
+            if has_te2:
+                te_parts.append("TE2")
+            log.debug(f"  LoRA: Loaded TE adapter '{adapter_name}' ({'+'.join(te_parts)}, {elapsed_ms:.0f}ms)")
+
+            adapter_names.append(adapter_name)
+            adapter_weights.append(spec.weight)
+
+        except _LoraSkipped:
+            continue
+        except Exception as ex:
+            log.warning(f"  LoRA: Failed to load TE adapter '{adapter_name}': {ex}")
+            continue
+
+    if adapter_names:
+        if hasattr(te1, 'peft_config') and te1.peft_config:
+            te1.set_adapters(adapter_names, adapter_weights)
+        if hasattr(te2, 'peft_config') and te2.peft_config:
+            te2.set_adapters(adapter_names, adapter_weights)
+    else:
+        if hasattr(te1, 'peft_config') and te1.peft_config:
+            te1.disable_adapters()
+        if hasattr(te2, 'peft_config') and te2.peft_config:
+            te2.disable_adapters()
 
 
 # ====================================================================
