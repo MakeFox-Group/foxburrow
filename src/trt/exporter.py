@@ -382,10 +382,10 @@ def export_unet_onnx(
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     log.info(f"  TRT: UNet ONNX exported ({file_size_mb:.0f}MB): {output_path}")
 
-    # UNet FP32 (~5GB) exceeds the 2GB protobuf limit, so PyTorch creates
-    # hundreds of individual per-tensor files.  Consolidate into one .data
-    # file for reliable TRT parsing.
-    consolidate_external_data(output_path, "unet")
+    # NOTE: UNet FP32 (~5GB) exceeds the 2GB protobuf limit, so PyTorch
+    # creates hundreds of individual per-tensor files.  The manager calls
+    # consolidate_external_data() after export to merge them into a single
+    # .data file before dispatching to TRT build queues.
 
 
 def export_vae_onnx(
