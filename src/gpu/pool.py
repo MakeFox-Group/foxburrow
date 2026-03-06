@@ -555,19 +555,65 @@ class GpuInstance:
         log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                  f"(~{vram_mb}MB, {model_entry.use_count} uses, "
                  f"idle {idle_s:.0f}s, score={best_score:.0f})")
+
+        # Free TRT shared memory if this was the last runner of its type
+        self._maybe_release_trt_shared_memory(model_entry.category)
+
         return model_entry
 
     def ensure_free_vram(self, min_free_bytes: int, protect: set[str] | None = None) -> None:
-        """Evict cached models until at least min_free_bytes VRAM is free."""
+        """Evict cached models until at least min_free_bytes VRAM is free.
+
+        After exhausting evictable models, also frees TRT shared memory pools
+        whose runners are no longer cached.  These buffers can be very large
+        (e.g. 1.1GB for UNet, 5.3GB for VAE) and are not freed automatically.
+        """
         while True:
             _, _, free = nvml.get_memory_info(self.nvml_handle)
             if free >= min_free_bytes:
                 return
             evicted = self.evict_lru(protect)
             if evicted is None:
+                # No more evictable models — try freeing orphaned TRT shared
+                # memory pools (buffers whose runners were all evicted).
+                freed_any = self._free_orphaned_trt_shared_memory()
+                if freed_any:
+                    continue
                 log.warning(f"  GPU [{self.uuid}]: Cannot free {min_free_bytes // (1024*1024)}MB — "
                             f"only {free // (1024*1024)}MB free, no evictable models")
                 return
+
+    def _free_orphaned_trt_shared_memory(self) -> bool:
+        """Free TRT shared memory pools whose runners are no longer cached.
+
+        Returns True if any memory was freed.
+        """
+        # Categories that map to each component type
+        comp_to_cat = {
+            "unet": "sdxl_unet_trt",
+            "vae": "sdxl_vae_trt",
+            "te1": "sdxl_te1_trt",
+            "te2": "sdxl_te2_trt",
+        }
+
+        with self._trt_shared_mem_lock:
+            pool_types = list(self._trt_shared_mem.keys())
+
+        if not pool_types:
+            return False
+
+        freed_any = False
+        with self._cache_lock:
+            cached_cats = {m.category for m in self._cache.values()}
+
+        for comp_type in pool_types:
+            required_cat = comp_to_cat.get(comp_type)
+            if required_cat and required_cat not in cached_cats:
+                freed = self.release_trt_shared_memory(comp_type)
+                if freed > 0:
+                    freed_any = True
+
+        return freed_any
 
     def ensure_session_group(self, group: str) -> None:
         """Switch the current session group. Models from other groups are NOT
@@ -618,6 +664,52 @@ class GpuInstance:
                 log.debug(f"  GPU [{self.uuid}]: TRT shared memory '{component_type}' "
                           f"allocated {new_mb:.0f}MB")
             return buf
+
+    def release_trt_shared_memory(self, component_type: str) -> int:
+        """Free the shared device memory buffer for a TRT component type.
+
+        Called after the last TRT runner of this type is evicted from the
+        cache.  Returns the number of bytes freed (0 if no buffer existed).
+        """
+        with self._trt_shared_mem_lock:
+            buf = self._trt_shared_mem.pop(component_type, None)
+            if buf is None:
+                return 0
+            freed = buf.nbytes
+            del buf
+        torch.cuda.empty_cache()
+        log.debug(f"  GPU [{self.uuid}]: TRT shared memory '{component_type}' "
+                  f"freed ({freed // (1024 * 1024)}MB)")
+        return freed
+
+    def _maybe_release_trt_shared_memory(self, evicted_category: str) -> None:
+        """Release TRT shared memory if no other runners of this type remain cached.
+
+        Must be called AFTER the model has been removed from _cache.
+        Maps TRT cache categories (e.g. 'sdxl_unet_trt') to shared memory
+        component types ('unet', 'vae', 'te1', 'te2').
+        """
+        if not evicted_category.endswith("_trt"):
+            return
+
+        # Map category → shared memory component type
+        cat_to_comp = {
+            "sdxl_unet_trt": "unet",
+            "sdxl_vae_trt": "vae",
+            "sdxl_te1_trt": "te1",
+            "sdxl_te2_trt": "te2",
+        }
+        comp_type = cat_to_comp.get(evicted_category)
+        if comp_type is None:
+            return
+
+        # Check if any other TRT runners of this type remain cached
+        with self._cache_lock:
+            for m in self._cache.values():
+                if m.category == evicted_category:
+                    return  # still have at least one runner
+
+        self.release_trt_shared_memory(comp_type)
 
     def get_trt_shared_memory_vram(self) -> int:
         """Return total VRAM consumed by TRT shared device memory buffers."""

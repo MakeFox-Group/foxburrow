@@ -1666,7 +1666,11 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 
 
 def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
-    """Stage: GPU VAE encode. Encodes job.input_image → job.latents."""
+    """Stage: GPU VAE encode. Encodes job.input_image → job.latents.
+
+    Uses the same TRT-aware tile selection as vae_decode so both directions
+    choose tiles consistently based on available engines, not GPU VRAM.
+    """
     if job.input_image is None:
         raise RuntimeError("input_image is required for VAE encode.")
 
@@ -1679,9 +1683,19 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         gpu.cache_model(fp, "sdxl_vae", vae, estimated_vram=400 * 1024 * 1024,
                         source="PyTorch-fallback")
     device = gpu.device
+    img_w, img_h = job.input_image.size
 
-    tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
-    tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
+    # Handle explicit user overrides first
+    has_user_override = job.vae_tile_width > 0 and job.vae_tile_height > 0
+    if has_user_override:
+        tile_w = (job.vae_tile_width // 8) * 8
+        tile_h = (job.vae_tile_height // 8) * 8
+    elif img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
+        # Use the same TRT-aware tile selection as decode
+        tile_w, tile_h = _pick_vae_tile_size(img_w, img_h, gpu, job)
+    else:
+        tile_w, tile_h = img_w, img_h
+
     latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
     job.latents = latents
     log.debug(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")

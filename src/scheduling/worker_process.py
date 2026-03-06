@@ -707,7 +707,7 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer, l
         if job.hires_input:
             tw = job.hires_input.hires_width
             th = job.hires_input.hires_height
-            if job.input_image.width != tw or job.input_image.height != th:
+            if tw > 0 and th > 0 and (job.input_image.width != tw or job.input_image.height != th):
                 from PIL import Image as _PILImage
                 log.debug(f"  Resizing intermediate image {job.input_image.width}x"
                           f"{job.input_image.height} → {tw}x{th} (hires target)")

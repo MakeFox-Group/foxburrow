@@ -316,7 +316,6 @@ class GpuWorkerProxy:
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # State tracking (main process side)
-        self._is_busy = False
         self._pending: tuple[WorkStage, InferenceJob] | None = None
         self._active_count = 0
         self._active_session_counts: dict[str, int] = defaultdict(int)
@@ -1183,9 +1182,13 @@ class GpuWorkerProxy:
     def _handle_process_death(self) -> None:
         """Handle worker process crash."""
         self._gpu_proxy.mark_failed("Worker process died")
+        # Reset drain/build flags so they don't stay stuck
+        self._draining = False
+        self._building = False
+        self._drain_event = None
+        if self._gpu_proxy._pool_gpu is not None:
+            self._gpu_proxy._pool_gpu._trt_building = False
         self._fail_pending_futures("Worker process died")
-        if self._drain_event is not None and not self._drain_event.is_set():
-            self._drain_event.set()
 
     def shutdown(self) -> None:
         """Request graceful shutdown of the worker process."""
