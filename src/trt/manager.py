@@ -247,12 +247,16 @@ class TrtBuildManager:
             all_exist = True
             for arch_key in arch_keys:
                 for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
+                    if component_type == "vae_enc":
+                        # vae_enc is optional — only require engines if ONNX
+                        # was successfully exported (skip if no ONNX exists)
+                        vae_enc_onnx = get_onnx_path(
+                            self._cache_dir, model_hash, "vae_enc")
+                        if not os.path.isfile(vae_enc_onnx):
+                            continue
                     if not all_engines_exist(self._cache_dir, model_hash,
                                              component_type, arch_key,
                                              dynamic_only=self._trt_config.dynamic_only):
-                        # vae_enc is optional — don't block readiness if missing
-                        if component_type == "vae_enc":
-                            continue
                         all_exist = False
                         break
                 if not all_exist:
