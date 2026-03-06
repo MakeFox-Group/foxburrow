@@ -468,13 +468,10 @@ class GpuWorkerProxy:
     def check_vram_budget(self, stage: WorkStage, job: InferenceJob) -> bool:
         """Check if this GPU has enough VRAM for a new stage.
 
-        When idle, always returns True (model loading handles eviction).
-        When busy, uses cached VRAM stats from the worker's StatusSnapshot
-        and real measured model sizes where available.
+        Uses cached VRAM stats from the worker's StatusSnapshot and real
+        measured model sizes where available.  Even idle GPUs are checked
+        to avoid dispatching work that exceeds total GPU capacity.
         """
-        if self._active_count == 0:
-            return True
-
         status = self._gpu_proxy._status
         if status is None:
             return True  # No status yet, be optimistic

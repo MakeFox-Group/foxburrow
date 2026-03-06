@@ -75,62 +75,150 @@ def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
     return _axis(img_w), _axis(img_h)
 
 
+def _optimal_tile_for_axis(dim: int, min_tile: int, max_tile: int) -> int | None:
+    """Find the optimal tile size for one axis within [min_tile, max_tile].
+
+    Minimizes the number of tiles (and thus overlap).  Returns a multiple
+    of 8, or None if no valid tile size exists within the engine range.
+    """
+    if dim < min_tile:
+        return None  # image dimension below engine minimum
+
+    if dim <= max_tile:
+        return dim  # fits in one tile — no splitting needed
+
+    # Multiple tiles needed — find fewest
+    min_n = math.ceil(dim / max_tile)
+    max_n = dim // min_tile if min_tile > 0 else min_n
+
+    for n in range(min_n, max_n + 1):
+        raw = math.ceil(dim / n)
+        # Try rounding up to multiple of 8 first (ensures full coverage)
+        tile_up = math.ceil(raw / 8) * 8
+        if min_tile <= tile_up <= max_tile:
+            return tile_up
+        # Try rounding down (tiling overlap handles residual)
+        tile_down = (raw // 8) * 8
+        if min_tile <= tile_down <= max_tile:
+            return tile_down
+
+    return None
+
+
 def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
                         job: "InferenceJob") -> tuple[int, int]:
-    """Pick VAE tile size preferring TRT static engine matches.
+    """Pick VAE tile size, TRT-aware with smart engine selection.
 
-    PCIe 3.0 x8 is the bottleneck.  Loading a new TRT engine from disk
-    costs ~1-2s (deserialization + CUDA allocation).  A few extra tiles
-    at ~50-100ms each is almost always cheaper than loading.  Therefore:
-
-    Priority:
-    1. Engine already loaded on GPU — absolute preference (zero cost)
-    2. Only if nothing loaded: largest static engine on disk (fewest tiles)
-    3. Auto-calc within dynamic range (512-1024)
-    4. Auto-calc for PyTorch fallback (original behavior)
+    Priority (respects dynamic_only — skips all static engines when set):
+    1. Static TRT engine already cached on GPU (zero load cost)
+    2. Static TRT engine on disk (load once, exact match)
+    3. Dynamic TRT engine — choose optimal tile within engine's range
+       to minimize tile count and overlap
+    4. PyTorch fallback (auto-calc with VAE_TILE_MAX)
     """
-    from trt.builder import VAE_STATIC_RESOLUTIONS, get_arch_key, get_engine_path
+    from trt.builder import (VAE_STATIC_RESOLUTIONS, get_arch_key, get_engine_path,
+                             discover_dynamic_engines)
 
     fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae")
     if not fp:
+        log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
+                  f"PyTorch fallback (no VAE fingerprint)")
         return _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
 
     arch_key = get_arch_key(gpu.device_id)
 
     from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
+    dynamic_only = app_state.config.tensorrt.dynamic_only
 
-    # Gather static resolutions that fit as tiles (must be <= image on both axes)
-    cached = []   # (w, h) — engine already loaded on this GPU
-    on_disk = []  # (w, h) — engine file exists but not loaded
+    # --- Phase 1: Static engines (skip entirely if dynamic_only) ---
+    if not dynamic_only:
+        cached_static = []
+        disk_static = []
 
-    for ew, eh in VAE_STATIC_RESOLUTIONS:
-        if ew > img_w or eh > img_h:
+        for ew, eh in VAE_STATIC_RESOLUTIONS:
+            if ew > img_w or eh > img_h:
+                continue
+            trt_fp = f"{fp}:vae_trt:{ew}x{eh}"
+            if gpu.is_component_loaded(trt_fp):
+                cached_static.append((ew, eh))
+            else:
+                engine_path = get_engine_path(cache_dir, fp, "vae", arch_key, ew, eh)
+                if os.path.isfile(engine_path):
+                    disk_static.append((ew, eh))
+
+        if cached_static:
+            best = max(cached_static, key=lambda r: r[0] * r[1])
+            log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
+                      f"{best[0]}x{best[1]} (cached static TRT)")
+            return best
+
+        if disk_static:
+            best = max(disk_static, key=lambda r: r[0] * r[1])
+            log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
+                      f"{best[0]}x{best[1]} (on-disk static TRT)")
+            return best
+
+    # --- Phase 2: Dynamic engines ---
+    dynamic_engines = discover_dynamic_engines(cache_dir, fp, "vae", arch_key)
+
+    best_cached_tile: tuple[int, int] | None = None
+    best_cached_tiles = float('inf')
+    best_cached_eng: dict | None = None
+    best_disk_tile: tuple[int, int] | None = None
+    best_disk_tiles = float('inf')
+    best_disk_eng: dict | None = None
+
+    for eng in dynamic_engines:
+        min_w, min_h = eng["min_res"]
+        max_w, max_h = eng["max_res"]
+
+        tile_w = _optimal_tile_for_axis(img_w, min_w, max_w)
+        tile_h = _optimal_tile_for_axis(img_h, min_h, max_h)
+        if tile_w is None or tile_h is None:
             continue
-        trt_fp = f"{fp}:vae_trt:{ew}x{eh}"
-        if gpu.is_component_loaded(trt_fp):
-            cached.append((ew, eh))
-        else:
-            engine_path = get_engine_path(cache_dir, fp, "vae", arch_key, ew, eh)
-            if os.path.isfile(engine_path):
-                on_disk.append((ew, eh))
 
-    # Prefer largest cached engine (fewest tiles, zero load cost)
-    if cached:
-        best = max(cached, key=lambda r: r[0] * r[1])
+        n_w = max(1, math.ceil(img_w / tile_w))
+        n_h = max(1, math.ceil(img_h / tile_h))
+        total = n_w * n_h
+
+        trt_fp = f"{fp}:vae_trt:{eng['label']}"
+        is_cached = gpu.is_component_loaded(trt_fp)
+
+        if is_cached and total < best_cached_tiles:
+            best_cached_tile = (tile_w, tile_h)
+            best_cached_tiles = total
+            best_cached_eng = eng
+        elif not is_cached and total < best_disk_tiles:
+            best_disk_tile = (tile_w, tile_h)
+            best_disk_tiles = total
+            best_disk_eng = eng
+
+    # Prefer cached dynamic engine (zero load cost)
+    if best_cached_tile is not None:
         log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
-                  f"{best[0]}x{best[1]} (cached TRT)")
-        return best
+                  f"{best_cached_tile[0]}x{best_cached_tile[1]} "
+                  f"(cached dynamic TRT '{best_cached_eng['label']}', "
+                  f"range {best_cached_eng['min_res'][0]}x{best_cached_eng['min_res'][1]}"
+                  f"-{best_cached_eng['max_res'][0]}x{best_cached_eng['max_res'][1]}, "
+                  f"~{best_cached_tiles} tiles)")
+        return best_cached_tile
 
-    # No cached engine — pick largest on-disk engine (will be loaded once)
-    if on_disk:
-        best = max(on_disk, key=lambda r: r[0] * r[1])
+    # On-disk dynamic engine
+    if best_disk_tile is not None:
         log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
-                  f"{best[0]}x{best[1]} (on-disk TRT)")
-        return best
+                  f"{best_disk_tile[0]}x{best_disk_tile[1]} "
+                  f"(dynamic TRT '{best_disk_eng['label']}', "
+                  f"range {best_disk_eng['min_res'][0]}x{best_disk_eng['min_res'][1]}"
+                  f"-{best_disk_eng['max_res'][0]}x{best_disk_eng['max_res'][1]}, "
+                  f"~{best_disk_tiles} tiles)")
+        return best_disk_tile
 
-    # No static engine fits — fall back to auto-calc (may use dynamic or PyTorch)
-    return _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
+    # --- Phase 3: PyTorch fallback ---
+    result = _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
+    log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
+              f"{result[0]}x{result[1]} (PyTorch fallback, no TRT engine available)")
+    return result
 
 
 def _auto_unet_tile(lat_w: int, lat_h: int, max_tile_px: int) -> tuple[int, int]:
@@ -581,8 +669,11 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         # Apply TE LoRA adapters if present
         if has_te_lora:
             _ensure_te_loras(te1, te2, inp.loras, gpu, app_state.lora_index)
-        elif hasattr(te1, 'peft_config') and te1.peft_config:
-            te1.disable_adapters()
+        else:
+            if hasattr(te1, 'peft_config') and te1.peft_config:
+                te1.disable_adapters()
+            if hasattr(te2, 'peft_config') and te2.peft_config:
+                te2.disable_adapters()
         run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
         run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
@@ -691,8 +782,11 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
                                 estimated_vram=1400 * 1024 * 1024, source="PyTorch-fallback")
         if has_te_lora:
             _ensure_te_loras(te1, te2, inp.loras, gpu, app_state.lora_index)
-        elif hasattr(te1, 'peft_config') and te1.peft_config:
-            te1.disable_adapters()
+        else:
+            if hasattr(te1, 'peft_config') and te1.peft_config:
+                te1.disable_adapters()
+            if hasattr(te2, 'peft_config') and te2.peft_config:
+                te2.disable_adapters()
         run_te1 = lambda ids, masks: _run_text_encoder_1(te1, ids, masks, device)
         run_te2 = lambda ids, masks: _run_text_encoder_2(te2, ids, masks, device)
 
@@ -1486,11 +1580,13 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
         tile_w, tile_h = img_w, img_h  # default: full image
 
     # Try TRT for full image first (may bypass tiling for 1280x1280, 1280x1536)
+    log.debug(f"  SDXL: Selecting VAE for {img_w}x{img_h} decode")
     trt_vae = None if has_user_override else _get_trt_vae_runner(gpu, job, img_w, img_h)
 
     if trt_vae is not None:
         # TRT handles full image — skip tiling even if >= threshold
         tile_w, tile_h = img_w, img_h
+        log.debug(f"  SDXL: TRT VAE covers full {img_w}x{img_h}")
     elif not has_user_override:
         # No explicit override and no full-image TRT — check if tiling needed
         if img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
@@ -1503,6 +1599,8 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
     # Try TRT for tile size (if tiling and no full-image TRT)
     if use_tiled and trt_vae is None:
         trt_vae = _get_trt_vae_runner(gpu, job, tile_w, tile_h)
+        log.debug(f"  SDXL: Tiled VAE decode {img_w}x{img_h} → tile {tile_w}x{tile_h}, "
+                  f"backend={'TRT' if trt_vae else 'PyTorch'}")
 
     # Prepare latents (dtype depends on TRT vs PyTorch)
     if trt_vae is not None:
@@ -1652,12 +1750,16 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
     hires_img_h = hires_lat_h * 8
 
     # Try TRT-aware tile selection for decode
+    log.debug(f"  HiresTransform: Selecting VAE for {hires_img_w}x{hires_img_h} decode")
     trt_vae = _get_trt_vae_runner(gpu, job, hires_img_w, hires_img_h)
     if trt_vae is not None:
         tile_w, tile_h = hires_img_w, hires_img_h
+        log.debug(f"  HiresTransform: TRT VAE covers full {hires_img_w}x{hires_img_h}")
     elif hires_img_w >= VAE_TILE_THRESHOLD or hires_img_h >= VAE_TILE_THRESHOLD:
         tile_w, tile_h = _pick_vae_tile_size(hires_img_w, hires_img_h, gpu, job)
         trt_vae = _get_trt_vae_runner(gpu, job, tile_w, tile_h)
+        log.debug(f"  HiresTransform: Tiled {hires_img_w}x{hires_img_h} → "
+                  f"tile {tile_w}x{tile_h}, backend={'TRT' if trt_vae else 'PyTorch'}")
     else:
         tile_w, tile_h = hires_img_w, hires_img_h
 
@@ -2403,8 +2505,8 @@ def _any_lora_has_te(lora_specs: list, lora_index: dict) -> bool:
                 fp_cache.set_extra(entry.path, has_te_lora="1" if has_te else "0")
                 if has_te:
                     return True
-            except Exception:
-                pass
+            except Exception as ex:
+                log.warning(f"  LoRA: Failed to peek TE keys in {entry.path}: {ex}")
     return False
 
 
@@ -2420,8 +2522,10 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
     from safetensors.torch import load_file as load_safetensors
     from utils import fingerprint as fp_cache
 
-    adapter_names = []
-    adapter_weights = []
+    te1_adapter_names: list[str] = []
+    te1_adapter_weights: list[float] = []
+    te2_adapter_names: list[str] = []
+    te2_adapter_weights: list[float] = []
 
     for spec in lora_specs:
         entry = lora_index.get(spec.name)
@@ -2438,10 +2542,17 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
         # Check if already loaded on these TEs
         te1_loaded = hasattr(te1, 'peft_config') and adapter_name in te1.peft_config
         te2_loaded = hasattr(te2, 'peft_config') and adapter_name in te2.peft_config
-        if te1_loaded and te2_loaded:
-            adapter_names.append(adapter_name)
-            adapter_weights.append(spec.weight)
-            continue
+        if te1_loaded or te2_loaded:
+            # Already injected — just track for set_adapters activation
+            if te1_loaded:
+                te1_adapter_names.append(adapter_name)
+                te1_adapter_weights.append(spec.weight)
+            if te2_loaded:
+                te2_adapter_names.append(adapter_name)
+                te2_adapter_weights.append(spec.weight)
+            if te1_loaded and te2_loaded:
+                continue
+            # One TE loaded but not the other — still need to load the missing one
 
         # Load the LoRA file and convert keys
         try:
@@ -2457,12 +2568,15 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
                 unet = _get_cached_model_optional(gpu, "sdxl_unet", None)
                 if unet is not None:
                     raw_sd = _maybe_map_sgm_blocks_to_diffusers(raw_sd, unet.config)
+                # Snapshot before conversion — _convert_non_diffusers_lora_to_diffusers
+                # mutates the input dict via .pop(), so the fallback path needs a copy
+                raw_sd_snapshot = dict(raw_sd)
                 try:
                     converted_sd, network_alphas = _convert_non_diffusers_lora_to_diffusers(raw_sd)
                 except ValueError:
                     # Conversion may fail if UNet block mapping was skipped — we only
                     # need TE keys, so extract them manually before conversion
-                    te_keys = {k: v for k, v in raw_sd.items() if k.startswith("lora_te")}
+                    te_keys = {k: v for k, v in raw_sd_snapshot.items() if k.startswith("lora_te")}
                     if not te_keys:
                         continue
                     # Minimal conversion: just TE keys
@@ -2513,8 +2627,15 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
                 te_parts.append("TE2")
             log.debug(f"  LoRA: Loaded TE adapter '{adapter_name}' ({'+'.join(te_parts)}, {elapsed_ms:.0f}ms)")
 
-            adapter_names.append(adapter_name)
-            adapter_weights.append(spec.weight)
+            # Track per-TE adapter lists for set_adapters activation
+            if has_te1:
+                if adapter_name not in te1_adapter_names:
+                    te1_adapter_names.append(adapter_name)
+                    te1_adapter_weights.append(spec.weight)
+            if has_te2:
+                if adapter_name not in te2_adapter_names:
+                    te2_adapter_names.append(adapter_name)
+                    te2_adapter_weights.append(spec.weight)
 
         except _LoraSkipped:
             continue
@@ -2522,14 +2643,17 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
             log.warning(f"  LoRA: Failed to load TE adapter '{adapter_name}': {ex}")
             continue
 
-    if adapter_names:
+    # Activate loaded adapters with correct weights, or disable if none
+    if te1_adapter_names:
         if hasattr(te1, 'peft_config') and te1.peft_config:
-            te1.set_adapters(adapter_names, adapter_weights)
-        if hasattr(te2, 'peft_config') and te2.peft_config:
-            te2.set_adapters(adapter_names, adapter_weights)
+            te1.set_adapters(te1_adapter_names, te1_adapter_weights)
     else:
         if hasattr(te1, 'peft_config') and te1.peft_config:
             te1.disable_adapters()
+    if te2_adapter_names:
+        if hasattr(te2, 'peft_config') and te2.peft_config:
+            te2.set_adapters(te2_adapter_names, te2_adapter_weights)
+    else:
         if hasattr(te2, 'peft_config') and te2.peft_config:
             te2.disable_adapters()
 
@@ -2593,6 +2717,7 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
         trt_fp = f"{fp}:unet_trt:{label}"
         cached = gpu.get_cached_model(trt_fp)
         if cached is not None:
+            log.debug(f"  TRT: Using cached UNet {label} runner for {width}x{height}")
             return cached.model
         try:
             engine_size = os.path.getsize(dynamic_path)
@@ -2605,10 +2730,13 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
                 source=f"TRT-UNet-{label}",
                 evict_callback=runner.unload,
             )
-            log.debug(f"  TRT: Loaded UNet {label} runner on GPU [{gpu.uuid}]")
+            log.debug(f"  TRT: Loaded UNet {label} runner for {width}x{height} on GPU [{gpu.uuid}]")
             return runner
         except Exception as ex:
-            log.warning(f"  TRT: Failed to load UNet {label} engine: {ex}")
+            log.warning(f"  TRT: Failed to load UNet {label} engine for {width}x{height}: {ex}")
+    else:
+        log.debug(f"  TRT: No dynamic UNet engine covers {width}x{height} "
+                  f"(profiles are per-axis min/max, rectangular aspect ratios may fall in gaps)")
 
     return None
 
@@ -2667,6 +2795,7 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
         trt_fp = f"{fp}:vae_trt:{label}"
         cached = gpu.get_cached_model(trt_fp)
         if cached is not None:
+            log.debug(f"  TRT: Using cached VAE {label} runner for {width}x{height}")
             return cached.model
         try:
             engine_size = os.path.getsize(dynamic_path)
@@ -2679,10 +2808,12 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
                 source=f"TRT-VAE-{label}",
                 evict_callback=runner.unload,
             )
-            log.debug(f"  TRT: Loaded VAE {label} runner on GPU [{gpu.uuid}]")
+            log.debug(f"  TRT: Loaded VAE {label} runner for {width}x{height} on GPU [{gpu.uuid}]")
             return runner
         except Exception as ex:
-            log.warning(f"  TRT: Failed to load VAE {label} engine: {ex}")
+            log.warning(f"  TRT: Failed to load VAE {label} engine for {width}x{height}: {ex}")
+    else:
+        log.debug(f"  TRT: No dynamic VAE engine covers {width}x{height}")
 
     return None
 
