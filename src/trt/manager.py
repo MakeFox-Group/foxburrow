@@ -32,7 +32,13 @@ from trt.builder import (
     get_onnx_path,
     validate_onnx,
 )
-from trt.exporter import export_te1_onnx, export_te2_onnx, export_unet_onnx, export_vae_onnx
+from trt.exporter import (
+    consolidate_external_data,
+    export_te1_onnx,
+    export_te2_onnx,
+    export_unet_onnx,
+    export_vae_onnx,
+)
 
 if TYPE_CHECKING:
     from scheduling.worker_proxy import GpuWorkerProxy as GpuWorker
@@ -287,6 +293,19 @@ class TrtBuildManager:
         unet_onnx = get_onnx_path(self._cache_dir, request.model_hash, "unet")
         if not os.path.isfile(unet_onnx):
             log.warning(f"  TRT: No UNet ONNX for {short_hash} after export — skipping")
+            with self._lock:
+                self._queued_models.discard(request.model_hash)
+            return
+
+        # Ensure UNet external data is consolidated into a single .data file.
+        # PyTorch creates hundreds of per-tensor files for >2GB models; TRT's
+        # WeightsContextMemoryMap fails to mmap them all.  This is idempotent —
+        # already-consolidated files are detected and skipped instantly.
+        try:
+            await loop.run_in_executor(
+                self._export_pool, consolidate_external_data, unet_onnx, "unet")
+        except Exception as ex:
+            log.log_exception(ex, f"TRT: UNet ONNX consolidation failed for {short_hash}")
             with self._lock:
                 self._queued_models.discard(request.model_hash)
             return

@@ -11,7 +11,7 @@ must be serialized via _onnx_lock.
 Large models (SDXL UNet ~5GB FP32) exceed the 2GB protobuf limit.
 PyTorch's TorchScript exporter auto-detects this and writes hundreds
 of individual per-tensor files alongside the .onnx graph stub.  After
-export, _consolidate_external_data() merges these into a single .data
+export, consolidate_external_data() merges these into a single .data
 file for reliable TRT parsing.
 """
 
@@ -30,7 +30,7 @@ import log
 _onnx_lock = threading.Lock()
 
 
-def _consolidate_external_data(onnx_path: str, component_name: str) -> None:
+def consolidate_external_data(onnx_path: str, component_name: str) -> None:
     """Merge per-tensor external data files into a single .data file.
 
     PyTorch's TorchScript ONNX exporter (dynamo=False) creates one file per
@@ -385,7 +385,7 @@ def export_unet_onnx(
     # UNet FP32 (~5GB) exceeds the 2GB protobuf limit, so PyTorch creates
     # hundreds of individual per-tensor files.  Consolidate into one .data
     # file for reliable TRT parsing.
-    _consolidate_external_data(output_path, "unet")
+    consolidate_external_data(output_path, "unet")
 
 
 def export_vae_onnx(
