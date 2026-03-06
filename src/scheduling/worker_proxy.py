@@ -194,6 +194,48 @@ class GpuProxy:
             return 0
         return self._status.loaded_lora_count
 
+    def check_trt_affinity(self, model_fp: str, component: str,
+                           width: int, height: int) -> int:
+        """Check TRT engine affinity for a given model/resolution.
+
+        Returns:
+            +2 if the GPU has a TRT engine that exactly matches (static)
+            +1 if the GPU has a dynamic TRT engine that covers the resolution
+             0 if the GPU has no TRT engines for this model/component
+            -1 if the GPU has TRT engine(s) that DON'T cover the resolution
+               (loading will evict them — wasteful)
+        """
+        if self._status is None:
+            return 0
+
+        prefix = f"{model_fp}:{component}_trt:"
+        cached_trt = [
+            fp[len(prefix):] for fp in self._status.cached_fingerprints
+            if fp.startswith(prefix)
+        ]
+
+        if not cached_trt:
+            return 0
+
+        # Check for exact static match
+        static_key = f"{width}x{height}"
+        if static_key in cached_trt:
+            return 2
+
+        # Check dynamic engines
+        from trt.builder import DYNAMIC_PROFILES
+        for label_suffix in cached_trt:
+            for profile in DYNAMIC_PROFILES:
+                if profile["label"] != label_suffix:
+                    continue
+                min_w, min_h = profile["min"]
+                max_w, max_h = profile["max"]
+                if min_w <= width <= max_w and min_h <= height <= max_h:
+                    return 1
+
+        # Has TRT engines but none cover this resolution
+        return -1
+
     def get_active_fingerprints(self) -> set[str]:
         # In the proxy, active fingerprints are tracked locally
         return set()
@@ -286,6 +328,9 @@ class GpuWorkerProxy:
         # Watchdog
         self._last_activity = _time.monotonic()
         self._watchdog_timeout = 600.0  # 10 minutes
+
+        # Dispatch tracking (for scheduler diversification)
+        self._last_dispatch_time: float = 0.0  # monotonic timestamp
 
     @property
     def gpu(self) -> GpuProxy:
@@ -428,6 +473,8 @@ class GpuWorkerProxy:
         if self._gpu_proxy.is_failed:
             raise RuntimeError(f"GPU [{self._gpu_proxy.uuid}] is permanently failed")
 
+        self._last_dispatch_time = _time.monotonic()
+
         # Update local concurrency tracking
         if self._active_count == 0:
             self._gpu_proxy._busy = True
@@ -554,7 +601,11 @@ class GpuWorkerProxy:
         log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Drained — GPU ready for TRT build")
 
     async def release_drain(self) -> None:
-        """Release drain state, resume normal operation."""
+        """Release drain state, resume normal operation.
+
+        After releasing, re-sends onload commands to restore pre-configured
+        models so the GPU is warm and ready for work immediately.
+        """
         self._cmd_queue.put(ReleaseDrainCmd())
         self._building = False
         self._draining = False
@@ -564,6 +615,30 @@ class GpuWorkerProxy:
             self._gpu_proxy._pool_gpu._trt_building = False
 
         log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Drain released")
+
+        # Re-load pre-configured models (onload) so the GPU isn't left cold.
+        # Drain evicts everything; without this, the first job to hit this GPU
+        # pays the full model-loading cost and the GPU sits at a scoring
+        # disadvantage vs GPUs that kept their models warm.
+        try:
+            from state import app_state
+            if self._gpu_proxy.onload:
+                models_dir = app_state.config.server.models_dir
+                await self.send_onload(
+                    types={"sdxl", "upscale", "bgremove"},
+                    onload_entries=self._gpu_proxy.onload,
+                    unevictable_entries=self._gpu_proxy.unevictable,
+                    models_dir=models_dir,
+                    sdxl_models=app_state.sdxl_models,
+                    lora_index=dict(app_state.lora_index),
+                    loras_dir=app_state.loras_dir,
+                )
+                log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
+                          f"Post-drain onload complete")
+        except Exception as ex:
+            log.warning(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
+                        f"Post-drain onload failed: {ex}")
+
         if self._scheduler_wake:
             self._scheduler_wake.set()
 

@@ -239,6 +239,38 @@ class GpuScheduler:
         if is_idle:
             score += 20            # slight preference for idle GPUs at equal time
 
+            # Diversification: prefer GPUs that haven't been dispatched recently.
+            # Breaks ties when all GPUs score equally (e.g., all empty after
+            # TRT drain) so work spreads across GPUs instead of snowballing
+            # onto whichever GPU happens to be listed first.
+            import time as _time
+            idle_since = _time.monotonic() - worker._last_dispatch_time
+            score += min(int(idle_since * 2), 30)  # up to +30 pts, ramps over 15s
+
+        # ── TRT engine affinity ──────────────────────────────────────
+        # For denoise/VAE stages, check if this GPU has a TRT engine that
+        # covers the job's resolution.  Avoids wasteful TRT engine swaps
+        # by preferring GPUs that already have the right engine, or clean
+        # GPUs over ones that would need to evict a useful engine.
+        if stage.type in (StageType.GPU_DENOISE, StageType.GPU_VAE_DECODE,
+                          StageType.GPU_VAE_ENCODE) and group.jobs:
+            inp = budget_job.sdxl_input
+            if inp is not None:
+                w, h = inp.width, inp.height
+                for c in stage.required_components:
+                    if c.category == "sdxl_unet" and stage.type == StageType.GPU_DENOISE:
+                        trt_aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)
+                    elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
+                        trt_aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
+                    else:
+                        continue
+                    if trt_aff == 2:
+                        score += 200    # exact static TRT match — fastest path
+                    elif trt_aff == 1:
+                        score += 150    # dynamic TRT engine covers this resolution
+                    elif trt_aff == -1:
+                        score -= 150    # has TRT engines but wrong resolution — will evict
+
         # Cross-group penalty — only when busy. An idle GPU has zero
         # context-switch cost so switching session groups is free.
         # Skip penalty when either side is a lightweight compatible-with-all group.
