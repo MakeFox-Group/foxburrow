@@ -431,6 +431,7 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
 
 def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer, loop) -> StageResult:
     """Execute a single pipeline stage. Returns StageResult with all outputs on CPU."""
+    import log
     import torch
     from gpu import torch_ext
     from scheduling.job import (
