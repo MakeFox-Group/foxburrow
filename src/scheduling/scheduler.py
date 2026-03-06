@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import time as _time
 from typing import TYPE_CHECKING
 
 import log
@@ -193,6 +194,7 @@ class GpuScheduler:
         # model loading cost + working memory alongside active jobs.
         # Use the first non-OOM'd job for budget estimation (the one that
         # will actually be dispatched), not jobs[0] which may be blocked.
+        budget_job = None
         if group.jobs:
             budget_job = next(
                 (j for j in group.jobs if worker.gpu.uuid not in j.oom_gpu_ids),
@@ -216,7 +218,7 @@ class GpuScheduler:
         # GPU2 has TRT VAE engines, and stages route accordingly.
         trt_covered_fps: set[str] = set()
         trt_affinity_score = 0
-        if stage.required_components and group.jobs:
+        if stage.required_components and budget_job is not None:
             inp = budget_job.sdxl_input
             if inp is not None:
                 w, h = inp.width, inp.height
@@ -296,7 +298,6 @@ class GpuScheduler:
             # Breaks ties when all GPUs score equally (e.g., all empty after
             # TRT drain) so work spreads across GPUs instead of snowballing
             # onto whichever GPU happens to be listed first.
-            import time as _time
             idle_since = _time.monotonic() - worker._last_dispatch_time
             score += min(int(idle_since * 2), 30)  # up to +30 pts, ramps over 15s
 

@@ -135,6 +135,7 @@ class TrtBuildManager:
     def start(self) -> None:
         """Start the pipeline as asyncio tasks."""
         loop = asyncio.get_running_loop()
+        self._loop = loop
 
         self._export_task = loop.create_task(self._export_coordinator())
 
@@ -203,11 +204,18 @@ class TrtBuildManager:
                 return
             self._queued_models.add(model_hash)
 
-        self._export_queue.put_nowait(_BuildRequest(
+        request = _BuildRequest(
             model_hash=model_hash,
             model_dir=model_dir,
             checkpoint_path=checkpoint_path,
-        ))
+        )
+        # Use call_soon_threadsafe so this is safe from background threads
+        # (e.g. ModelScanner's daemon thread). asyncio.Queue is not thread-safe.
+        loop = getattr(self, '_loop', None)
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._export_queue.put_nowait, request)
+        else:
+            self._export_queue.put_nowait(request)
         log.debug(f"  TRT: Queued build for model {model_hash[:16]}")
 
     def is_ready(self, model_hash: str) -> bool:

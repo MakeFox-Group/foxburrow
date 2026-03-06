@@ -632,11 +632,11 @@ class GpuWorkerProxy:
 
         After releasing, re-sends onload commands to restore pre-configured
         models so the GPU is warm and ready for work immediately.
+        Drain state (_draining) stays True until onload completes so the
+        scheduler doesn't dispatch to a cold GPU.
         """
         self._cmd_queue.put(ReleaseDrainCmd())
         self._building = False
-        self._draining = False
-        self._drain_event = None
         # Sync to pool's GpuInstance so AdmissionControl restores capacity
         if self._gpu_proxy._pool_gpu is not None:
             self._gpu_proxy._pool_gpu._trt_building = False
@@ -647,6 +647,8 @@ class GpuWorkerProxy:
         # Drain evicts everything; without this, the first job to hit this GPU
         # pays the full model-loading cost and the GPU sits at a scoring
         # disadvantage vs GPUs that kept their models warm.
+        # Keep _draining=True during onload so the scheduler doesn't dispatch
+        # to a GPU with no models loaded yet.
         try:
             from state import app_state
             if self._gpu_proxy.onload:
@@ -665,6 +667,10 @@ class GpuWorkerProxy:
         except Exception as ex:
             log.warning(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
                         f"Post-drain onload failed: {ex}")
+        finally:
+            # Only now mark as available for work
+            self._draining = False
+            self._drain_event = None
 
         if self._scheduler_wake:
             self._scheduler_wake.set()
