@@ -222,6 +222,11 @@ class GpuScheduler:
             inp = budget_job.sdxl_input
             if inp is not None:
                 w, h = inp.width, inp.height
+                # Use hires resolution for hires denoise/decode stages
+                if budget_job.is_hires_pass and budget_job.hires_input:
+                    hi = budget_job.hires_input
+                    if hi.hires_width > 0 and hi.hires_height > 0:
+                        w, h = hi.hires_width, hi.hires_height
                 for c in stage.required_components:
                     if c.category == "sdxl_unet":
                         aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)

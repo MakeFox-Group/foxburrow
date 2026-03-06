@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import itertools
 import threading
+import time as _time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
@@ -207,6 +208,9 @@ class CachedModel:
     actual_vram: int = 0  # measured bytes (0 = not measured)
     source: str = ""  # human-readable source name, e.g. "xavier_v10"
     evict_callback: Callable[[], None] | None = None  # called on eviction for cleanup
+    cached_at: float = 0.0  # time.monotonic() when cached
+    last_used: float = 0.0  # time.monotonic() when last accessed
+    use_count: int = 0  # how many times this model has been used
 
 
 class GpuInstance:
@@ -349,12 +353,16 @@ class GpuInstance:
         with self._cache_lock:
             if fingerprint in self._cache:
                 self._cache.move_to_end(fingerprint)
-                return self._cache[fingerprint]
+                m = self._cache[fingerprint]
+                m.last_used = _time.monotonic()
+                m.use_count += 1
+                return m
             return None
 
     def cache_model(self, fingerprint: str, category: str, model: object, estimated_vram: int,
                     source: str = "", actual_vram: int = 0,
                     evict_callback: Callable[[], None] | None = None) -> None:
+        now = _time.monotonic()
         with self._cache_lock:
             self._cache[fingerprint] = CachedModel(
                 fingerprint=fingerprint,
@@ -364,6 +372,9 @@ class GpuInstance:
                 actual_vram=actual_vram,
                 source=source,
                 evict_callback=evict_callback,
+                cached_at=now,
+                last_used=now,
+                use_count=0,
             )
             self._cache.move_to_end(fingerprint)
 
@@ -467,51 +478,80 @@ class GpuInstance:
                             f"in {model_entry.category} before eviction")
         model_entry.model.to("cpu")
 
+    def _eviction_score(self, fp: str, m: CachedModel, now: float) -> float:
+        """Score a model for eviction.  LOWER score = evict first.
+
+        Factors:
+        - Recency: models unused for longer are cheaper to evict
+        - Frequency: frequently-used models are more valuable (keep)
+        - VRAM cost: larger models are more expensive to reload (keep)
+        - Session group: non-current group models are cheaper to evict
+        - Category: TRT engines are expensive to reload (keep)
+        """
+        idle_s = now - m.last_used if m.last_used > 0 else 3600.0
+
+        # Base score: recency (higher idle = lower score = evict sooner)
+        score = -idle_s
+
+        # Frequency bonus: each use makes the model harder to evict
+        # Diminishing returns: log-ish curve, capped
+        score += min(m.use_count * 5.0, 200.0)
+
+        # VRAM cost: bigger models are more expensive to reload
+        vram_mb = (m.actual_vram if m.actual_vram > 0 else m.estimated_vram) / (1024 * 1024)
+        score += vram_mb * 0.02  # 1GB model = +20 pts
+
+        # TRT engines are expensive to deserialize (~5-10s), heavily penalize eviction
+        if m.category.endswith("_trt"):
+            score += 100.0
+
+        # Non-current session group: cheaper to evict
+        if self._current_group:
+            model_group = _get_group_for_category(m.category)
+            if model_group and model_group != self._current_group:
+                score -= 200.0
+
+        return score
+
     def evict_lru(self, protect: set[str] | None = None) -> CachedModel | None:
-        """Evict the least-recently-used cached model not in the protected,
-        unevictable, or actively-in-use sets. Prefers evicting models from
-        non-current session groups first. Moves model to CPU.
-        Returns evicted model or None."""
-        # Snapshot active fingerprints BEFORE acquiring _cache_lock to maintain
-        # consistent lock ordering (active_fp_lock → cache_lock), matching
-        # get_evictable_vram(). Models actively being used by another thread's
-        # forward pass must never be evicted — .to("cpu") mid-inference causes
-        # device mismatch errors or silent corruption (black images).
+        """Evict the least-valuable cached model using weighted scoring.
+
+        Considers recency, usage frequency, VRAM cost, session group, and
+        model category (TRT engines are expensive to reload).  Models in
+        the protected, unevictable, or actively-in-use sets are excluded.
+        Returns evicted model or None.
+        """
         active_fps = self.get_active_fingerprints()
+        now = _time.monotonic()
         with self._cache_lock:
-            # First pass: try to evict from non-current groups (least valuable)
-            if self._current_group:
-                for fp in list(self._cache.keys()):
-                    if not self._is_evictable(fp, protect):
-                        continue
-                    if fp in active_fps:
-                        continue
-                    m = self._cache[fp]
-                    if _get_group_for_category(m.category) != self._current_group:
-                        model_entry = self._cache.pop(fp)
-                        if model_entry.evict_callback:
-                            model_entry.evict_callback()
-                        self._safe_to_cpu(model_entry)
-                        torch.cuda.empty_cache()
-                        log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
-                                 f"(~{model_entry.estimated_vram // (1024*1024)}MB, "
-                                 f"non-current group)")
-                        return model_entry
-            # Second pass: evict from any group (but still respect unevictable/active)
-            for fp in list(self._cache.keys()):
+            best_fp: str | None = None
+            best_score = float('inf')
+
+            for fp, m in self._cache.items():
                 if not self._is_evictable(fp, protect):
                     continue
                 if fp in active_fps:
                     continue
-                model_entry = self._cache.pop(fp)
-                if model_entry.evict_callback:
-                    model_entry.evict_callback()
-                self._safe_to_cpu(model_entry)
-                torch.cuda.empty_cache()
-                log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
-                         f"(~{model_entry.estimated_vram // (1024*1024)}MB)")
-                return model_entry
-            return None
+                score = self._eviction_score(fp, m, now)
+                if score < best_score:
+                    best_score = score
+                    best_fp = fp
+
+            if best_fp is None:
+                return None
+
+            model_entry = self._cache.pop(best_fp)
+            vram_mb = (model_entry.actual_vram if model_entry.actual_vram > 0
+                       else model_entry.estimated_vram) // (1024 * 1024)
+            idle_s = now - model_entry.last_used if model_entry.last_used > 0 else 0
+            if model_entry.evict_callback:
+                model_entry.evict_callback()
+            self._safe_to_cpu(model_entry)
+            torch.cuda.empty_cache()
+            log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
+                     f"(~{vram_mb}MB, {model_entry.use_count} uses, "
+                     f"idle {idle_s:.0f}s, score={best_score:.0f})")
+            return model_entry
 
     def ensure_free_vram(self, min_free_bytes: int, protect: set[str] | None = None) -> None:
         """Evict cached models until at least min_free_bytes VRAM is free."""
