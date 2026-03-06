@@ -760,6 +760,7 @@ def main() -> None:
         log.debug(f"  LoRA directory not found: {loras_dir} (skipping)")
 
     # Discover upscale model (in models/other/)
+    # Track handler paths for worker process propagation
     upscale_path = discover_model_file(models_dir, os.path.join("other", "upscale"),
                                        [".pth", ".safetensors", ".onnx"])
     if upscale_path:
@@ -770,9 +771,11 @@ def main() -> None:
 
     # Discover bgremove model (in models/other/)
     bgremove_found = False
+    bgremove_handler_path: str | None = None  # path passed to set_model_path
     bgremove_dir = os.path.join(models_dir, "other", "bgremove")
     if os.path.isfile(os.path.join(bgremove_dir, "config.json")):
         bgremove_found = True
+        bgremove_handler_path = bgremove_dir
         from handlers.bgremove import set_model_path
         set_model_path(bgremove_dir)
         log.debug(f"  BGRemove model: {bgremove_dir}")
@@ -781,6 +784,7 @@ def main() -> None:
                                             [".safetensors", ".pth", ".onnx"])
         if bgremove_path:
             bgremove_found = True
+            bgremove_handler_path = bgremove_path
             from handlers.bgremove import set_model_path
             set_model_path(bgremove_path)
             log.debug(f"  BGRemove model: {bgremove_path}")
@@ -789,17 +793,20 @@ def main() -> None:
 
     # Discover tagger model (in models/other/)
     tagger_found = False
+    tagger_handler_path: str | None = None  # path passed to set_model_path
     tagger_dir = os.path.join(models_dir, "other", "tagger")
     tagger_path = discover_model_file(models_dir, os.path.join("other", "tagger"), [".onnx"])
     if tagger_path:
         tagger_found = True
+        tagger_handler_path = os.path.dirname(tagger_path)
         from handlers.tagger import set_model_path
-        set_model_path(os.path.dirname(tagger_path))
+        set_model_path(tagger_handler_path)
     elif os.path.isdir(tagger_dir):
         has_model = any(f.endswith(".safetensors") for f in os.listdir(tagger_dir))
         has_tags = os.path.isfile(os.path.join(tagger_dir, "tags.json"))
         if has_model and has_tags:
             tagger_found = True
+            tagger_handler_path = tagger_dir
             from handlers.tagger import set_model_path
             set_model_path(tagger_dir)
     if tagger_found:
@@ -870,6 +877,9 @@ def main() -> None:
                     "models_dir": os.path.abspath(config.server.models_dir),
                     "trt_enabled": config.tensorrt.enabled,
                     "trt_dynamic_only": config.tensorrt.dynamic_only,
+                    "upscale_model_path": upscale_path,
+                    "bgremove_model_path": bgremove_handler_path,
+                    "tagger_model_path": tagger_handler_path,
                 },
                 cmd_q,
                 result_q,

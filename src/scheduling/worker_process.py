@@ -24,6 +24,7 @@ from scheduling.worker_protocol import (
     DrainComplete,
     ExecuteStageCmd,
     GetStatusCmd,
+    LogMessage,
     OnloadCmd,
     OnloadComplete,
     ProcessError,
@@ -106,7 +107,14 @@ def gpu_worker_main(
     torch._inductor.config.conv_1x1_as_mm = True
 
     import log
-    log.init_file(os.path.abspath(f"data/worker_{gpu_index}.jsonl"))
+
+    def _log_to_queue(message: str, level_value: str) -> None:
+        try:
+            result_queue.put(LogMessage(message=message, level=level_value))
+        except Exception:
+            pass  # Queue broken — nothing we can do
+
+    log.set_remote_callback(_log_to_queue)
     log.info(f"GPU worker process started: GPU[{gpu_index}] {gpu_name} ({gpu_uuid})")
 
     device = torch.device("cuda:0")
@@ -196,6 +204,30 @@ def gpu_worker_main(
     _trt_cfg.dynamic_only = server_config_dict.get("trt_dynamic_only", True)
     app_state.config = FoxBurrowConfig(
         server=_server_cfg, gpus=[gpu_config], tensorrt=_trt_cfg)
+
+    # Set handler model paths — these are module-level globals in each handler
+    # that the main process sets via set_model_path(). Worker processes (spawned
+    # via multiprocessing.spawn) get fresh module state, so we must set them here.
+    _up_path = server_config_dict.get("upscale_model_path")
+    if _up_path:
+        from handlers.upscale import set_model_path as _set_upscale_path
+        _set_upscale_path(_up_path)
+        app_state.registry.register_upscale_model(_up_path)
+
+    _bgr_path = server_config_dict.get("bgremove_model_path")
+    if _bgr_path:
+        from handlers.bgremove import set_model_path as _set_bgremove_path
+        _set_bgremove_path(_bgr_path)
+        # Registry needs a file path for fingerprinting; handler path may be a directory
+        _bgr_file = (os.path.join(_bgr_path, "model.safetensors")
+                     if os.path.isdir(_bgr_path) else _bgr_path)
+        if os.path.isfile(_bgr_file):
+            app_state.registry.register_bgremove_model(_bgr_file)
+
+    _tag_path = server_config_dict.get("tagger_model_path")
+    if _tag_path:
+        from handlers.tagger import set_model_path as _set_tagger_path
+        _set_tagger_path(_tag_path)
 
     # Initialize profiling tracer
     from profiling.tracer import register_tracer

@@ -260,6 +260,13 @@ class ProcessError:
 
 
 @dataclass
+class LogMessage:
+    """Log message from worker process, forwarded to main process for display."""
+    message: str
+    level: str  # LogLevel.value: "DEBUG", "INFO", "WARNING", "ERROR"
+
+
+@dataclass
 class WorkerReady:
     """Worker process has initialized and is ready for commands."""
     gpu_model_name: str

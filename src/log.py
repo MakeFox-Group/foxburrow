@@ -39,6 +39,10 @@ _tui_callback: Callable[[str, LogLevel], None] | None = None
 _tui_min_level: LogLevel = LogLevel.INFO
 _suppress_stdout: bool = False
 
+# Remote (queue) callback — routes ALL log messages to the main process.
+# When set, file logging is skipped (main process handles it).
+_remote_callback: Callable[[str, str], None] | None = None  # (message, level_value)
+
 
 def init_file(path: str) -> None:
     """Open the log file for appending. Creates parent directories if needed."""
@@ -76,24 +80,43 @@ def clear_tui_callback() -> None:
         _suppress_stdout = False
 
 
+def set_remote_callback(callback: Callable[[str, str], None]) -> None:
+    """Register a remote callback for worker processes.
+
+    When set, ALL log messages are sent to the callback as (message, level_value)
+    instead of being written to the local log file. Stdout is also suppressed.
+    The main process is responsible for file logging and TUI display.
+    """
+    global _remote_callback, _suppress_stdout
+    with _lock:
+        _remote_callback = callback
+        _suppress_stdout = True
+
+
 def write_line(message: str, level: LogLevel = LogLevel.INFO) -> None:
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] [{level.value}] {message}"
-    # Snapshot callback under lock, then call it OUTSIDE the lock to avoid
+    # Snapshot callbacks under lock, then call them OUTSIDE the lock to avoid
     # deadlock if the callback (or anything it calls) re-enters log.*.
     cb = None
+    rcb = None
     with _lock:
-        if not _suppress_stdout:
-            print(line, flush=True)
-        if _log_file is not None:
-            record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
-                                ensure_ascii=False)
-            _log_file.write(record + "\n")
-            _log_file.flush()
+        rcb = _remote_callback
+        if rcb is None:
+            # Local mode: write to stdout and file
+            if not _suppress_stdout:
+                print(line, flush=True)
+            if _log_file is not None:
+                record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
+                                    ensure_ascii=False)
+                _log_file.write(record + "\n")
+                _log_file.flush()
         if _tui_callback is not None and _LEVEL_ORDER.get(level, 0) >= _LEVEL_ORDER.get(_tui_min_level, 1):
             cb = _tui_callback
+    if rcb is not None:
+        rcb(message, level.value)
     if cb is not None:
         cb(line, level)
 
@@ -104,16 +127,21 @@ def write(message: str, level: LogLevel = LogLevel.INFO) -> None:
     ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] [{level.value}] {message}"
     cb = None
+    rcb = None
     with _lock:
-        if not _suppress_stdout:
-            print(line, end="", flush=True)
-        if _log_file is not None:
-            record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
-                                ensure_ascii=False)
-            _log_file.write(record + "\n")
-            _log_file.flush()
+        rcb = _remote_callback
+        if rcb is None:
+            if not _suppress_stdout:
+                print(line, end="", flush=True)
+            if _log_file is not None:
+                record = json.dumps({"ts": ts_iso, "level": level.value, "msg": message},
+                                    ensure_ascii=False)
+                _log_file.write(record + "\n")
+                _log_file.flush()
         if _tui_callback is not None and _LEVEL_ORDER.get(level, 0) >= _LEVEL_ORDER.get(_tui_min_level, 1):
             cb = _tui_callback
+    if rcb is not None:
+        rcb(message, level.value)
     if cb is not None:
         cb(line, level)
 

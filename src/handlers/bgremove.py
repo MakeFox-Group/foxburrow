@@ -42,7 +42,10 @@ def load_model(device: torch.device) -> torch.nn.Module:
         repair_accelerate_leak()
         model = BiRefNet(bb_pretrained=False)
 
-        weights_path = os.path.join(_model_path, "model.safetensors")
+        if os.path.isdir(_model_path):
+            weights_path = os.path.join(_model_path, "model.safetensors")
+        else:
+            weights_path = _model_path
         state_dict = load_file(weights_path)
         # assign=True replaces parameter objects entirely instead of copy_()
         # into them — handles meta tensors from accelerate leaks without

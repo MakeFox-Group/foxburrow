@@ -32,6 +32,7 @@ from scheduling.worker_protocol import (
     DrainComplete,
     ExecuteStageCmd,
     GetStatusCmd,
+    LogMessage,
     OnloadCmd,
     OnloadComplete,
     ProcessError,
@@ -801,7 +802,12 @@ class GpuWorkerProxy:
 
                 self._last_activity = _time.monotonic()
 
-                if isinstance(msg, WorkerReady):
+                if isinstance(msg, LogMessage):
+                    level = log.LogLevel(msg.level) if msg.level in ("DEBUG", "INFO", "WARNING", "ERROR") else log.LogLevel.INFO
+                    log.write_line(msg.message, level)
+                    continue
+
+                elif isinstance(msg, WorkerReady):
                     self._gpu_model_name = msg.gpu_model_name
                     self._arch_key = msg.arch_key
                     self._ready = True
