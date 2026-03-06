@@ -50,7 +50,12 @@ def load_model(device: torch.device) -> torch.nn.Module:
         # assign=True replaces parameter objects entirely instead of copy_()
         # into them — handles meta tensors from accelerate leaks without
         # needing fix_meta_tensors first.
-        model.load_state_dict(state_dict, strict=False, assign=True)
+        result = model.load_state_dict(state_dict, strict=False, assign=True)
+        if result.missing_keys:
+            log.warning(f"  BGRemove: {len(result.missing_keys)} missing keys in checkpoint: "
+                        f"{result.missing_keys[:5]}...")
+        if result.unexpected_keys:
+            log.debug(f"  BGRemove: {len(result.unexpected_keys)} unexpected keys in checkpoint")
         model.to(device=device, dtype=torch.float16).eval()
         log.debug(f"  BGRemove: Loaded RMBG-2.0 to {device}")
         return model

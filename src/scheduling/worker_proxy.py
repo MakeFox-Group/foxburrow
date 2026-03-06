@@ -803,7 +803,10 @@ class GpuWorkerProxy:
                 self._last_activity = _time.monotonic()
 
                 if isinstance(msg, LogMessage):
-                    level = log.LogLevel(msg.level) if msg.level in ("DEBUG", "INFO", "WARNING", "ERROR") else log.LogLevel.INFO
+                    try:
+                        level = log.LogLevel(msg.level)
+                    except ValueError:
+                        level = log.LogLevel.INFO
                     log.write_line(msg.message, level)
                     continue
 
