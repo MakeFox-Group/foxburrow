@@ -994,11 +994,62 @@ class GpuWorkerProxy:
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
         else:
-            # More stages — advance and re-enqueue
+            # More stages — advance and try fast re-dispatch
             self._gpu_proxy.record_success()
             job.current_stage_index = msg.current_stage_index
-            from state import app_state
-            app_state.queue.re_enqueue(job)
+            if not self._try_fast_redispatch(job):
+                from state import app_state
+                app_state.queue.re_enqueue(job)
+
+    def _try_fast_redispatch(self, job: InferenceJob) -> bool:
+        """Try to immediately dispatch the next stage to this same GPU.
+
+        Avoids the full scheduler round-trip (re-enqueue → wake → score all
+        GPUs → dispatch) when this GPU is clearly the best choice.  The
+        tensors still go through IPC (unavoidable with multiprocessing) but
+        we skip the scheduling latency.
+
+        Returns True if the job was dispatched, False if it should be
+        re-enqueued normally.
+        """
+        next_stage = job.current_stage
+        if next_stage is None:
+            return False
+
+        # Only fast-dispatch GPU stages (CPU stages go to the thread pool)
+        if next_stage.is_cpu_only:
+            return False
+
+        # Don't fast-dispatch if GPU is draining or failed
+        if self._draining or self._building or self._gpu_proxy.is_failed:
+            return False
+
+        # Don't fast-dispatch if GPU can't accept this stage type
+        if not self.can_accept_work(next_stage):
+            return False
+
+        # Don't fast-dispatch if there are higher-priority jobs waiting
+        # in the queue that could use this GPU instead
+        from state import app_state
+        queue = app_state.queue
+        groups = queue.get_work_groups()
+        for g in groups:
+            if g.stage.is_cpu_only:
+                continue
+            # If a different work group has older/higher-priority jobs
+            # waiting, let the scheduler handle it — don't starve them
+            if g.oldest_age_seconds > 5.0 and g.stage.type != next_stage.type:
+                return False
+
+        # VRAM budget check
+        if not self.check_vram_budget(next_stage, job):
+            return False
+
+        # All checks passed — dispatch immediately
+        log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Fast re-dispatch "
+                  f"{job} → {next_stage.type.value}")
+        self.dispatch(next_stage, job)
+        return True
 
     def _handle_progress(self, msg: ProgressUpdate) -> None:
         """Update job progress from worker."""

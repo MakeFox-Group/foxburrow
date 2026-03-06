@@ -227,7 +227,7 @@ class GpuInstance:
 
         # Busy semaphore for status reporting
         self._busy_lock = threading.Lock()
-        self._busy = False
+        self._busy_count = 0
 
         # Model cache: fingerprint -> CachedModel (LRU ordered)
         self._cache: OrderedDict[str, CachedModel] = OrderedDict()
@@ -236,6 +236,11 @@ class GpuInstance:
         # Active model pointers — ref-counted so concurrent jobs don't clobber each other
         self._active_fp_counts: Counter[str] = Counter()
         self._active_fp_lock = threading.Lock()
+
+        # Model loading lock — serializes _ensure_models_for_stage calls
+        # so concurrent stage threads don't race on VRAM allocation.
+        # CUDA kernels release the GIL so actual stage execution is parallel.
+        self.model_load_lock = threading.Lock()
 
         # Session group tracking
         self._current_group: str | None = None
@@ -292,18 +297,23 @@ class GpuInstance:
 
     @property
     def is_busy(self) -> bool:
-        return self._busy
+        return self._busy_count > 0
 
     def try_acquire(self) -> bool:
         with self._busy_lock:
-            if self._busy:
+            if self._busy_count > 0:
                 return False
-            self._busy = True
+            self._busy_count += 1
             return True
+
+    def acquire(self) -> None:
+        """Increment busy ref count. Use for concurrent stage execution."""
+        with self._busy_lock:
+            self._busy_count += 1
 
     def release(self) -> None:
         with self._busy_lock:
-            self._busy = False
+            self._busy_count = max(0, self._busy_count - 1)
 
     def supports_capability(self, cap: str) -> bool:
         return cap.lower() in self.capabilities

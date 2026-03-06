@@ -1,8 +1,10 @@
 """GPU worker subprocess — owns all CUDA state for a single GPU.
 
 Launched by the main process with CUDA_VISIBLE_DEVICES set so this
-process sees exactly one GPU as cuda:0.  Runs a sequential command
-loop: no concurrency, no locks, no GIL contention with other GPUs.
+process sees exactly one GPU as cuda:0.  ExecuteStageCmd runs in a
+thread pool so multiple stage types (TE, UNet, VAE) from different
+jobs can execute concurrently on the same GPU.  Other commands
+(drain, TRT build, onload, etc.) run on the main thread sequentially.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import sys
 import time as _time
 import traceback
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # NOTE: torch is imported AFTER CUDA_VISIBLE_DEVICES is set in gpu_worker_main().
@@ -246,6 +249,35 @@ def gpu_worker_main(
     _worker_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_worker_loop)
 
+    # Thread pool for concurrent stage execution.  Allows TE + UNet + VAE
+    # from different jobs to run simultaneously.  CUDA kernels release the
+    # GIL so actual GPU work runs in parallel; model loading is serialized
+    # by GpuInstance._cache_lock.  MAX_CONCURRENCY matches the proxy's limit.
+    from scheduling.worker_proxy import MAX_CONCURRENCY
+    _stage_pool = ThreadPoolExecutor(
+        max_workers=MAX_CONCURRENCY,
+        thread_name_prefix=f"gpu-stage-{gpu_index}",
+    )
+
+    def _run_stage_in_thread(cmd: ExecuteStageCmd) -> None:
+        """Execute a stage in the thread pool and send the result."""
+        try:
+            result = _execute_stage_cmd(gpu, cmd, gpu_model_name, tracer)
+            result_queue.put(result)
+        except Exception as ex:
+            fatal = _is_cuda_fatal_local(ex)
+            log.log_exception(ex, f"GPU worker [{gpu_uuid}]: Stage failed")
+            result_queue.put(ProcessError(
+                error=f"{type(ex).__name__}: {ex}",
+                fatal=fatal,
+            ))
+        finally:
+            # Send fresh status after every stage completion
+            try:
+                result_queue.put(_build_status_snapshot(gpu, gpu_model_name, arch_key))
+            except Exception:
+                pass
+
     # ── Command loop ──────────────────────────────────────────────
     import queue as _queue_mod
     while True:
@@ -263,10 +295,17 @@ def gpu_worker_main(
 
         try:
             if isinstance(cmd, ExecuteStageCmd):
-                result = _execute_stage_cmd(gpu, cmd, gpu_model_name, tracer)
-                result_queue.put(result)
+                _stage_pool.submit(_run_stage_in_thread, cmd)
+                # Don't send status here — the thread sends it on completion.
+                continue
 
             elif isinstance(cmd, DrainCmd):
+                # Wait for all active stages to finish before draining
+                _stage_pool.shutdown(wait=True)
+                _stage_pool = ThreadPoolExecutor(
+                    max_workers=MAX_CONCURRENCY,
+                    thread_name_prefix=f"gpu-stage-{gpu_index}",
+                )
                 _drain(gpu)
                 result_queue.put(DrainComplete())
 
@@ -321,12 +360,14 @@ def gpu_worker_main(
                 fatal=fatal,
             ))
 
-        # Always send fresh status after every command
+        # Always send fresh status after every non-stage command
         try:
             result_queue.put(_build_status_snapshot(gpu, gpu_model_name, arch_key))
         except Exception:
             pass
 
+    # Shut down the thread pool gracefully
+    _stage_pool.shutdown(wait=True)
     log.info(f"  GPU worker [{gpu_uuid}]: Exiting")
 
 
@@ -485,102 +526,139 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
     job._stage_model_fps = {c.category: c.fingerprint
                             for c in stage.required_components}
 
-    # ── Model loading ─────────────────────────────────────────────
-    load_start = _time.monotonic()
+    # Mark GPU busy (ref-counted for concurrent stages)
+    gpu.acquire()
 
-    # Release PyTorch cached allocator memory before loading
-    with torch.cuda.device(device):
-        torch.cuda.empty_cache()
-
-    vram_before = torch.cuda.memory_allocated(device)
-    _ensure_models_for_stage(gpu, stage, job, gpu_model_name)
-
-    # Ensure free VRAM for working memory
-    from scheduling.worker import _get_min_free_vram
-    min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
-    if min_free > 0:
-        gpu.ensure_free_vram(min_free)
-
-    load_duration = _time.monotonic() - load_start
-    vram_delta = torch.cuda.memory_allocated(device) - vram_before
-
-    # Record model load event
-    if load_duration > 0.01:
-        model_name = _get_model_name_from_job(job)
-        tracer.model_load(
-            job.job_id, model_name, stage.type.value,
-            load_duration, vram_delta)
-
-    # ── Execute stage ─────────────────────────────────────────────
-    set_current_tracer(tracer)
-
-    stage_start = _time.monotonic()
-
-    # Memory measurement
-    peak_scope = None
-    mem_baseline = 0
-    if torch_ext.HAS_PEAK_SCOPE:
-        peak_scope = torch.cuda.PeakMemoryScope(device=device)
-        peak_scope.__enter__()
-    else:
-        with torch.cuda.device(device):
-            torch.cuda.reset_peak_memory_stats()
-        mem_baseline = torch.cuda.memory_allocated(device)
-
-    # Tag activations
-    tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_ACTIVATIONS)
-               if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
-
+    load_duration = 0.0
+    stage_duration = 0.0
+    migrate_to_gpu_s = 0.0
+    working_mem = 0
     output_image = None
     oom = False
     fatal = False
     error = None
 
-    migrate_to_gpu_s = 0.0
     try:
-        # Move tensors to GPU (CPU→VRAM transfer)
-        _migrate_start = _time.monotonic()
-        _migrate_tensors_to_device(job, device)
-        migrate_to_gpu_s = _time.monotonic() - _migrate_start
+        # ── Model loading (serialized across concurrent stages) ──
+        load_start = _time.monotonic()
 
-        with tag_ctx:
-            output_image = _dispatch_stage(job, stage, gpu)
+        with gpu.model_load_lock:
+            # Release PyTorch cached allocator memory before loading
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
 
-        gpu.record_success()
+            vram_before = torch.cuda.memory_allocated(device)
+            _ensure_models_for_stage(gpu, stage, job, gpu_model_name)
+
+            # Ensure free VRAM for working memory
+            from scheduling.worker import _get_min_free_vram
+            min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
+            if min_free > 0:
+                gpu.ensure_free_vram(min_free)
+
+        load_duration = _time.monotonic() - load_start
+        vram_delta = torch.cuda.memory_allocated(device) - vram_before
+
+        # Record model load event
+        if load_duration > 0.01:
+            model_name = _get_model_name_from_job(job)
+            tracer.model_load(
+                job.job_id, model_name, stage.type.value,
+                load_duration, vram_delta)
+
+        # ── Execute stage ─────────────────────────────────────────
+        set_current_tracer(tracer)
+
+        stage_start = _time.monotonic()
+
+        # Memory measurement
+        peak_scope = None
+        mem_baseline = 0
+        if torch_ext.HAS_PEAK_SCOPE:
+            peak_scope = torch.cuda.PeakMemoryScope(device=device)
+            peak_scope.__enter__()
+        else:
+            with torch.cuda.device(device):
+                torch.cuda.reset_peak_memory_stats()
+            mem_baseline = torch.cuda.memory_allocated(device)
+
+        # Tag activations
+        tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_ACTIVATIONS)
+                   if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
+
+        try:
+            # Move tensors to GPU (CPU→VRAM transfer)
+            _migrate_start = _time.monotonic()
+            _migrate_tensors_to_device(job, device)
+            migrate_to_gpu_s = _time.monotonic() - _migrate_start
+
+            with tag_ctx:
+                output_image = _dispatch_stage(job, stage, gpu)
+
+            gpu.record_success()
+
+        except torch.cuda.OutOfMemoryError as ex:
+            oom = True
+            error = str(ex)
+            torch.cuda.empty_cache()
+
+        except Exception as ex:
+            if _is_cuda_fatal_local(ex):
+                fatal = True
+                gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
+            error = str(ex)
+
+        finally:
+            if peak_scope is not None:
+                peak_scope.__exit__(None, None, None)
+                working_mem = peak_scope.peak_bytes
+            else:
+                mem_peak = torch.cuda.max_memory_allocated(device)
+                working_mem = mem_peak - mem_baseline
+
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+
+            set_current_tracer(None)
+
+        stage_duration = _time.monotonic() - stage_start
+
+        # Update BPP measurement
+        if error is None:
+            from scheduling.worker import _get_stage_pixels, _update_working_memory
+            stage_pixels = _get_stage_pixels(stage.type, job)
+            _update_working_memory(stage.type, working_mem, stage_pixels)
 
     except torch.cuda.OutOfMemoryError as ex:
+        # OOM during model loading (before stage execution)
         oom = True
         error = str(ex)
         torch.cuda.empty_cache()
 
     except Exception as ex:
+        # Model loading or other pre-stage failure
         if _is_cuda_fatal_local(ex):
             fatal = True
             gpu.mark_failed(f"CUDA context corrupted ({type(ex).__name__})")
         error = str(ex)
+        import traceback as _tb
+        log.error(f"  GPU worker: Stage {stage.type.value} failed: {_tb.format_exc()}")
 
     finally:
-        if peak_scope is not None:
-            peak_scope.__exit__(None, None, None)
-            working_mem = peak_scope.peak_bytes
-        else:
-            mem_peak = torch.cuda.max_memory_allocated(device)
-            working_mem = mem_peak - mem_baseline
+        # Release active fingerprints added by _ensure_models_for_stage
+        # and _load_sdxl_components (te_protect_fps only).
+        release_fps: set[str] = set()
+        release_fps.update(c.fingerprint for c in stage.required_components)
+        release_fps.update(getattr(stage, '_trt_active_fps', set()))
+        if release_fps:
+            gpu.remove_active_fingerprints(release_fps)
+        te_protect = getattr(stage, '_te_protect_fps', set())
+        if te_protect:
+            gpu.remove_active_fingerprints(te_protect)
 
-        with torch.cuda.device(device):
-            torch.cuda.empty_cache()
+        gpu.release()
 
-        set_current_tracer(None)
-
-    stage_duration = _time.monotonic() - stage_start
-
-    # Update BPP measurement (always solo in worker process)
-    if error is None:
-        from scheduling.worker import _get_stage_pixels, _update_working_memory
-        stage_pixels = _get_stage_pixels(stage.type, job)
-        _update_working_memory(stage.type, working_mem, stage_pixels)
-
-    # Record per-stage GPU timing for the API (migrate_to_cpu_s added after serialization)
+    # Record per-stage GPU timing for the API
     model_name = _get_model_name_from_job(job)
     vram_alloc = torch.cuda.memory_allocated(device)
     vram_reserved = torch.cuda.memory_reserved(device)
@@ -606,19 +684,6 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
         tracer.stage_complete(
             job.job_id, model_name, stage.type.value,
             _stage_w, _stage_h, _stage_steps, stage_duration)
-
-    # Release active fingerprints added by _ensure_models_for_stage (line 676-678)
-    # and _load_sdxl_components (te_protect_fps only).
-    release_fps: set[str] = set()
-    release_fps.update(c.fingerprint for c in stage.required_components)
-    release_fps.update(getattr(stage, '_trt_active_fps', set()))
-    if release_fps:
-        gpu.remove_active_fingerprints(release_fps)
-    te_protect = getattr(stage, '_te_protect_fps', set())
-    if te_protect:
-        gpu.remove_active_fingerprints(te_protect)
-
-    gpu.release()
 
     # Handle intermediate image for multi-stage pipelines
     if output_image is not None and not oom and error is None:
