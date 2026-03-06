@@ -2515,6 +2515,11 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
         converted_sd = raw_sd
         network_alphas = None
 
+    # Repair accelerate leak BEFORE injection — if the leak is active, PEFT
+    # creates LoRA parameters on meta device, and load_state_dict's copy_()
+    # into meta tensors is a silent no-op (weights are lost, not loaded).
+    repair_accelerate_leak()
+
     # Use diffusers' built-in UNet LoRA loading (handles diffusers→PEFT conversion,
     # LoraConfig creation, adapter injection, and weight loading)
     unet.load_lora_adapter(
@@ -2524,14 +2529,13 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
         network_alphas=network_alphas,
     )
 
-    # Defense-in-depth: PEFT injects new LoRA modules into the UNet.  If a
-    # concurrent from_pretrained() on another GPU worker has accelerate's
-    # register_parameter patch active, those LoRA modules get meta parameters.
-    # Repair any leak and fix any meta tensors that slipped through.
+    # Post-injection check: if a concurrent thread re-activated the leak
+    # during injection, LoRA weights are silently corrupted (zeroed).
     repair_accelerate_leak()
     n = fix_meta_tensors(unet)
     if n:
-        log.warning(f"  LoRA: Fixed {n} meta tensor(s) in UNet after adapter injection")
+        log.error(f"  LoRA: {n} meta tensor(s) in UNet after '{adapter_name}' injection — "
+                  f"LoRA weights are CORRUPTED (zeroed). Accelerate leak race condition.")
 
     # Track loaded adapter on the GPU
     if hasattr(gpu, '_loaded_lora_adapters'):
@@ -2663,6 +2667,10 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
 
             t0 = time.monotonic()
 
+            # Repair accelerate leak BEFORE injection — if active, PEFT creates
+            # LoRA params on meta device and load_state_dict copy_() is a no-op.
+            repair_accelerate_leak()
+
             if has_te1 and not te1_loaded:
                 _load_lora_into_text_encoder(
                     converted_sd, network_alphas, te1,
@@ -2673,7 +2681,8 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
                 repair_accelerate_leak()
                 n = fix_meta_tensors(te1)
                 if n:
-                    log.warning(f"  LoRA: Fixed {n} meta tensor(s) in TE1 after adapter injection")
+                    log.error(f"  LoRA: {n} meta tensor(s) in TE1 after '{adapter_name}' injection — "
+                              f"LoRA weights are CORRUPTED (zeroed). Accelerate leak race condition.")
 
             if has_te2 and not te2_loaded:
                 _load_lora_into_text_encoder(
@@ -2685,7 +2694,8 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
                 repair_accelerate_leak()
                 n = fix_meta_tensors(te2)
                 if n:
-                    log.warning(f"  LoRA: Fixed {n} meta tensor(s) in TE2 after adapter injection")
+                    log.error(f"  LoRA: {n} meta tensor(s) in TE2 after '{adapter_name}' injection — "
+                              f"LoRA weights are CORRUPTED (zeroed). Accelerate leak race condition.")
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             te_parts = []
