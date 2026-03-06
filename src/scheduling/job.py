@@ -205,6 +205,9 @@ class InferenceJob:
         self.oom_retries: int = 0
         self.oom_gpu_ids: set[str] = set()  # GPUs that OOM'd this job
 
+        # GPU affinity — which GPU last ran a stage for this job
+        self.last_gpu_uuid: str | None = None
+
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
         self.unet_tile_width: int = 0   # UNet / MultiDiffusion tile width (pixels)
         self.unet_tile_height: int = 0  # UNet / MultiDiffusion tile height (pixels)

@@ -298,6 +298,14 @@ class GpuScheduler:
                 score += 100       # prefer "ready now" over "ready in 0.01s"
             elif loaded_count > 0:
                 score += 50        # partial cache saves some load time
+
+        # Same-GPU affinity: prefer the GPU that ran the previous stage for
+        # this job.  The previous stage's models + TRT engines are likely still
+        # cached, and the CUDA allocator has warm memory pools.  This avoids
+        # unnecessary cross-GPU latent transfers and model reloading.
+        if budget_job is not None and budget_job.last_gpu_uuid == worker.gpu.uuid:
+            score += 75  # significant but not overwhelming — a better GPU can still win
+
         if is_idle:
             score += 20            # slight preference for idle GPUs at equal time
 

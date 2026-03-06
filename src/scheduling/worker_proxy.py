@@ -902,6 +902,9 @@ class GpuWorkerProxy:
                         f"Job {msg.job_id} has no current stage")
             return
 
+        # Track GPU affinity for same-GPU scheduling preference
+        job.last_gpu_uuid = self._gpu_proxy.uuid
+
         # Update job timing
         job.model_load_time_s += msg.model_load_time_s
         job.gpu_time_s += msg.gpu_time_s
