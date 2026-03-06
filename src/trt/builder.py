@@ -600,25 +600,49 @@ def discover_dynamic_engines(
     if not os.path.isdir(comp_dir):
         return []
 
+    # Build a lookup of known profiles by label for backfilling missing sidecars
+    _known_profiles = {p["label"]: p for p in DYNAMIC_PROFILES}
+
     results = []
     for name in os.listdir(comp_dir):
-        if not name.endswith(".json"):
+        if not name.endswith(".engine"):
             continue
-        json_path = os.path.join(comp_dir, name)
-        engine_path = os.path.join(comp_dir, name.replace(".json", ".engine"))
-        if not os.path.isfile(engine_path):
+        # Skip static engines (e.g. "640x768.engine")
+        label = name[:-7]  # strip .engine
+        if "x" in label and label.replace("x", "").isdigit():
             continue
+
+        engine_path = os.path.join(comp_dir, name)
+        json_path = os.path.join(comp_dir, label + ".json")
+
+        # Try to read existing sidecar
+        data = None
+        if os.path.isfile(json_path):
+            try:
+                with open(json_path) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        # Backfill sidecar from known profiles if missing
+        if data is None and label in _known_profiles:
+            prof = _known_profiles[label]
+            data = {"min_res": list(prof["min"]), "opt_res": list(prof["opt"]), "max_res": list(prof["max"])}
+            _write_dynamic_sidecar(engine_path, prof["min"], prof["opt"], prof["max"])
+            log.debug(f"  TRT: Backfilled sidecar for {label} engine")
+
+        if data is None:
+            continue
+
         try:
-            with open(json_path) as f:
-                data = json.load(f)
             results.append({
                 "path": engine_path,
-                "label": name[:-5],  # strip .json
+                "label": label,
                 "min_res": tuple(data["min_res"]),
                 "opt_res": tuple(data["opt_res"]),
                 "max_res": tuple(data["max_res"]),
             })
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (KeyError, TypeError):
             continue
 
     # Sort by range area — tightest fit first
