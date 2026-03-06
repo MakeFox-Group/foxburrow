@@ -1,8 +1,12 @@
 """TensorRT engine building from ONNX models.
 
-Builds two engine types per model × component × GPU architecture:
-  1. Static engine for 640×768 (80% of traffic, maximum kernel optimization)
-  2. Dynamic engine covering 512×512 → 2048×2048 (optimized at 1024×1024)
+Builds static + dynamic engines per model × component × GPU architecture:
+  - Static engines for high-traffic resolutions (exact match, max perf)
+  - Dynamic engines covering resolution ranges (fallback for arbitrary sizes)
+
+Each dynamic engine writes a JSON sidecar ({label}.json) describing its
+min/opt/max resolution range.  The runtime discovers available engines
+by scanning these sidecars and picks the tightest-fitting one.
 
 Uses maximum available workspace: GPU is drained (no inference) during
 builds, so nearly all VRAM is available.  _get_workspace_gb() reserves
@@ -12,6 +16,7 @@ _BUILD_HEADROOM_GB (1 GB) for the CUDA context and TRT internals.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import time as _time
 from typing import Callable
@@ -75,8 +80,23 @@ VAE_STATIC_RESOLUTIONS: list[tuple[int, int]] = [
     (1280, 1280),
 ]
 
-# Dynamic engine covering base resolutions (shared by UNet and VAE).
-DYNAMIC_STANDARD = {"min": (512, 512), "opt": (768, 768), "max": (1024, 1024), "label": "dynamic-standard"}
+# Dynamic engine profiles.  Each covers a resolution range; the runtime
+# picks the tightest-fitting dynamic engine when no static match exists.
+# UNet gets all three ranges; VAE only gets standard (hires VAE uses tiled decode).
+DYNAMIC_PROFILES: list[dict] = [
+    {"min": (512, 512), "opt": (768, 768), "max": (1024, 1024), "label": "dynamic-standard"},
+    {"min": (1024, 1024), "opt": (1280, 1280), "max": (1536, 1536), "label": "dynamic-hires"},
+    {"min": (1536, 1536), "opt": (1792, 1792), "max": (2048, 2048), "label": "dynamic-hires-xl"},
+]
+
+# Which dynamic profiles to build per component type.
+_COMPONENT_DYNAMIC_PROFILES: dict[str, list[dict]] = {
+    "unet": DYNAMIC_PROFILES,
+    "vae": [DYNAMIC_PROFILES[0]],  # VAE: standard only (hires uses tiled decode)
+}
+
+# Backward compat alias
+DYNAMIC_STANDARD = DYNAMIC_PROFILES[0]
 
 # Headroom reserved during TRT builds (GB).  The GPU is drained (no inference)
 # during builds, so we only need room for the CUDA context and TRT internals.
@@ -434,8 +454,11 @@ def build_dynamic_engine(
         config.add_optimization_profile(profile)
 
         label = f"dynamic {min_res[0]}x{min_res[1]}→{max_res[0]}x{max_res[1]}"
-        return _do_build(builder, network, config, engine_path, component_type,
-                         label, device_id, max_workspace_gb)
+        ok = _do_build(builder, network, config, engine_path, component_type,
+                       label, device_id, max_workspace_gb)
+        if ok:
+            _write_dynamic_sidecar(engine_path, min_res, opt_res, max_res)
+        return ok
     finally:
         del parser, network, builder
         if config is not None:
@@ -544,6 +567,91 @@ def get_onnx_path(cache_dir: str, model_hash: str, component_type: str) -> str:
     )
 
 
+def _write_dynamic_sidecar(
+    engine_path: str,
+    min_res: tuple[int, int],
+    opt_res: tuple[int, int],
+    max_res: tuple[int, int],
+) -> None:
+    """Write a JSON sidecar alongside a dynamic engine describing its profile."""
+    sidecar_path = engine_path.replace(".engine", ".json")
+    data = {
+        "min_res": list(min_res),
+        "opt_res": list(opt_res),
+        "max_res": list(max_res),
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def discover_dynamic_engines(
+    cache_dir: str,
+    model_hash: str,
+    component_type: str,
+    arch_key: str,
+) -> list[dict]:
+    """Discover all dynamic engines for a component by scanning JSON sidecars.
+
+    Returns a list of dicts with keys: path, label, min_res, opt_res, max_res.
+    Sorted by range area (tightest first) for best-fit selection.
+    """
+    short_hash = model_hash[:16]
+    comp_dir = os.path.join(cache_dir, short_hash, arch_key, component_type)
+    if not os.path.isdir(comp_dir):
+        return []
+
+    results = []
+    for name in os.listdir(comp_dir):
+        if not name.endswith(".json"):
+            continue
+        json_path = os.path.join(comp_dir, name)
+        engine_path = os.path.join(comp_dir, name.replace(".json", ".engine"))
+        if not os.path.isfile(engine_path):
+            continue
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+            results.append({
+                "path": engine_path,
+                "label": name[:-5],  # strip .json
+                "min_res": tuple(data["min_res"]),
+                "opt_res": tuple(data["opt_res"]),
+                "max_res": tuple(data["max_res"]),
+            })
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+    # Sort by range area — tightest fit first
+    def _range_area(d):
+        w_range = d["max_res"][0] - d["min_res"][0]
+        h_range = d["max_res"][1] - d["min_res"][1]
+        return w_range * h_range
+
+    results.sort(key=_range_area)
+    return results
+
+
+def find_best_dynamic_engine(
+    cache_dir: str,
+    model_hash: str,
+    component_type: str,
+    arch_key: str,
+    width: int,
+    height: int,
+) -> dict | None:
+    """Find the best-fitting dynamic engine for a given resolution.
+
+    Returns the tightest dynamic profile whose range covers (width, height),
+    or None if no dynamic engine covers it.
+    """
+    for eng in discover_dynamic_engines(cache_dir, model_hash, component_type, arch_key):
+        min_w, min_h = eng["min_res"]
+        max_w, max_h = eng["max_res"]
+        if min_w <= width <= max_w and min_h <= height <= max_h:
+            return eng
+    return None
+
+
 def _get_static_resolutions(component_type: str) -> list[tuple[int, int]]:
     """Return the static resolution list for a component type."""
     if component_type == "vae":
@@ -574,13 +682,8 @@ def has_trt_coverage(
     # Static exact match
     if os.path.isfile(get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)):
         return True
-    # Dynamic range check
-    dyn = DYNAMIC_STANDARD
-    dmin, dmax = dyn["min"], dyn["max"]
-    if dmin[0] <= width <= dmax[0] and dmin[1] <= height <= dmax[1]:
-        if os.path.isfile(get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, dyn["label"])):
-            return True
-    return False
+    # Dynamic range check — discover all available dynamic engines
+    return find_best_dynamic_engine(cache_dir, model_hash, component_type, arch_key, width, height) is not None
 
 
 def all_engines_exist(
@@ -599,9 +702,10 @@ def all_engines_exist(
         path = get_engine_path(cache_dir, model_hash, component_type, arch_key, w, h)
         if not os.path.isfile(path):
             return False
-    path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, DYNAMIC_STANDARD["label"])
-    if not os.path.isfile(path):
-        return False
+    for profile in _COMPONENT_DYNAMIC_PROFILES.get(component_type, [DYNAMIC_STANDARD]):
+        path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, profile["label"])
+        if not os.path.isfile(path):
+            return False
     return True
 
 
@@ -618,7 +722,8 @@ def build_all_engines(
     For each component (unet, vae), builds:
       - One static engine per configured resolution
         (UNet: UNET_STATIC_RESOLUTIONS, VAE: VAE_STATIC_RESOLUTIONS)
-      - One dynamic-standard engine (512×512 → 1024×1024, opt 768×768)
+      - Dynamic engines per _COMPONENT_DYNAMIC_PROFILES (UNet gets all three
+        ranges: standard/hires/hires-xl; VAE gets standard only)
 
     Args:
         model_hash: Content fingerprint of the model (from registry).
@@ -695,27 +800,27 @@ def build_all_engines(
                     if ok:
                         results[component_type].append(f"static-{sw}x{sh}")
 
-            # Dynamic engine (standard range only)
-            dyn = DYNAMIC_STANDARD
-            label = dyn["label"]
-            dyn_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, label)
-            if os.path.isfile(dyn_path):
-                log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type} {label}")
-                results[component_type].append(label)
-            else:
-                if progress_cb:
-                    progress_cb(component_type, label)
-                ok = build_dynamic_engine(
-                    onnx_path=onnx_path,
-                    engine_path=dyn_path,
-                    component_type=component_type,
-                    device_id=device_id,
-                    min_res=dyn["min"],
-                    opt_res=dyn["opt"],
-                    max_res=dyn["max"],
-                    max_workspace_gb=max_workspace_gb,
-                )
-                if ok:
+            # Dynamic engines — build all profiles configured for this component
+            for dyn in _COMPONENT_DYNAMIC_PROFILES.get(component_type, [DYNAMIC_STANDARD]):
+                label = dyn["label"]
+                dyn_path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, label)
+                if os.path.isfile(dyn_path):
+                    log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type} {label}")
                     results[component_type].append(label)
+                else:
+                    if progress_cb:
+                        progress_cb(component_type, label)
+                    ok = build_dynamic_engine(
+                        onnx_path=onnx_path,
+                        engine_path=dyn_path,
+                        component_type=component_type,
+                        device_id=device_id,
+                        min_res=dyn["min"],
+                        opt_res=dyn["opt"],
+                        max_res=dyn["max"],
+                        max_workspace_gb=max_workspace_gb,
+                    )
+                    if ok:
+                        results[component_type].append(label)
 
     return results
