@@ -608,7 +608,11 @@ class GpuInstance:
 
         for comp_type in pool_types:
             required_cat = comp_to_cat.get(comp_type)
-            if required_cat and required_cat not in cached_cats:
+            if required_cat is None:
+                log.warning(f"  GPU [{self.uuid}]: Unknown TRT pool key '{comp_type}' "
+                            f"— cannot determine orphan status, skipping")
+                continue
+            if required_cat not in cached_cats:
                 freed = self.release_trt_shared_memory(comp_type)
                 if freed > 0:
                     freed_any = True
@@ -688,6 +692,12 @@ class GpuInstance:
         Must be called AFTER the model has been removed from _cache.
         Maps TRT cache categories (e.g. 'sdxl_unet_trt') to shared memory
         component types ('unet', 'vae', 'te1', 'te2').
+
+        Thread safety: the check-then-act gap between the cache scan and
+        release_trt_shared_memory is safe because this is called from
+        evict_lru, which is called from ensure_free_vram, which is always
+        called under gpu.model_load_lock.  No concurrent thread can load
+        a new runner between the scan and the release.
         """
         if not evicted_category.endswith("_trt"):
             return
