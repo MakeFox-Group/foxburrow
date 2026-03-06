@@ -2690,6 +2690,7 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
             trt_fp = f"{fp}:unet_trt:{width}x{height}"
             cached = gpu.get_cached_model(trt_fp)
             if cached is not None:
+                log.debug(f"  TRT: Using cached UNet static runner {width}x{height}")
                 return cached.model
             try:
                 engine_size = os.path.getsize(static_path)
@@ -2768,6 +2769,7 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
             trt_fp = f"{fp}:vae_trt:{width}x{height}"
             cached = gpu.get_cached_model(trt_fp)
             if cached is not None:
+                log.debug(f"  TRT: Using cached VAE static runner {width}x{height}")
                 return cached.model
             try:
                 engine_size = os.path.getsize(static_path)

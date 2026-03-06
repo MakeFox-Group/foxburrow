@@ -468,9 +468,13 @@ class GpuWorkerProxy:
     def check_vram_budget(self, stage: WorkStage, job: InferenceJob) -> bool:
         """Check if this GPU has enough VRAM for a new stage.
 
-        Uses cached VRAM stats from the worker's StatusSnapshot and real
-        measured model sizes where available.  Even idle GPUs are checked
-        to avoid dispatching work that exceeds total GPU capacity.
+        When idle, checks against total GPU memory (the worker's loader
+        will evict models as needed).  Only rejects if the job fundamentally
+        exceeds the GPU's capacity.
+
+        When busy, uses cached VRAM stats from the worker's StatusSnapshot
+        and real measured model sizes to check if there's room alongside
+        the currently active workload.
         """
         status = self._gpu_proxy._status
         if status is None:
@@ -493,7 +497,19 @@ class GpuWorkerProxy:
         working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
         total_needed = model_cost + working_cost
 
-        # Available: NVML free + allocator slack + evictable
+        # Idle GPU: check against total memory, not current free.
+        # The worker's model loader handles eviction, so current free memory
+        # is irrelevant — only reject if the job can never fit on this GPU.
+        # This avoids deadlock on fresh startup when conservative fallback
+        # estimates + unloaded model costs exceed current free memory.
+        if self._active_count == 0:
+            vram = status.vram_stats
+            total_memory = vram.get("total", 0)
+            if total_memory > 0 and total_needed > total_memory:
+                return False
+            return True
+
+        # Busy GPU: check against currently available VRAM
         vram = status.vram_stats
         nvml_free = vram.get("free", 0)
         pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
