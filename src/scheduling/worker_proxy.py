@@ -237,10 +237,14 @@ class GpuProxy:
         if not cached_trt:
             return 0
 
-        # Check for exact static match
-        static_key = f"{width}x{height}"
-        if static_key in cached_trt:
-            return 2
+        from state import app_state
+        dynamic_only = app_state.config.tensorrt.dynamic_only
+
+        # Check for exact static match (skip if dynamic_only)
+        if not dynamic_only:
+            static_key = f"{width}x{height}"
+            if static_key in cached_trt:
+                return 2
 
         # Check dynamic engines
         from trt.builder import DYNAMIC_PROFILES
@@ -688,7 +692,8 @@ class GpuWorkerProxy:
 
     async def trt_build(self, model_hash: str, model_dir: str,
                         cache_dir: str, arch_key: str,
-                        max_workspace_gb: float = 0) -> TrtBuildResult:
+                        max_workspace_gb: float = 0,
+                        dynamic_only: bool = False) -> TrtBuildResult:
         """Send a TRT build command and wait for the result."""
         self._trt_build_future = self._loop.create_future()
         self._cmd_queue.put(TrtBuildCmd(
@@ -697,6 +702,7 @@ class GpuWorkerProxy:
             cache_dir=cache_dir,
             arch_key=arch_key,
             max_workspace_gb=max_workspace_gb,
+            dynamic_only=dynamic_only,
         ))
         return await self._trt_build_future
 

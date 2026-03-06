@@ -247,7 +247,8 @@ class TrtBuildManager:
             for arch_key in arch_keys:
                 for component_type in ("te1", "te2", "unet", "vae"):
                     if not all_engines_exist(self._cache_dir, model_hash,
-                                             component_type, arch_key):
+                                             component_type, arch_key,
+                                             dynamic_only=self._trt_config.dynamic_only):
                         all_exist = False
                         break
                 if not all_exist:
@@ -348,7 +349,8 @@ class TrtBuildManager:
                 if not os.path.isfile(onnx):
                     continue
                 if not all_engines_exist(self._cache_dir, request.model_hash,
-                                         component_type, arch_key):
+                                         component_type, arch_key,
+                                         dynamic_only=self._trt_config.dynamic_only):
                     needs_build = True
                     break
 
@@ -519,6 +521,7 @@ class TrtBuildManager:
                         cache_dir=self._cache_dir,
                         arch_key=arch_key,
                         max_workspace_gb=self._get_workspace_gb(arch_key),
+                        dynamic_only=self._trt_config.dynamic_only,
                     )
                     if trt_result.success:
                         results = trt_result.results

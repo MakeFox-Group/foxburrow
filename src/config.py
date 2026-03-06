@@ -38,6 +38,7 @@ class SchedulerConfig:
 class TensorrtConfig:
     enabled: bool = True                  # Master switch — false = pure PyTorch
     auto_build: bool = True               # false = use existing engines, skip builds
+    dynamic_only: bool = True             # true = skip static engines, only use dynamic
     workspace_gb: float = 7.0             # Default workspace cap (GB)
     workspace_gb_per_arch: dict[str, float] = field(default_factory=dict)
 
@@ -105,6 +106,7 @@ class FoxBurrowConfig:
             t = parser["tensorrt"]
             trt.enabled = t.getboolean("enabled", trt.enabled)
             trt.auto_build = t.getboolean("auto_build", trt.auto_build)
+            trt.dynamic_only = t.getboolean("dynamic_only", trt.dynamic_only)
             trt.workspace_gb = t.getfloat("workspace_gb", trt.workspace_gb)
             # Per-architecture overrides: workspace_gb.sm_89 = 7
             for key, val in t.items():

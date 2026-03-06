@@ -699,6 +699,7 @@ def has_trt_coverage(
     arch_key: str,
     width: int,
     height: int,
+    dynamic_only: bool = False,
 ) -> bool:
     """Check if a TRT engine can handle the given resolution.
 
@@ -706,15 +707,18 @@ def has_trt_coverage(
     a dynamic engine exists whose range covers the resolution.
     For text encoders (te1/te2), resolution is irrelevant — just check
     if the single "default" engine exists.
+
+    If *dynamic_only* is True, static engines are ignored.
     """
     # Text encoders: no spatial dimensions, single engine per component
     if component_type in ("te1", "te2"):
         return os.path.isfile(
             get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, "default"))
 
-    # Static exact match
-    if os.path.isfile(get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)):
-        return True
+    # Static exact match (skip if dynamic_only)
+    if not dynamic_only:
+        if os.path.isfile(get_engine_path(cache_dir, model_hash, component_type, arch_key, width, height)):
+            return True
     # Dynamic range check — discover all available dynamic engines
     return find_best_dynamic_engine(cache_dir, model_hash, component_type, arch_key, width, height) is not None
 
@@ -724,17 +728,22 @@ def all_engines_exist(
     model_hash: str,
     component_type: str,
     arch_key: str,
+    dynamic_only: bool = False,
 ) -> bool:
-    """Check if all required engines (static + dynamic) exist for a component."""
+    """Check if all required engines (static + dynamic) exist for a component.
+
+    If *dynamic_only* is True, static engines are not required.
+    """
     # Text encoders: single "default" engine per component
     if component_type in ("te1", "te2"):
         return os.path.isfile(
             get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, "default"))
 
-    for w, h in _get_static_resolutions(component_type):
-        path = get_engine_path(cache_dir, model_hash, component_type, arch_key, w, h)
-        if not os.path.isfile(path):
-            return False
+    if not dynamic_only:
+        for w, h in _get_static_resolutions(component_type):
+            path = get_engine_path(cache_dir, model_hash, component_type, arch_key, w, h)
+            if not os.path.isfile(path):
+                return False
     for profile in _COMPONENT_DYNAMIC_PROFILES.get(component_type, [DYNAMIC_STANDARD]):
         path = get_dynamic_engine_path(cache_dir, model_hash, component_type, arch_key, profile["label"])
         if not os.path.isfile(path):
@@ -749,11 +758,12 @@ def build_all_engines(
     device_id: int,
     max_workspace_gb: float = 0,
     progress_cb: Callable[[str, str], None] | None = None,
+    dynamic_only: bool = False,
 ) -> dict[str, list[str]]:
     """Build all missing TRT engines for a model on a specific GPU architecture.
 
     For each component (unet, vae), builds:
-      - One static engine per configured resolution
+      - One static engine per configured resolution (unless *dynamic_only*)
         (UNet: UNET_STATIC_RESOLUTIONS, VAE: VAE_STATIC_RESOLUTIONS)
       - Dynamic engines per _COMPONENT_DYNAMIC_PROFILES (UNet gets all three
         ranges: standard/hires/hires-xl; VAE gets standard only)
@@ -765,6 +775,7 @@ def build_all_engines(
         device_id: CUDA device index to build on.
         progress_cb: Optional callback(component_type, engine_label) called
             before each engine build starts, for TUI progress display.
+        dynamic_only: If True, skip building static engines.
 
     Returns:
         Dict mapping component_type -> list of successfully built engine labels.
@@ -812,26 +823,27 @@ def build_all_engines(
                         results[component_type].append("default")
                 continue
 
-            # Static engines for all configured resolutions
-            for sw, sh in _get_static_resolutions(component_type):
-                static_path = get_engine_path(cache_dir, model_hash, component_type, arch_key, sw, sh)
-                if os.path.isfile(static_path):
-                    log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
-                    results[component_type].append(f"static-{sw}x{sh}")
-                else:
-                    if progress_cb:
-                        progress_cb(component_type, f"static-{sw}x{sh}")
-                    ok = build_static_engine(
-                        onnx_path=onnx_path,
-                        engine_path=static_path,
-                        component_type=component_type,
-                        width=sw,
-                        height=sh,
-                        device_id=device_id,
-                        max_workspace_gb=max_workspace_gb,
-                    )
-                    if ok:
+            # Static engines for all configured resolutions (skip if dynamic_only)
+            if not dynamic_only:
+                for sw, sh in _get_static_resolutions(component_type):
+                    static_path = get_engine_path(cache_dir, model_hash, component_type, arch_key, sw, sh)
+                    if os.path.isfile(static_path):
+                        log.debug(f"  TRT: Static engine exists, skipping: {component_type} {sw}x{sh}")
                         results[component_type].append(f"static-{sw}x{sh}")
+                    else:
+                        if progress_cb:
+                            progress_cb(component_type, f"static-{sw}x{sh}")
+                        ok = build_static_engine(
+                            onnx_path=onnx_path,
+                            engine_path=static_path,
+                            component_type=component_type,
+                            width=sw,
+                            height=sh,
+                            device_id=device_id,
+                            max_workspace_gb=max_workspace_gb,
+                        )
+                        if ok:
+                            results[component_type].append(f"static-{sw}x{sh}")
 
             # Dynamic engines — build all profiles configured for this component
             for dyn in _COMPONENT_DYNAMIC_PROFILES.get(component_type, [DYNAMIC_STANDARD]):

@@ -829,14 +829,17 @@ def _trt_covers_component(gpu, stage, job, component) -> bool:
     else:
         return False
 
+    from state import app_state
+    dynamic_only = app_state.config.tensorrt.dynamic_only
+
     if trt_component in ("te1", "te2"):
         try:
             from trt.builder import has_trt_coverage, get_arch_key
-            from state import app_state
             cache_dir = app_state.config.server.tensorrt_cache
             arch_key = get_arch_key(0)
             return has_trt_coverage(
-                cache_dir, component.fingerprint, trt_component, arch_key, 0, 0)
+                cache_dir, component.fingerprint, trt_component, arch_key, 0, 0,
+                dynamic_only=dynamic_only)
         except Exception:
             return False
 
@@ -857,11 +860,11 @@ def _trt_covers_component(gpu, stage, job, component) -> bool:
 
     try:
         from trt.builder import has_trt_coverage, get_arch_key
-        from state import app_state
         cache_dir = app_state.config.server.tensorrt_cache
         arch_key = get_arch_key(0)
         return has_trt_coverage(
-            cache_dir, component.fingerprint, trt_component, arch_key, width, height)
+            cache_dir, component.fingerprint, trt_component, arch_key, width, height,
+            dynamic_only=dynamic_only)
     except Exception:
         return False
 
@@ -1127,7 +1130,8 @@ def _handle_trt_build(cmd: TrtBuildCmd, result_queue) -> TrtBuildResult:
         results = build_all_engines(
             cmd.model_hash, cmd.cache_dir, cmd.arch_key, device_id=0,
             max_workspace_gb=cmd.max_workspace_gb,
-            progress_cb=_progress)
+            progress_cb=_progress,
+            dynamic_only=cmd.dynamic_only)
         return TrtBuildResult(success=True, results=results)
     except Exception as ex:
         log.log_exception(ex, f"TRT build failed for {cmd.model_hash[:16]}")

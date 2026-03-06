@@ -2338,29 +2338,31 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
 
     from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
+    dynamic_only = app_state.config.tensorrt.dynamic_only
 
-    # 1. Try static engine for exact resolution match
-    static_path = get_engine_path(cache_dir, fp, "unet", arch_key, width, height)
-    if os.path.isfile(static_path):
-        trt_fp = f"{fp}:unet_trt:{width}x{height}"
-        cached = gpu.get_cached_model(trt_fp)
-        if cached is not None:
-            return cached.model
-        try:
-            engine_size = os.path.getsize(static_path)
-            gpu.ensure_free_vram(engine_size, protect={trt_fp})
-            unet_getter = lambda min_bytes: gpu.get_trt_shared_memory("unet", min_bytes)
-            runner = TrtUNetRunner(static_path, gpu.device, shared_memory_getter=unet_getter)
-            gpu.cache_model(
-                trt_fp, "sdxl_unet_trt", runner,
-                estimated_vram=runner.vram_usage,
-                source=f"TRT-UNet-static-{width}x{height}",
-                evict_callback=runner.unload,
-            )
-            log.debug(f"  TRT: Loaded UNet static runner {width}x{height} on GPU [{gpu.uuid}]")
-            return runner
-        except Exception as ex:
-            log.warning(f"  TRT: Failed to load UNet static engine {width}x{height}: {ex}")
+    # 1. Try static engine for exact resolution match (skip if dynamic_only)
+    if not dynamic_only:
+        static_path = get_engine_path(cache_dir, fp, "unet", arch_key, width, height)
+        if os.path.isfile(static_path):
+            trt_fp = f"{fp}:unet_trt:{width}x{height}"
+            cached = gpu.get_cached_model(trt_fp)
+            if cached is not None:
+                return cached.model
+            try:
+                engine_size = os.path.getsize(static_path)
+                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                unet_getter = lambda min_bytes: gpu.get_trt_shared_memory("unet", min_bytes)
+                runner = TrtUNetRunner(static_path, gpu.device, shared_memory_getter=unet_getter)
+                gpu.cache_model(
+                    trt_fp, "sdxl_unet_trt", runner,
+                    estimated_vram=runner.vram_usage,
+                    source=f"TRT-UNet-static-{width}x{height}",
+                    evict_callback=runner.unload,
+                )
+                log.debug(f"  TRT: Loaded UNet static runner {width}x{height} on GPU [{gpu.uuid}]")
+                return runner
+            except Exception as ex:
+                log.warning(f"  TRT: Failed to load UNet static engine {width}x{height}: {ex}")
 
     # 2. Fall back to best-fitting dynamic engine (discovered via JSON sidecars)
     from trt.builder import find_best_dynamic_engine
@@ -2410,29 +2412,31 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
 
     from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
+    dynamic_only = app_state.config.tensorrt.dynamic_only
 
-    # 1. Try static engine for exact resolution match
-    static_path = get_engine_path(cache_dir, fp, "vae", arch_key, width, height)
-    if os.path.isfile(static_path):
-        trt_fp = f"{fp}:vae_trt:{width}x{height}"
-        cached = gpu.get_cached_model(trt_fp)
-        if cached is not None:
-            return cached.model
-        try:
-            engine_size = os.path.getsize(static_path)
-            gpu.ensure_free_vram(engine_size, protect={trt_fp})
-            vae_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae", min_bytes)
-            runner = TrtVaeRunner(static_path, gpu.device, shared_memory_getter=vae_getter)
-            gpu.cache_model(
-                trt_fp, "sdxl_vae_trt", runner,
-                estimated_vram=runner.vram_usage,
-                source=f"TRT-VAE-static-{width}x{height}",
-                evict_callback=runner.unload,
-            )
-            log.debug(f"  TRT: Loaded VAE static runner {width}x{height} on GPU [{gpu.uuid}]")
-            return runner
-        except Exception as ex:
-            log.warning(f"  TRT: Failed to load VAE static engine {width}x{height}: {ex}")
+    # 1. Try static engine for exact resolution match (skip if dynamic_only)
+    if not dynamic_only:
+        static_path = get_engine_path(cache_dir, fp, "vae", arch_key, width, height)
+        if os.path.isfile(static_path):
+            trt_fp = f"{fp}:vae_trt:{width}x{height}"
+            cached = gpu.get_cached_model(trt_fp)
+            if cached is not None:
+                return cached.model
+            try:
+                engine_size = os.path.getsize(static_path)
+                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                vae_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae", min_bytes)
+                runner = TrtVaeRunner(static_path, gpu.device, shared_memory_getter=vae_getter)
+                gpu.cache_model(
+                    trt_fp, "sdxl_vae_trt", runner,
+                    estimated_vram=runner.vram_usage,
+                    source=f"TRT-VAE-static-{width}x{height}",
+                    evict_callback=runner.unload,
+                )
+                log.debug(f"  TRT: Loaded VAE static runner {width}x{height} on GPU [{gpu.uuid}]")
+                return runner
+            except Exception as ex:
+                log.warning(f"  TRT: Failed to load VAE static engine {width}x{height}: {ex}")
 
     # 2. Fall back to best-fitting dynamic engine (discovered via JSON sidecars)
     from trt.builder import find_best_dynamic_engine
