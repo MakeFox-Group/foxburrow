@@ -564,13 +564,16 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
             job.job_id, model_name, stage.type.value,
             _stage_w, _stage_h, _stage_steps, stage_duration)
 
-    # Release active fingerprints — all protection sets added during loading
+    # Release active fingerprints added by _ensure_models_for_stage (line 676-678)
+    # and _load_sdxl_components (te_protect_fps only).
     release_fps: set[str] = set()
     release_fps.update(c.fingerprint for c in stage.required_components)
     release_fps.update(getattr(stage, '_trt_active_fps', set()))
-    release_fps.update(getattr(stage, '_load_protect_fps', set()))
     if release_fps:
         gpu.remove_active_fingerprints(release_fps)
+    te_protect = getattr(stage, '_te_protect_fps', set())
+    if te_protect:
+        gpu.remove_active_fingerprints(te_protect)
 
     gpu.release()
 
@@ -696,11 +699,11 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
 
     trt_fps: set[str] = set()
 
-    # Protect ALL required component fingerprints from eviction during the
-    # entire loading phase.  This prevents TRT engine loading (which calls
-    # ensure_free_vram internally) from evicting models loaded earlier in
-    # this same stage — e.g., loading a TRT UNet engine must not evict
-    # the TE1/TE2 that were just loaded for the same pipeline.
+    # Build a protect set for ensure_free_vram() calls during loading.
+    # This prevents eviction of models needed by THIS stage while loading
+    # other models. The protect= parameter does NOT increment ref-counts —
+    # ref-counts are managed solely by _ensure_models_for_stage() after
+    # loading completes (lines 676-678).
     all_required_fps = {c.fingerprint for c in stage.required_components}
 
     # Also protect TE TRT engines from eviction during non-TE stages
@@ -714,11 +717,16 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
                 if gpu.is_component_loaded(te_fp):
                     te_protect_fps.add(te_fp)
 
-    # Add protection for all required components + TE TRT engines
-    protect_fps = all_required_fps | te_protect_fps
-    gpu.add_active_fingerprints(protect_fps)
+    # TE TRT engines need ref-count protection because _ensure_models_for_stage
+    # doesn't know about them (they're not in stage.required_components).
+    if te_protect_fps:
+        gpu.add_active_fingerprints(te_protect_fps)
     stage._te_protect_fps = te_protect_fps
-    stage._load_protect_fps = protect_fps  # Track for cleanup
+
+    # protect_fps is passed to ensure_free_vram(protect=...) during loading.
+    # This does NOT touch ref-counts — it only prevents eviction of these
+    # specific fingerprints during the ensure_free_vram call.
+    protect_fps = all_required_fps | te_protect_fps
 
     device = torch.device("cuda:0")
 
@@ -731,14 +739,14 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
             log.debug(f"  Skipping PyTorch {component.category} — TRT engine available")
             new_trt_fps = _preload_trt_engine(gpu, stage, job, component)
             trt_fps.update(new_trt_fps)
-            # Protect newly loaded TRT engines from eviction by later loads
-            if new_trt_fps:
-                gpu.add_active_fingerprints(new_trt_fps)
-                protect_fps.update(new_trt_fps)
+            # Add to protect set so later ensure_free_vram calls don't evict
+            # newly loaded TRT engines. No add_active_fingerprints here —
+            # ref-counts are managed by _ensure_models_for_stage via _trt_active_fps.
+            protect_fps.update(new_trt_fps)
             continue
 
-        # Ensure VRAM before loading — protect set includes all required
-        # components AND any TRT engines loaded so far in this stage
+        # Ensure VRAM before loading — protect set prevents eviction of
+        # required components and TRT engines loaded earlier in this stage
         gpu.ensure_free_vram(component.estimated_vram_bytes, protect=protect_fps)
 
         # Load the model component

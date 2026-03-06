@@ -715,15 +715,24 @@ class GpuWorkerProxy:
 
     @staticmethod
     def _merge_bpp(bpp_data: dict[str, float]) -> None:
-        """Merge a worker's BPP measurements into the main process's tracking."""
+        """Merge a worker's BPP measurements into the main process's tracking.
+
+        Uses damped-max logic matching the worker's approach: new peaks are
+        tracked immediately, but when a worker reports a significantly lower
+        value than the stored max, the stored value decays toward it.  This
+        prevents permanent inflation from outlier measurements.
+        """
         from scheduling.worker import _measured_bpp, _bpp_lock
         with _bpp_lock:
             for stage_val, bpp in bpp_data.items():
                 try:
                     st = StageType(stage_val)
-                    # Keep the max BPP across all workers (conservative)
-                    if bpp > _measured_bpp.get(st, 0.0):
+                    prev = _measured_bpp.get(st, 0.0)
+                    if bpp >= prev:
                         _measured_bpp[st] = bpp
+                    elif prev > 0 and bpp < prev * 0.5:
+                        # Worker has decayed its measurement — follow it down
+                        _measured_bpp[st] = max(bpp * 1.5, prev * 0.5)
                 except ValueError:
                     pass
 

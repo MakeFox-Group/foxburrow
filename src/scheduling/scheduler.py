@@ -234,15 +234,17 @@ class GpuScheduler:
                         elif aff == -1:
                             trt_affinity_score -= 150   # wrong TRT — will evict
                     elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
-                        aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
-                        if aff >= 1:
-                            trt_covered_fps.add(c.fingerprint)
-                        if aff == 2:
-                            trt_affinity_score += 200
-                        elif aff == 1:
-                            trt_affinity_score += 150
-                        elif aff == -1:
-                            trt_affinity_score -= 150
+                        # TRT VAE is only used during decode, not encode
+                        if stage.type == StageType.GPU_VAE_DECODE:
+                            aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
+                            if aff >= 1:
+                                trt_covered_fps.add(c.fingerprint)
+                            if aff == 2:
+                                trt_affinity_score += 200
+                            elif aff == 1:
+                                trt_affinity_score += 150
+                            elif aff == -1:
+                                trt_affinity_score -= 150
                     elif c.category == "sdxl_te1":
                         te_fp = f"{c.fingerprint}:te1_trt:default"
                         if worker.gpu.is_component_loaded(te_fp):

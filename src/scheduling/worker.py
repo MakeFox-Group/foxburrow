@@ -267,7 +267,6 @@ def _unloaded_model_cost(gpu: GpuProxy, categories: list[str]) -> int:
     for each loaded category, falling back to static estimates.
     """
     from scheduling.model_registry import VramEstimates
-    from scheduling.worker_proxy import _global_measured_vram
 
     _model_vram = {
         "sdxl_unet": VramEstimates.SDXL_UNET,
