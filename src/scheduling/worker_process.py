@@ -859,8 +859,9 @@ def _preload_trt_engine(gpu, stage, job, component) -> set[str]:
         candidates.append(f"{base_fp}:{trt_comp}_trt:default")
     else:
         candidates.append(f"{base_fp}:{trt_comp}_trt:{width}x{height}")
-        from trt.builder import DYNAMIC_STANDARD
-        candidates.append(f"{base_fp}:{trt_comp}_trt:{DYNAMIC_STANDARD['label']}")
+        from trt.builder import DYNAMIC_PROFILES
+        for profile in DYNAMIC_PROFILES:
+            candidates.append(f"{base_fp}:{trt_comp}_trt:{profile['label']}")
 
     loaded = set()
     for c in candidates:

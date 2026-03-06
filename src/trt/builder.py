@@ -574,7 +574,7 @@ def _write_dynamic_sidecar(
     max_res: tuple[int, int],
 ) -> None:
     """Write a JSON sidecar alongside a dynamic engine describing its profile."""
-    sidecar_path = engine_path.replace(".engine", ".json")
+    sidecar_path = os.path.splitext(engine_path)[0] + ".json"
     data = {
         "min_res": list(min_res),
         "opt_res": list(opt_res),
@@ -635,23 +635,32 @@ def discover_dynamic_engines(
             continue
 
         try:
+            min_r = tuple(data["min_res"])
+            opt_r = tuple(data["opt_res"])
+            max_r = tuple(data["max_res"])
+            if len(min_r) != 2 or len(opt_r) != 2 or len(max_r) != 2:
+                continue
             results.append({
                 "path": engine_path,
                 "label": label,
-                "min_res": tuple(data["min_res"]),
-                "opt_res": tuple(data["opt_res"]),
-                "max_res": tuple(data["max_res"]),
+                "min_res": min_r,
+                "opt_res": opt_r,
+                "max_res": max_r,
             })
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, ValueError):
             continue
 
-    # Sort by range area — tightest fit first
-    def _range_area(d):
+    # Sort by range area (tightest first), then by higher min_res as tiebreaker.
+    # At boundary resolutions (e.g. 1024×1024 where standard and hires overlap),
+    # the higher-min engine is preferred since its OPT is closer to the request.
+    def _sort_key(d):
         w_range = d["max_res"][0] - d["min_res"][0]
         h_range = d["max_res"][1] - d["min_res"][1]
-        return w_range * h_range
+        area = w_range * h_range
+        min_sum = d["min_res"][0] + d["min_res"][1]
+        return (area, -min_sum)
 
-    results.sort(key=_range_area)
+    results.sort(key=_sort_key)
     return results
 
 
@@ -831,6 +840,10 @@ def build_all_engines(
                 if os.path.isfile(dyn_path):
                     log.debug(f"  TRT: Dynamic engine exists, skipping: {component_type} {label}")
                     results[component_type].append(label)
+                    # Ensure sidecar exists (backward compat for pre-sidecar engines)
+                    sidecar = os.path.splitext(dyn_path)[0] + ".json"
+                    if not os.path.isfile(sidecar):
+                        _write_dynamic_sidecar(dyn_path, dyn["min"], dyn["opt"], dyn["max"])
                 else:
                     if progress_cb:
                         progress_cb(component_type, label)
