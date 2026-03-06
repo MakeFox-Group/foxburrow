@@ -73,7 +73,6 @@ VAE_STATIC_RESOLUTIONS: list[tuple[int, int]] = [
     (640, 768),
     (1024, 1024),
     (1280, 1280),
-    (1280, 1536),
 ]
 
 # Dynamic engine covering base resolutions (shared by UNet and VAE).
