@@ -18,9 +18,10 @@ Key improvement over the old two-phase batch approach:
 from __future__ import annotations
 
 import asyncio
+import multiprocessing as mp
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import torch
@@ -91,6 +92,15 @@ class TrtBuildManager:
         self._export_pool = ThreadPoolExecutor(
             max_workers=export_threads, thread_name_prefix="trt-export")
         self._export_threads = export_threads
+
+        # Process pool for ONNX external data consolidation.  The onnx
+        # library's load/save is GIL-bound (protobuf serialization of
+        # ~5GB UNet models), so threads serialize on the GIL.  Separate
+        # processes each get their own GIL for true parallel execution.
+        self._consolidation_pool = ProcessPoolExecutor(
+            max_workers=export_threads,
+            mp_context=mp.get_context("spawn"),
+        )
 
         # Layer 1: input queue for models needing export+build
         self._export_queue: asyncio.Queue[_BuildRequest] = asyncio.Queue()
@@ -303,7 +313,7 @@ class TrtBuildManager:
         # already-consolidated files are detected and skipped instantly.
         try:
             await loop.run_in_executor(
-                self._export_pool, consolidate_external_data, unet_onnx, "unet")
+                self._consolidation_pool, consolidate_external_data, unet_onnx, "unet")
         except Exception as ex:
             log.log_exception(ex, f"TRT: UNet ONNX consolidation failed for {short_hash}")
             with self._lock:
