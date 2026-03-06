@@ -1696,6 +1696,8 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     else:
         tile_w, tile_h = img_w, img_h
 
+    if img_w > tile_w or img_h > tile_h:
+        log.debug(f"  SDXL: Tiled VAE encode {img_w}x{img_h} → tile {tile_w}x{tile_h}")
     latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
     job.latents = latents
     log.debug(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
