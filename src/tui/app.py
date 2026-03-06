@@ -236,6 +236,9 @@ class FoxburrowApp(App):
         from utils.lora_index import rescan_loras
         rescan_loras(loras_dir, app_state.lora_index)
 
+        from state import propagate_lora_index
+        propagate_lora_index()
+
     # ── Shutdown ───────────────────────────────────────────────────
 
     def action_request_quit(self) -> None:
