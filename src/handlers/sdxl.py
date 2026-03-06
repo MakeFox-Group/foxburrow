@@ -2106,7 +2106,11 @@ def _vae_encode(image: Image.Image, vae: "AutoencoderKL | None", device: torch.d
 
     img_w, img_h = image.size
 
-    if tile_w > 0 and tile_h > 0:
+    # When trt_runner is provided with tile_w=0/tile_h=0, the caller guarantees
+    # this engine covers the full image — skip auto-tiling entirely.
+    if trt_runner is not None and tile_w == 0 and tile_h == 0:
+        eff_w, eff_h = img_w, img_h
+    elif tile_w > 0 and tile_h > 0:
         eff_w = (tile_w // 8) * 8
         eff_h = (tile_h // 8) * 8
     elif img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
