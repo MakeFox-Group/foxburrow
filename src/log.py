@@ -77,7 +77,8 @@ def clear_tui_callback() -> None:
     global _tui_callback, _suppress_stdout
     with _lock:
         _tui_callback = None
-        _suppress_stdout = False
+        if _remote_callback is None:
+            _suppress_stdout = False
 
 
 def set_remote_callback(callback: Callable[[str, str], None]) -> None:
