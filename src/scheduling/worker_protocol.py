@@ -192,6 +192,15 @@ class StatusSnapshot:
     gpu_model_name: str
     arch_key: str
 
+    # Per-fingerprint measured VRAM (actual bytes for each cached model).
+    # Lets the main process use real model sizes instead of registry estimates.
+    fingerprint_vram: dict[str, int] = field(default_factory=dict)
+
+    # Runtime bytes-per-pixel measurements from the worker's stage executions.
+    # Keys are StageType.value strings, values are max observed BPP ratios.
+    # Propagated to the main process so _get_min_free_vram() uses real data.
+    measured_bpp: dict[str, float] = field(default_factory=dict)
+
 
 @dataclass
 class ProgressUpdate:

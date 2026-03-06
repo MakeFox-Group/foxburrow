@@ -201,14 +201,63 @@ class GpuScheduler:
             if not worker.check_vram_budget(stage, budget_job):
                 return -2**31
 
+        from scheduling.worker_proxy import _global_measured_vram
+
         score = 0
         is_idle = worker.is_idle
         loaded_cats = worker.get_loaded_categories()
         required_group = get_session_group(stage.type)
 
+        # ── TRT coverage detection ────────────────────────────────────
+        # Determine which required components are covered by cached TRT
+        # engines on this GPU.  TRT-covered components don't need PyTorch
+        # model loading — they're ready instantly.  This is critical for
+        # cross-GPU specialization: GPU1 can have TRT UNet engines while
+        # GPU2 has TRT VAE engines, and stages route accordingly.
+        trt_covered_fps: set[str] = set()
+        trt_affinity_score = 0
+        if stage.required_components and group.jobs:
+            inp = budget_job.sdxl_input
+            if inp is not None:
+                w, h = inp.width, inp.height
+                for c in stage.required_components:
+                    if c.category == "sdxl_unet":
+                        aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)
+                        if aff >= 1:
+                            trt_covered_fps.add(c.fingerprint)
+                        if aff == 2:
+                            trt_affinity_score += 200   # exact static TRT match
+                        elif aff == 1:
+                            trt_affinity_score += 150   # dynamic TRT covers resolution
+                        elif aff == -1:
+                            trt_affinity_score -= 150   # wrong TRT — will evict
+                    elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
+                        aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
+                        if aff >= 1:
+                            trt_covered_fps.add(c.fingerprint)
+                        if aff == 2:
+                            trt_affinity_score += 200
+                        elif aff == 1:
+                            trt_affinity_score += 150
+                        elif aff == -1:
+                            trt_affinity_score -= 150
+                    elif c.category == "sdxl_te1":
+                        te_fp = f"{c.fingerprint}:te1_trt:default"
+                        if worker.gpu.is_component_loaded(te_fp):
+                            trt_covered_fps.add(c.fingerprint)
+                            trt_affinity_score += 100
+                    elif c.category == "sdxl_te2":
+                        te_fp = f"{c.fingerprint}:te2_trt:default"
+                        if worker.gpu.is_component_loaded(te_fp):
+                            trt_covered_fps.add(c.fingerprint)
+                            trt_affinity_score += 100
+
+        score += trt_affinity_score
+
         # ── Time-to-ready (dominant factor) ──────────────────────────
-        # Instead of fixed affinity bonuses, score by *how soon* this GPU
-        # can actually start the job: wait time + model load time.
+        # Score by *how soon* this GPU can actually start the job:
+        # wait time + model load time.  Components covered by TRT are
+        # treated as "loaded" — no PyTorch model loading needed.
         wait_s = _estimate_remaining_s(worker) if not is_idle else 0.0
 
         missing_vram = 0
@@ -218,8 +267,12 @@ class GpuScheduler:
             for c in stage.required_components:
                 if worker.gpu.is_component_loaded(c.fingerprint):
                     loaded_count += 1
+                elif c.fingerprint in trt_covered_fps:
+                    loaded_count += 1  # TRT engine handles this — no load needed
                 else:
-                    missing_vram += c.estimated_vram_bytes
+                    # Use measured VRAM from global registry when available
+                    measured = _global_measured_vram.get(c.fingerprint)
+                    missing_vram += measured if measured is not None else c.estimated_vram_bytes
                     num_missing += 1
 
         # Model load time estimate: configurable MB/s + 0.5s per-component overhead
@@ -246,30 +299,6 @@ class GpuScheduler:
             import time as _time
             idle_since = _time.monotonic() - worker._last_dispatch_time
             score += min(int(idle_since * 2), 30)  # up to +30 pts, ramps over 15s
-
-        # ── TRT engine affinity ──────────────────────────────────────
-        # For denoise/VAE stages, check if this GPU has a TRT engine that
-        # covers the job's resolution.  Avoids wasteful TRT engine swaps
-        # by preferring GPUs that already have the right engine, or clean
-        # GPUs over ones that would need to evict a useful engine.
-        if stage.type in (StageType.GPU_DENOISE, StageType.GPU_VAE_DECODE,
-                          StageType.GPU_VAE_ENCODE) and group.jobs:
-            inp = budget_job.sdxl_input
-            if inp is not None:
-                w, h = inp.width, inp.height
-                for c in stage.required_components:
-                    if c.category == "sdxl_unet" and stage.type == StageType.GPU_DENOISE:
-                        trt_aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)
-                    elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
-                        trt_aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
-                    else:
-                        continue
-                    if trt_aff == 2:
-                        score += 200    # exact static TRT match — fastest path
-                    elif trt_aff == 1:
-                        score += 150    # dynamic TRT engine covers this resolution
-                    elif trt_aff == -1:
-                        score -= 150    # has TRT engines but wrong resolution — will evict
 
         # Cross-group penalty — only when busy. An idle GPU has zero
         # context-switch cost so switching session groups is free.

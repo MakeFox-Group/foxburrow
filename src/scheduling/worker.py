@@ -261,8 +261,14 @@ def _vram_available(gpu: GpuProxy) -> int:
 
 
 def _unloaded_model_cost(gpu: GpuProxy, categories: list[str]) -> int:
-    """Sum estimated VRAM for model categories not currently loaded on the GPU."""
+    """Sum VRAM for model categories not currently loaded on the GPU.
+
+    Uses measured VRAM from global registry (populated by worker processes)
+    for each loaded category, falling back to static estimates.
+    """
     from scheduling.model_registry import VramEstimates
+    from scheduling.worker_proxy import _global_measured_vram
+
     _model_vram = {
         "sdxl_unet": VramEstimates.SDXL_UNET,
         "sdxl_te1": VramEstimates.SDXL_TEXT_ENCODER_1,
@@ -272,11 +278,27 @@ def _unloaded_model_cost(gpu: GpuProxy, categories: list[str]) -> int:
         "bgremove": VramEstimates.BGREMOVE,
     }
     loaded_cats = set(gpu.get_cached_categories())
-    return sum(
-        _model_vram.get(cat, 500 * 1024**2)
-        for cat in categories
-        if cat not in loaded_cats
-    )
+    total = 0
+    for cat in categories:
+        if cat in loaded_cats:
+            continue
+        # Check global measured VRAM for any model of this category
+        measured = _find_measured_vram_for_category(cat)
+        if measured is not None:
+            total += measured
+        else:
+            total += _model_vram.get(cat, 500 * 1024**2)
+    return total
+
+
+def _find_measured_vram_for_category(category: str) -> int | None:
+    """Find the largest measured VRAM for any model of the given category.
+
+    Uses the global category → max VRAM mapping built from worker StatusSnapshots.
+    Returns the maximum observed VRAM for this category across all workers.
+    """
+    from scheduling.worker_proxy import get_measured_category_vram
+    return get_measured_category_vram(category)
 
 
 def _working_memory_cost(stage_type: StageType, ref_pixels: int,

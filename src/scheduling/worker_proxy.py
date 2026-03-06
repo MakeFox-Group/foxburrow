@@ -64,6 +64,26 @@ _SESSION_MAX_CONCURRENCY: dict[str, int] = {
 
 MAX_CONCURRENCY = 4
 
+# Global measured model VRAM — aggregated from all workers' StatusSnapshots.
+# Once ANY worker loads a model and measures its VRAM, this value is available
+# for budget calculations across all workers.  fingerprint -> actual bytes.
+_global_measured_vram: dict[str, int] = {}
+
+# Global category → max measured VRAM — tracks the largest observed VRAM
+# per model category (e.g. "sdxl_unet", "sdxl_te1") across all workers.
+# Used by _unloaded_model_cost() for slot estimation.
+_global_category_vram: dict[str, int] = {}
+
+
+def get_measured_model_vram(fingerprint: str) -> int | None:
+    """Look up the measured VRAM for a model component from any worker."""
+    return _global_measured_vram.get(fingerprint)
+
+
+def get_measured_category_vram(category: str) -> int | None:
+    """Look up the max measured VRAM for any model of the given category."""
+    return _global_category_vram.get(category)
+
 
 class GpuProxy:
     """Lightweight read-only GPU info object for the scheduler.
@@ -439,7 +459,8 @@ class GpuWorkerProxy:
         """Check if this GPU has enough VRAM for a new stage.
 
         When idle, always returns True (model loading handles eviction).
-        When busy, uses cached VRAM stats from the worker's StatusSnapshot.
+        When busy, uses cached VRAM stats from the worker's StatusSnapshot
+        and real measured model sizes where available.
         """
         if self._active_count == 0:
             return True
@@ -448,18 +469,24 @@ class GpuWorkerProxy:
         if status is None:
             return True  # No status yet, be optimistic
 
-        # Cost: models not loaded + working memory
-        model_cost = sum(
-            c.estimated_vram_bytes
-            for c in stage.required_components
-            if not self._gpu_proxy.is_component_loaded(c.fingerprint)
-        )
+        # Cost: models not loaded + working memory.
+        # Use measured VRAM from the global registry (populated by any worker
+        # that has loaded this model) instead of static estimates.
+        model_cost = 0
+        for c in stage.required_components:
+            if self._gpu_proxy.is_component_loaded(c.fingerprint):
+                continue
+            measured = _global_measured_vram.get(c.fingerprint)
+            if measured is not None:
+                model_cost += measured
+            else:
+                model_cost += c.estimated_vram_bytes
 
         from scheduling.worker import _get_min_free_vram
         working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
         total_needed = model_cost + working_cost
 
-        # Available: NVML free + evictable
+        # Available: NVML free + allocator slack + evictable
         vram = status.vram_stats
         nvml_free = vram.get("free", 0)
         pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
@@ -680,6 +707,20 @@ class GpuWorkerProxy:
         ))
         await self._onload_future
 
+    @staticmethod
+    def _merge_bpp(bpp_data: dict[str, float]) -> None:
+        """Merge a worker's BPP measurements into the main process's tracking."""
+        from scheduling.worker import _measured_bpp, _bpp_lock
+        with _bpp_lock:
+            for stage_val, bpp in bpp_data.items():
+                try:
+                    st = StageType(stage_val)
+                    # Keep the max BPP across all workers (conservative)
+                    if bpp > _measured_bpp.get(st, 0.0):
+                        _measured_bpp[st] = bpp
+                except ValueError:
+                    pass
+
     def update_lora_index(self, lora_index: dict) -> None:
         """Push an updated LoRA index to the worker process (fire-and-forget)."""
         self._cmd_queue.put(UpdateLoraIndexCmd(lora_index=lora_index))
@@ -736,6 +777,20 @@ class GpuWorkerProxy:
 
                 elif isinstance(msg, StatusSnapshot):
                     self._gpu_proxy._update(msg)
+                    # Merge measured model VRAM into global registry
+                    if msg.fingerprint_vram:
+                        _global_measured_vram.update(msg.fingerprint_vram)
+                    # Build category → max VRAM mapping from model info
+                    for info in msg.cached_models_info:
+                        cat = info.get("category", "")
+                        vram = info.get("vram", 0)
+                        if cat and vram > 0:
+                            prev = _global_category_vram.get(cat, 0)
+                            if vram > prev:
+                                _global_category_vram[cat] = vram
+                    # Propagate BPP measurements to the main process
+                    if msg.measured_bpp:
+                        self._merge_bpp(msg.measured_bpp)
 
                 elif isinstance(msg, ProgressUpdate):
                     self._handle_progress(msg)

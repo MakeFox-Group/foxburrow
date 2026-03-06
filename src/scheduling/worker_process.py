@@ -306,10 +306,17 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
 
     cached_fps = set()
     cached_cats = []
+    fp_vram: dict[str, int] = {}
     with gpu._cache_lock:
-        for fp in gpu._cache:
+        for fp, m in gpu._cache.items():
             cached_fps.add(fp)
-        cached_cats = [m.category for m in gpu._cache.values()]
+            cached_cats.append(m.category)
+            fp_vram[fp] = m.actual_vram if m.actual_vram > 0 else m.estimated_vram
+
+    # Collect runtime BPP measurements from this worker process
+    from scheduling.worker import _measured_bpp, _bpp_lock
+    with _bpp_lock:
+        bpp_copy = {st.value: v for st, v in _measured_bpp.items()}
 
     try:
         vram_stats = gpu.get_vram_stats()
@@ -331,6 +338,8 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
         loaded_lora_count=len(getattr(gpu, "_loaded_lora_adapters", {})),
         gpu_model_name=gpu_model_name,
         arch_key=arch_key,
+        fingerprint_vram=fp_vram,
+        measured_bpp=bpp_copy,
     )
 
 
@@ -555,14 +564,13 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
             job.job_id, model_name, stage.type.value,
             _stage_w, _stage_h, _stage_steps, stage_duration)
 
-    # Release active fingerprints
-    active_fps = {c.fingerprint for c in stage.required_components}
-    active_fps.update(getattr(stage, '_trt_active_fps', set()))
-    if active_fps:
-        gpu.remove_active_fingerprints(active_fps)
-    te_protect = getattr(stage, '_te_protect_fps', set())
-    if te_protect:
-        gpu.remove_active_fingerprints(te_protect)
+    # Release active fingerprints — all protection sets added during loading
+    release_fps: set[str] = set()
+    release_fps.update(c.fingerprint for c in stage.required_components)
+    release_fps.update(getattr(stage, '_trt_active_fps', set()))
+    release_fps.update(getattr(stage, '_load_protect_fps', set()))
+    if release_fps:
+        gpu.remove_active_fingerprints(release_fps)
 
     gpu.release()
 
@@ -687,9 +695,16 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
                 break
 
     trt_fps: set[str] = set()
-    te_protect_fps: set[str] = set()
 
-    # Protect TE TRT engines from eviction during non-TE stages
+    # Protect ALL required component fingerprints from eviction during the
+    # entire loading phase.  This prevents TRT engine loading (which calls
+    # ensure_free_vram internally) from evicting models loaded earlier in
+    # this same stage — e.g., loading a TRT UNet engine must not evict
+    # the TE1/TE2 that were just loaded for the same pipeline.
+    all_required_fps = {c.fingerprint for c in stage.required_components}
+
+    # Also protect TE TRT engines from eviction during non-TE stages
+    te_protect_fps: set[str] = set()
     if stage.type != StageType.GPU_TEXT_ENCODE:
         fps = getattr(job, '_stage_model_fps', {})
         for te_key, comp_name in (("sdxl_te1", "te1"), ("sdxl_te2", "te2")):
@@ -698,9 +713,12 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
                 te_fp = f"{base}:{comp_name}_trt:default"
                 if gpu.is_component_loaded(te_fp):
                     te_protect_fps.add(te_fp)
-        if te_protect_fps:
-            gpu.add_active_fingerprints(te_protect_fps)
+
+    # Add protection for all required components + TE TRT engines
+    protect_fps = all_required_fps | te_protect_fps
+    gpu.add_active_fingerprints(protect_fps)
     stage._te_protect_fps = te_protect_fps
+    stage._load_protect_fps = protect_fps  # Track for cleanup
 
     device = torch.device("cuda:0")
 
@@ -711,12 +729,17 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
         # Check TRT coverage
         if _trt_covers_component(gpu, stage, job, component):
             log.debug(f"  Skipping PyTorch {component.category} — TRT engine available")
-            trt_fps.update(_preload_trt_engine(gpu, stage, job, component))
+            new_trt_fps = _preload_trt_engine(gpu, stage, job, component)
+            trt_fps.update(new_trt_fps)
+            # Protect newly loaded TRT engines from eviction by later loads
+            if new_trt_fps:
+                gpu.add_active_fingerprints(new_trt_fps)
+                protect_fps.update(new_trt_fps)
             continue
 
-        # Ensure VRAM before loading
-        active_fps = {c.fingerprint for c in stage.required_components}
-        gpu.ensure_free_vram(component.estimated_vram_bytes, protect=active_fps)
+        # Ensure VRAM before loading — protect set includes all required
+        # components AND any TRT engines loaded so far in this stage
+        gpu.ensure_free_vram(component.estimated_vram_bytes, protect=protect_fps)
 
         # Load the model component
         from handlers.sdxl import load_component
