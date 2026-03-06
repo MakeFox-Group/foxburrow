@@ -97,9 +97,8 @@ class TrtBuildManager:
         # library's load/save is GIL-bound (protobuf serialization of
         # ~5GB UNet models), so threads serialize on the GIL.  Separate
         # processes each get their own GIL for true parallel execution.
-        # Capped at 4 workers — each loads ~10GB peak RAM during consolidation.
         self._consolidation_pool = ProcessPoolExecutor(
-            max_workers=min(export_threads, 4),
+            max_workers=export_threads,
             mp_context=mp.get_context("spawn"),
         )
 
