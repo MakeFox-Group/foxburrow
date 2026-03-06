@@ -32,6 +32,34 @@ class RegionalPromptResult:
     base_ratio: float        # blend ratio for base (default 0.2)
     has_per_region_neg: bool  # True if negatives differ across regions
 
+    def to_dict(self) -> dict:
+        return {
+            "regions": [
+                {"prompt": r.prompt, "negative": r.negative,
+                 "x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1}
+                for r in self.regions
+            ],
+            "base_prompt": self.base_prompt,
+            "negative_prompt": self.negative_prompt,
+            "base_ratio": self.base_ratio,
+            "has_per_region_neg": self.has_per_region_neg,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RegionalPromptResult":
+        regions = [
+            RegionInfo(prompt=r["prompt"], negative=r["negative"],
+                       x0=r["x0"], y0=r["y0"], x1=r["x1"], y1=r["y1"])
+            for r in d["regions"]
+        ]
+        return cls(
+            regions=regions,
+            base_prompt=d["base_prompt"],
+            negative_prompt=d["negative_prompt"],
+            base_ratio=d["base_ratio"],
+            has_per_region_neg=d["has_per_region_neg"],
+        )
+
 
 def detect_regional_keywords(prompt: str) -> bool:
     """Lightweight check for ADDCOL / ADDROW / ADDBASE / ADDCOMM keywords."""

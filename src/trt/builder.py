@@ -234,7 +234,7 @@ def build_te_engine(
     """Build a TensorRT engine for a text encoder (TE1 or TE2).
 
     Text encoders have no spatial dimensions — only the batch axis
-    (number of 77-token chunks) is dynamic, ranging from 1 to 4.
+    (number of 77-token chunks) is dynamic, ranging from 1 to 16.
     A single engine per text encoder covers all use cases.
 
     Args:
@@ -273,9 +273,10 @@ def build_te_engine(
 
         profile = builder.create_optimization_profile()
 
-        # Dynamic batch: 1 to 4 chunks, seq_len fixed at 77
-        profile.set_shape("input_ids",      (1, 77), (1, 77), (4, 77))
-        profile.set_shape("attention_mask",  (1, 77), (1, 77), (4, 77))
+        # Dynamic batch: 1 to 16 chunks, seq_len fixed at 77
+        # Long prompts with emphasis syntax can expand to many chunks
+        profile.set_shape("input_ids",      (1, 77), (2, 77), (16, 77))
+        profile.set_shape("attention_mask",  (1, 77), (2, 77), (16, 77))
 
         config.add_optimization_profile(profile)
 

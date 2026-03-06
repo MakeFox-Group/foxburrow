@@ -2713,16 +2713,16 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
 
     # Activate loaded adapters with correct weights, or disable if none
     if te1_adapter_names:
-        if hasattr(te1, 'peft_config') and te1.peft_config:
+        if hasattr(te1, 'set_adapters'):
             te1.set_adapters(te1_adapter_names, te1_adapter_weights)
     else:
-        if hasattr(te1, 'peft_config') and te1.peft_config:
+        if hasattr(te1, 'disable_adapters'):
             te1.disable_adapters()
     if te2_adapter_names:
-        if hasattr(te2, 'peft_config') and te2.peft_config:
+        if hasattr(te2, 'set_adapters'):
             te2.set_adapters(te2_adapter_names, te2_adapter_weights)
     else:
-        if hasattr(te2, 'peft_config') and te2.peft_config:
+        if hasattr(te2, 'disable_adapters'):
             te2.disable_adapters()
 
 

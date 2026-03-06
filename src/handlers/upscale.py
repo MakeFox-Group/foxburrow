@@ -162,6 +162,16 @@ def load_model(device: torch.device) -> nn.Module:
     # into a meta tensor raises NotImplementedError, but assign=True just
     # swaps in the real CPU tensors from the file.
     model.load_state_dict(state, strict=True, assign=True)
+
+    # Belt-and-suspenders: if a concurrent thread re-activated the accelerate
+    # leak during RRDBNet construction, some params/buffers may still be meta
+    # even after assign=True. fix_meta_tensors replaces them with zeros — safe
+    # for buffers, and strict=True above ensures all weight params were loaded.
+    from gpu.pool import fix_meta_tensors
+    n_fixed = fix_meta_tensors(model)
+    if n_fixed:
+        log.warning(f"  Upscale: Fixed {n_fixed} meta tensor(s) after load_state_dict")
+
     model.to(device).half().eval()
 
     log.debug(f"  Upscale: Loaded RealESRGAN x2plus to {device}")
