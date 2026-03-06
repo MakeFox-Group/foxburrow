@@ -446,6 +446,12 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
     # TE TRT engines from eviction during model loading.
     job._te_fingerprints = cmd.te_fingerprints
 
+    # Pre-populate _stage_model_fps so _preload_trt_engine can find
+    # component fingerprints during model loading. _dispatch_stage
+    # overwrites this with the same values later.
+    job._stage_model_fps = {c.category: c.fingerprint
+                            for c in stage.required_components}
+
     # ── Model loading ─────────────────────────────────────────────
     load_start = _time.monotonic()
 
