@@ -97,8 +97,9 @@ class TrtBuildManager:
         # library's load/save is GIL-bound (protobuf serialization of
         # ~5GB UNet models), so threads serialize on the GIL.  Separate
         # processes each get their own GIL for true parallel execution.
+        # Capped at 4 workers — each loads ~10GB peak RAM during consolidation.
         self._consolidation_pool = ProcessPoolExecutor(
-            max_workers=export_threads,
+            max_workers=min(export_threads, 4),
             mp_context=mp.get_context("spawn"),
         )
 
@@ -154,6 +155,17 @@ class TrtBuildManager:
         log.info(f"  TRT: Build manager started (cache: {self._cache_dir}, "
                  f"export_threads: {self._export_threads}, mode: {mode}, "
                  f"architectures: {gpu_counts}, {ws_info})")
+
+    def stop(self) -> None:
+        """Cancel all pending work and shut down executor pools."""
+        if self._export_task:
+            self._export_task.cancel()
+        for task in self._arch_tasks.values():
+            task.cancel()
+        for task in list(self._active_export_tasks):
+            task.cancel()
+        self._export_pool.shutdown(wait=False, cancel_futures=True)
+        self._consolidation_pool.shutdown(wait=False, cancel_futures=True)
 
     def _get_workspace_gb(self, arch_key: str) -> float:
         """Resolve workspace GB for an architecture from config.

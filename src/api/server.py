@@ -49,6 +49,8 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
         # Graceful shutdown
         log.debug("  Shutting down...")
         cleanup_task.cancel()
+        if app_state.trt_manager:
+            app_state.trt_manager.stop()
         if app_state.fs_watcher:
             await app_state.fs_watcher.stop()
         scheduler = app_state.scheduler
