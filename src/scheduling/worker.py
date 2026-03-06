@@ -247,8 +247,10 @@ _REF_IMAGE_PX = 1536 * 1024                           # 1572864 image pixels
 
 
 def _vram_available(gpu: GpuProxy) -> int:
-    """Return VRAM available for new allocations (NVML free + allocator slack + evictable).
+    """Return VRAM available for new allocations.
 
+    Includes NVML free, PyTorch allocator slack, evictable model cache,
+    and TRT shared memory that can be freed (re-allocated on next use).
     Works with GpuProxy's cached vram_stats from StatusSnapshot.
     """
     vram = gpu.get_vram_stats()
@@ -257,7 +259,8 @@ def _vram_available(gpu: GpuProxy) -> int:
     nvml_free = vram.get("free", 0)
     pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
     evictable = gpu.get_evictable_vram()
-    return nvml_free + pt_slack + evictable
+    trt_freeable = gpu.get_trt_freeable_vram()
+    return nvml_free + pt_slack + evictable + trt_freeable
 
 
 def _unloaded_model_cost(gpu: GpuProxy, categories: list[str]) -> int:

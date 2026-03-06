@@ -132,7 +132,10 @@ class GpuScheduler:
             if not group.jobs:
                 gpu_groups.remove(group)
 
-        # Dispatch GPU stages using scoring — one job at a time
+        # Dispatch GPU stages using scoring — find best (worker, group) match
+        # and dispatch, repeating until no more valid matches.  Each dispatch
+        # updates concurrency counts and pending VRAM cost so subsequent
+        # iterations in the same round see accurate state.
         dispatched = True
         while dispatched and gpu_groups:
             dispatched = False

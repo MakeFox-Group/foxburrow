@@ -561,17 +561,43 @@ class GpuInstance:
 
         return model_entry
 
-    def ensure_free_vram(self, min_free_bytes: int, protect: set[str] | None = None) -> None:
+    def ensure_free_vram(self, min_free_bytes: int, protect: set[str] | None = None) -> bool:
         """Evict cached models until at least min_free_bytes VRAM is free.
 
-        After exhausting evictable models, also frees TRT shared memory pools
-        whose runners are no longer cached.  These buffers can be very large
-        (e.g. 1.1GB for UNet, 5.3GB for VAE) and are not freed automatically.
+        Pre-checks whether eviction can possibly succeed before touching
+        anything.  If the total reclaimable VRAM (evictable models + freeable
+        TRT shared memory + current free) is less than what's needed, returns
+        False immediately without evicting a single model.
+
+        Escalating eviction strategy (only if pre-check passes):
+        1. Normal LRU eviction (inactive, evictable models)
+        2. Orphaned TRT shared memory (buffers whose runners were all evicted)
+        3. Force-free ALL non-active TRT shared memory (buffers are re-created
+           on next use — this reclaims 100s of MB per component type)
+
+        Returns True if the requested VRAM is available, False if not.
         """
+        _, _, free = nvml.get_memory_info(self.nvml_handle)
+        if free >= min_free_bytes:
+            return True
+
+        # Pre-check: can we possibly free enough?  Avoid partially evicting
+        # models only to discover a non-evictable model blocks us.
+        evictable = self.get_evictable_vram(protect)
+        trt_freeable = self._get_freeable_trt_shared_memory_vram()
+        max_available = free + evictable + trt_freeable
+        if max_available < min_free_bytes:
+            log.warning(
+                f"  GPU [{self.uuid}]: Cannot free {min_free_bytes // (1024*1024)}MB — "
+                f"only {max_available // (1024*1024)}MB reclaimable "
+                f"(free={free // (1024*1024)}MB, evictable={evictable // (1024*1024)}MB, "
+                f"trt_freeable={trt_freeable // (1024*1024)}MB)")
+            return False
+
         while True:
             _, _, free = nvml.get_memory_info(self.nvml_handle)
             if free >= min_free_bytes:
-                return
+                return True
             evicted = self.evict_lru(protect)
             if evicted is None:
                 # No more evictable models — try freeing orphaned TRT shared
@@ -579,9 +605,15 @@ class GpuInstance:
                 freed_any = self._free_orphaned_trt_shared_memory()
                 if freed_any:
                     continue
+                # Last resort: force-free ALL TRT shared memory that isn't
+                # actively executing.  The buffers are large (UNet ~438-738MB,
+                # VAE ~2.5GB) and will be re-allocated on next runner use.
+                freed_any = self._force_free_trt_shared_memory()
+                if freed_any:
+                    continue
                 log.warning(f"  GPU [{self.uuid}]: Cannot free {min_free_bytes // (1024*1024)}MB — "
                             f"only {free // (1024*1024)}MB free, no evictable models")
-                return
+                return False
 
     def _free_orphaned_trt_shared_memory(self) -> bool:
         """Free TRT shared memory pools whose runners are no longer cached.
@@ -619,6 +651,94 @@ class GpuInstance:
                     freed_any = True
 
         return freed_any
+
+    def _force_free_trt_shared_memory(self) -> bool:
+        """Force-free TRT shared memory buffers not currently in active use.
+
+        Unlike _free_orphaned_trt_shared_memory (which only frees buffers for
+        evicted runners), this frees buffers even when runners remain cached —
+        as long as no runner of that type is actively executing.  The buffer is
+        re-allocated transparently on next runner use via get_trt_shared_memory.
+
+        Returns True if any memory was freed.
+        """
+        cat_to_comp = {
+            "sdxl_unet_trt": "unet",
+            "sdxl_vae_trt": "vae",
+            "sdxl_vae_enc_trt": "vae_enc",
+            "sdxl_te1_trt": "te1",
+            "sdxl_te2_trt": "te2",
+        }
+
+        with self._trt_shared_mem_lock:
+            pool_types = list(self._trt_shared_mem.keys())
+
+        if not pool_types:
+            return False
+
+        # Find which component types have actively-executing TRT runners.
+        # These cannot be freed — the runner is using the buffer right now.
+        active_fps = self.get_active_fingerprints()
+        active_comp_types: set[str] = set()
+        with self._cache_lock:
+            for fp, m in self._cache.items():
+                if not m.category.endswith("_trt"):
+                    continue
+                if fp in active_fps:
+                    comp_type = cat_to_comp.get(m.category)
+                    if comp_type:
+                        active_comp_types.add(comp_type)
+
+        freed_any = False
+        known_comp_types = set(cat_to_comp.values())
+        for comp_type in pool_types:
+            if comp_type in active_comp_types:
+                continue  # Runner actively executing — buffer in use
+            if comp_type not in known_comp_types:
+                continue  # Unknown pool key — can't verify active status
+            freed = self.release_trt_shared_memory(comp_type)
+            if freed > 0:
+                log.debug(f"  GPU [{self.uuid}]: Force-freed TRT shared memory "
+                          f"'{comp_type}' ({freed // (1024*1024)}MB)")
+                freed_any = True
+
+        return freed_any
+
+    def _get_freeable_trt_shared_memory_vram(self) -> int:
+        """Return TRT shared memory VRAM that could be freed.
+
+        Excludes buffers for component types with actively-executing runners.
+        """
+        cat_to_comp = {
+            "sdxl_unet_trt": "unet",
+            "sdxl_vae_trt": "vae",
+            "sdxl_vae_enc_trt": "vae_enc",
+            "sdxl_te1_trt": "te1",
+            "sdxl_te2_trt": "te2",
+        }
+
+        with self._trt_shared_mem_lock:
+            pool_items = list(self._trt_shared_mem.items())
+
+        if not pool_items:
+            return 0
+
+        active_fps = self.get_active_fingerprints()
+        active_comp_types: set[str] = set()
+        with self._cache_lock:
+            for fp, m in self._cache.items():
+                if not m.category.endswith("_trt"):
+                    continue
+                if fp in active_fps:
+                    comp_type = cat_to_comp.get(m.category)
+                    if comp_type:
+                        active_comp_types.add(comp_type)
+
+        total = 0
+        for comp_type, buf in pool_items:
+            if comp_type not in active_comp_types:
+                total += buf.nbytes
+        return total
 
     def ensure_session_group(self, group: str) -> None:
         """Switch the current session group. Models from other groups are NOT

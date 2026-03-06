@@ -190,6 +190,7 @@ class StatusSnapshot:
     vram_stats: dict
     loaded_models_vram: int
     evictable_vram: int
+    trt_freeable_vram: int
     is_failed: bool
     fail_reason: str
     is_busy: bool

@@ -415,6 +415,7 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
         vram_stats=vram_stats,
         loaded_models_vram=gpu.get_loaded_models_vram(),
         evictable_vram=gpu.get_evictable_vram(),
+        trt_freeable_vram=gpu._get_freeable_trt_shared_memory_vram(),
         is_failed=gpu.is_failed,
         fail_reason=gpu._fail_reason,
         is_busy=gpu.is_busy,
@@ -561,11 +562,15 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer, l
             vram_before = torch.cuda.memory_allocated(device)
             _ensure_models_for_stage(gpu, stage, job, gpu_model_name)
 
-            # Ensure free VRAM for working memory
+            # Ensure free VRAM for working memory.
+            # If eviction can't free enough, raise OOM to re-route the job.
             from scheduling.worker import _get_min_free_vram
             min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
             if min_free > 0:
-                gpu.ensure_free_vram(min_free)
+                if not gpu.ensure_free_vram(min_free):
+                    raise torch.cuda.OutOfMemoryError(
+                        f"Cannot free {min_free // (1024*1024)}MB working memory "
+                        f"for {stage.type.value} — predicted OOM, re-routing")
 
             # Capture VRAM delta inside lock so concurrent threads
             # don't pollute the measurement.
@@ -874,8 +879,13 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
             continue
 
         # Ensure VRAM before loading — protect set prevents eviction of
-        # required components and TRT engines loaded earlier in this stage
-        gpu.ensure_free_vram(component.estimated_vram_bytes, protect=protect_fps)
+        # required components and TRT engines loaded earlier in this stage.
+        # If eviction can't free enough, raise OOM so the job is re-routed
+        # to a different GPU rather than crashing the CUDA context.
+        if not gpu.ensure_free_vram(component.estimated_vram_bytes, protect=protect_fps):
+            raise torch.cuda.OutOfMemoryError(
+                f"Cannot free {component.estimated_vram_bytes // (1024*1024)}MB "
+                f"for {component.category} — predicted OOM, re-routing")
 
         # Load the model component
         from handlers.sdxl import load_component
@@ -1075,7 +1085,9 @@ def _load_upscale_model(gpu) -> None:
     if comp and gpu.is_component_loaded(comp.fingerprint):
         return
     if comp:
-        gpu.ensure_free_vram(comp.estimated_vram_bytes, protect={comp.fingerprint})
+        if not gpu.ensure_free_vram(comp.estimated_vram_bytes, protect={comp.fingerprint}):
+            raise torch.cuda.OutOfMemoryError(
+                f"Cannot free {comp.estimated_vram_bytes // (1024*1024)}MB for upscale model")
     before = torch.cuda.memory_allocated(device)
     tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
                if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
@@ -1114,7 +1126,9 @@ def _load_bgremove_model(gpu) -> None:
     if comp and gpu.is_component_loaded(comp.fingerprint):
         return
     if comp:
-        gpu.ensure_free_vram(comp.estimated_vram_bytes, protect={comp.fingerprint})
+        if not gpu.ensure_free_vram(comp.estimated_vram_bytes, protect={comp.fingerprint}):
+            raise torch.cuda.OutOfMemoryError(
+                f"Cannot free {comp.estimated_vram_bytes // (1024*1024)}MB for bgremove model")
     before = torch.cuda.memory_allocated(device)
     tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
                if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())

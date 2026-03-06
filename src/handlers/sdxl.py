@@ -105,6 +105,10 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
        to minimize tile count and overlap
     4. PyTorch fallback (auto-calc with VAE_TILE_MAX)
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
+
     from trt.builder import (VAE_STATIC_RESOLUTIONS, get_arch_key, get_engine_path,
                              discover_dynamic_engines)
 
@@ -2443,6 +2447,62 @@ def _detect_lora_arch(state_dict: dict) -> str:
 # The UNet architecture that foxburrow serves (SDXL).
 _EXPECTED_LORA_ARCH = "sdxl"
 
+# SGM/Kohya LoRA key → diffusers module path for non-block UNet layers.
+# These keys crash diffusers' _maybe_map_sgm_blocks_to_diffusers because they
+# don't contain input_blocks/middle_block/output_blocks patterns.
+_SDXL_NONBLOCK_LORA_MAP = {
+    "label_emb_0_0": "add_embedding.linear_1",
+    "label_emb_0_2": "add_embedding.linear_2",
+    "time_embed_0": "time_embedding.linear_1",
+    "time_embed_2": "time_embedding.linear_2",
+    "out_0": "conv_norm_out",
+    "out_2": "conv_out",
+}
+
+
+def _extract_nonblock_lora_keys(state_dict: dict) -> tuple[dict, dict]:
+    """Extract and convert non-block lora_unet_* keys that crash diffusers' SGM mapper.
+
+    Pops matching keys from state_dict in-place and returns them converted to
+    the same format that _convert_non_diffusers_lora_to_diffusers produces.
+
+    Returns:
+        (converted_state_dict, network_alphas)
+    """
+    converted = {}
+    alphas = {}
+    to_pop = []
+
+    for key in list(state_dict.keys()):
+        if not key.startswith("lora_unet_"):
+            continue
+        lora_name = key.split(".")[0]
+        module_key = lora_name[len("lora_unet_"):]
+
+        diffusers_module = _SDXL_NONBLOCK_LORA_MAP.get(module_key)
+        if diffusers_module is None:
+            continue
+
+        suffix = key[len(lora_name):]
+
+        if suffix == ".alpha":
+            alphas[f"unet.{diffusers_module}.alpha"] = state_dict[key].item()
+            to_pop.append(key)
+        elif suffix == ".lora_down.weight":
+            converted[f"unet.{diffusers_module}.lora.down.weight"] = state_dict[key]
+            to_pop.append(key)
+        elif suffix == ".lora_up.weight":
+            converted[f"unet.{diffusers_module}.lora.up.weight"] = state_dict[key]
+            to_pop.append(key)
+        elif suffix == ".dora_scale":
+            converted[f"unet.{diffusers_module}.lora_magnitude_vector.weight"] = state_dict[key]
+            to_pop.append(key)
+
+    for key in to_pop:
+        state_dict.pop(key)
+
+    return converted, alphas
+
 
 def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance) -> None:
     """Load a LoRA safetensors/pt file as a PEFT adapter on the UNet.
@@ -2506,11 +2566,21 @@ def _load_lora_adapter(unet, lora_path: str, adapter_name: str, gpu: GpuInstance
     is_a1111 = any(k.startswith("lora_unet_") or k.startswith("lora_te") for k in raw_sd)
 
     if is_a1111:
+        # Extract non-block UNet keys (label_emb, time_embed, etc.) BEFORE the
+        # SGM mapper — diffusers' mapper crashes on keys that aren't block-level.
+        nonblock_sd, nonblock_alphas = _extract_nonblock_lora_keys(raw_sd)
         # Remap SGM/LDM block indices to diffusers structure (input_blocks_4 → down_blocks.1.attentions.0)
         # This must happen BEFORE the key format conversion
         raw_sd = _maybe_map_sgm_blocks_to_diffusers(raw_sd, unet.config)
         # Convert A1111/Kohya → diffusers format (handles remaining key renaming)
         converted_sd, network_alphas = _convert_non_diffusers_lora_to_diffusers(raw_sd)
+        # Merge manually-converted non-block keys back
+        if nonblock_sd:
+            converted_sd.update(nonblock_sd)
+            if network_alphas is None:
+                network_alphas = nonblock_alphas
+            elif nonblock_alphas:
+                network_alphas.update(nonblock_alphas)
     else:
         converted_sd = raw_sd
         network_alphas = None
@@ -2636,6 +2706,8 @@ def _ensure_te_loras(te1, te2, lora_specs: list, gpu, lora_index: dict) -> None:
 
             is_a1111 = any(k.startswith("lora_unet_") or k.startswith("lora_te") for k in raw_sd)
             if is_a1111:
+                # Extract non-block UNet keys before SGM mapper (prevents crash)
+                _extract_nonblock_lora_keys(raw_sd)
                 # UNet config needed for SGM block mapping — get from cache if available
                 unet = _get_cached_model_optional(gpu, "sdxl_unet", None)
                 if unet is not None:
@@ -2748,6 +2820,10 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
     then falls back to the best-fitting dynamic engine discovered via JSON sidecars.
     Returns a TrtUNetRunner or None to fall back to PyTorch.
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return None
+
     from trt.builder import get_arch_key, get_engine_path
     from trt.runner import TrtUNetRunner
 
@@ -2757,7 +2833,6 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
     dynamic_only = app_state.config.tensorrt.dynamic_only
 
@@ -2772,7 +2847,8 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
                 return cached.model
             try:
                 engine_size = os.path.getsize(static_path)
-                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                    raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
                 unet_getter = lambda min_bytes: gpu.get_trt_shared_memory("unet", min_bytes)
                 runner = TrtUNetRunner(static_path, gpu.device, shared_memory_getter=unet_getter)
                 gpu.cache_model(
@@ -2800,7 +2876,8 @@ def _get_trt_unet_runner(gpu: GpuInstance, job: InferenceJob,
             return cached.model
         try:
             engine_size = os.path.getsize(dynamic_path)
-            gpu.ensure_free_vram(engine_size, protect={trt_fp})
+            if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
             unet_getter = lambda min_bytes: gpu.get_trt_shared_memory("unet", min_bytes)
             runner = TrtUNetRunner(dynamic_path, gpu.device, shared_memory_getter=unet_getter)
             gpu.cache_model(
@@ -2827,6 +2904,10 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
     Tries static engine first, then best-fitting dynamic engine.
     Returns a TrtVaeRunner or None.
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return None
+
     from trt.builder import get_arch_key, get_engine_path
     from trt.runner import TrtVaeRunner
 
@@ -2836,7 +2917,6 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
     dynamic_only = app_state.config.tensorrt.dynamic_only
 
@@ -2851,7 +2931,8 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
                 return cached.model
             try:
                 engine_size = os.path.getsize(static_path)
-                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                    raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
                 vae_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae", min_bytes)
                 runner = TrtVaeRunner(static_path, gpu.device, shared_memory_getter=vae_getter)
                 gpu.cache_model(
@@ -2879,7 +2960,8 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
             return cached.model
         try:
             engine_size = os.path.getsize(dynamic_path)
-            gpu.ensure_free_vram(engine_size, protect={trt_fp})
+            if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
             vae_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae", min_bytes)
             runner = TrtVaeRunner(dynamic_path, gpu.device, shared_memory_getter=vae_getter)
             gpu.cache_model(
@@ -2906,6 +2988,10 @@ def _get_trt_vae_enc_runner(gpu: "GpuInstance", job: InferenceJob,
     Uses the same VAE model fingerprint (same weights, different ONNX graph).
     Returns a TrtVaeEncoderRunner or None.
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return None
+
     from trt.builder import get_arch_key, get_engine_path
     from trt.runner import TrtVaeEncoderRunner
 
@@ -2915,7 +3001,6 @@ def _get_trt_vae_enc_runner(gpu: "GpuInstance", job: InferenceJob,
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
     dynamic_only = app_state.config.tensorrt.dynamic_only
 
@@ -2930,7 +3015,8 @@ def _get_trt_vae_enc_runner(gpu: "GpuInstance", job: InferenceJob,
                 return cached.model
             try:
                 engine_size = os.path.getsize(static_path)
-                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                    raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
                 enc_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae_enc", min_bytes)
                 runner = TrtVaeEncoderRunner(static_path, gpu.device, shared_memory_getter=enc_getter)
                 gpu.cache_model(
@@ -2958,7 +3044,8 @@ def _get_trt_vae_enc_runner(gpu: "GpuInstance", job: InferenceJob,
             return cached.model
         try:
             engine_size = os.path.getsize(dynamic_path)
-            gpu.ensure_free_vram(engine_size, protect={trt_fp})
+            if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+                raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
             enc_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae_enc", min_bytes)
             runner = TrtVaeEncoderRunner(dynamic_path, gpu.device, shared_memory_getter=enc_getter)
             gpu.cache_model(
@@ -2983,6 +3070,10 @@ def _get_trt_te1_runner(gpu: "GpuInstance", job: InferenceJob):
     Text encoders have a single "default" engine (no resolution variants).
     Returns a TrtTe1Runner or None to fall back to PyTorch.
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return None
+
     from trt.builder import get_arch_key, get_dynamic_engine_path
     from trt.runner import TrtTe1Runner
 
@@ -2992,7 +3083,6 @@ def _get_trt_te1_runner(gpu: "GpuInstance", job: InferenceJob):
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
 
     engine_path = get_dynamic_engine_path(cache_dir, fp, "te1", arch_key, "default")
@@ -3006,7 +3096,8 @@ def _get_trt_te1_runner(gpu: "GpuInstance", job: InferenceJob):
 
     try:
         engine_size = os.path.getsize(engine_path)
-        gpu.ensure_free_vram(engine_size, protect={trt_fp})
+        if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+            raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
         te1_getter = lambda min_bytes: gpu.get_trt_shared_memory("te1", min_bytes)
         runner = TrtTe1Runner(engine_path, gpu.device, shared_memory_getter=te1_getter)
         gpu.cache_model(
@@ -3027,6 +3118,10 @@ def _get_trt_te2_runner(gpu: "GpuInstance", job: InferenceJob):
 
     Returns a TrtTe2Runner or None to fall back to PyTorch.
     """
+    from state import app_state
+    if not app_state.config.tensorrt.enabled:
+        return None
+
     from trt.builder import get_arch_key, get_dynamic_engine_path
     from trt.runner import TrtTe2Runner
 
@@ -3036,7 +3131,6 @@ def _get_trt_te2_runner(gpu: "GpuInstance", job: InferenceJob):
 
     arch_key = get_arch_key(gpu.device_id)
 
-    from state import app_state
     cache_dir = app_state.config.server.tensorrt_cache
 
     engine_path = get_dynamic_engine_path(cache_dir, fp, "te2", arch_key, "default")
@@ -3050,7 +3144,8 @@ def _get_trt_te2_runner(gpu: "GpuInstance", job: InferenceJob):
 
     try:
         engine_size = os.path.getsize(engine_path)
-        gpu.ensure_free_vram(engine_size, protect={trt_fp})
+        if not gpu.ensure_free_vram(engine_size, protect={trt_fp}):
+            raise RuntimeError(f"Insufficient VRAM for TRT engine ({engine_size // (1024*1024)}MB)")
         te2_getter = lambda min_bytes: gpu.get_trt_shared_memory("te2", min_bytes)
         runner = TrtTe2Runner(engine_path, gpu.device, shared_memory_getter=te2_getter)
         gpu.cache_model(

@@ -65,6 +65,11 @@ _SESSION_MAX_CONCURRENCY: dict[str, int] = {
 
 MAX_CONCURRENCY = 4
 
+# CUDA context + driver + allocator fragmentation overhead.
+# Subtracted from total GPU memory for idle-GPU budget checks.
+# Conservative: avoids dispatching to a GPU that has no room after overhead.
+_VRAM_OVERHEAD_BYTES = 500 * 1024 * 1024  # 500 MB
+
 # Global measured model VRAM — aggregated from all workers' StatusSnapshots.
 # Once ANY worker loads a model and measures its VRAM, this value is available
 # for budget calculations across all workers.  fingerprint -> actual bytes.
@@ -202,6 +207,11 @@ class GpuProxy:
         if self._status is None:
             return 0
         return self._status.trt_shared_memory_vram
+
+    def get_trt_freeable_vram(self) -> int:
+        if self._status is None:
+            return 0
+        return self._status.trt_freeable_vram
 
     @property
     def current_group(self) -> str | None:
@@ -361,6 +371,12 @@ class GpuWorkerProxy:
         # Dispatch tracking (for scheduler diversification)
         self._last_dispatch_time: float = 0.0  # monotonic timestamp
 
+        # Pending VRAM cost: VRAM committed by dispatches not yet reflected
+        # in the worker's StatusSnapshot.  Deducted from available VRAM in
+        # check_vram_budget so multiple dispatches in the same scheduling
+        # round don't overcommit.  Reset when a fresh snapshot arrives.
+        self._pending_vram_cost: int = 0
+
     @property
     def gpu(self) -> GpuProxy:
         return self._gpu_proxy
@@ -467,13 +483,15 @@ class GpuWorkerProxy:
     def check_vram_budget(self, stage: WorkStage, job: InferenceJob) -> bool:
         """Check if this GPU has enough VRAM for a new stage.
 
-        When idle, checks against total GPU memory (the worker's loader
-        will evict models as needed).  Only rejects if the job fundamentally
-        exceeds the GPU's capacity.
+        This is the PRIMARY OOM prevention gate.  The scheduler MUST verify
+        VRAM budget before dispatching — workers should never hit OOM because
+        the scheduler guaranteed the work fits.
 
-        When busy, uses cached VRAM stats from the worker's StatusSnapshot
-        and real measured model sizes to check if there's room alongside
-        the currently active workload.
+        Accounts for:
+        - Models not yet loaded (need VRAM for loading)
+        - Working memory for execution (resolution-scaled)
+        - Pending VRAM from recently-dispatched jobs not yet in the snapshot
+        - Reclaimable VRAM (evictable models + freeable TRT shared memory)
         """
         status = self._gpu_proxy._status
         if status is None:
@@ -496,25 +514,26 @@ class GpuWorkerProxy:
         working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
         total_needed = model_cost + working_cost
 
-        # Idle GPU: check against total memory, not current free.
-        # The worker's model loader handles eviction, so current free memory
-        # is irrelevant — only reject if the job can never fit on this GPU.
-        # This avoids deadlock on fresh startup when conservative fallback
-        # estimates + unloaded model costs exceed current free memory.
-        if self._active_count == 0:
+        # Idle GPU (no active + no pending): check against total usable memory.
+        # The worker can evict everything, so budget = total - overhead.
+        if self._active_count == 0 and self._pending_vram_cost == 0:
             vram = status.vram_stats
             total_memory = vram.get("total", 0)
-            if total_memory > 0 and total_needed > total_memory:
+            usable = total_memory - _VRAM_OVERHEAD_BYTES
+            if usable > 0 and total_needed > usable:
                 return False
             return True
 
-        # Busy GPU: check against currently available VRAM
+        # Busy or recently-dispatched GPU: check available VRAM.
+        # Available = NVML free + PyTorch slack + evictable + TRT freeable
+        #           - pending cost from dispatches not yet in the snapshot.
         vram = status.vram_stats
         nvml_free = vram.get("free", 0)
         pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
         evictable = status.evictable_vram
+        trt_freeable = status.trt_freeable_vram
 
-        available = nvml_free + pt_slack + evictable
+        available = nvml_free + pt_slack + evictable + trt_freeable - self._pending_vram_cost
         return available >= total_needed
 
     def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
@@ -532,6 +551,17 @@ class GpuWorkerProxy:
         key = get_session_key(stage.type)
         if key:
             self._active_session_counts[key] += 1
+
+        # Track pending VRAM cost so subsequent check_vram_budget calls in
+        # the same scheduling round see reduced available VRAM.
+        dispatch_cost = 0
+        for c in stage.required_components:
+            if not self._gpu_proxy.is_component_loaded(c.fingerprint):
+                measured = _global_measured_vram.get(c.fingerprint)
+                dispatch_cost += measured if measured is not None else c.estimated_vram_bytes
+        from scheduling.worker import _get_min_free_vram
+        dispatch_cost += _get_min_free_vram(stage.type, job, self._gpu_model_name)
+        self._pending_vram_cost += dispatch_cost
 
         # Track active job
         if job.started_at is None:
@@ -835,6 +865,8 @@ class GpuWorkerProxy:
 
                 elif isinstance(msg, StatusSnapshot):
                     self._gpu_proxy._update(msg)
+                    # Fresh snapshot supersedes pending cost estimates
+                    self._pending_vram_cost = 0
                     # Merge measured model VRAM into global registry
                     if msg.fingerprint_vram:
                         _global_measured_vram.update(msg.fingerprint_vram)
