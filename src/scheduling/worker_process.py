@@ -686,16 +686,20 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
             _stage_w, _stage_h, _stage_steps, stage_duration)
 
     # Handle intermediate image for multi-stage pipelines
-    if output_image is not None and not oom and error is None:
-        if cmd.current_stage_index + 1 < cmd.pipeline_length:
-            # Store as input_image for next stage
-            job.input_image = output_image
-            if job.hires_input:
-                tw = job.hires_input.hires_width
-                th = job.hires_input.hires_height
-                if job.input_image.width != tw or job.input_image.height != th:
-                    from PIL import Image as _PILImage
-                    job.input_image = job.input_image.resize((tw, th), _PILImage.LANCZOS)
+    is_intermediate = (cmd.current_stage_index + 1 < cmd.pipeline_length)
+    if output_image is not None and not oom and error is None and is_intermediate:
+        # Store as input_image for next stage
+        job.input_image = output_image
+        if job.hires_input:
+            tw = job.hires_input.hires_width
+            th = job.hires_input.hires_height
+            if job.input_image.width != tw or job.input_image.height != th:
+                from PIL import Image as _PILImage
+                log.debug(f"  Resizing intermediate image {job.input_image.width}x"
+                          f"{job.input_image.height} → {tw}x{th} (hires target)")
+                job.input_image = job.input_image.resize((tw, th), _PILImage.LANCZOS)
+        # Use resized image for the StageResult so proxy gets the correct size
+        output_image = job.input_image
 
     # ── Build result ──────────────────────────────────────────────
     # Move all tensors to CPU for pickling (VRAM→SYSRAM transfer)

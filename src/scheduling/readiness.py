@@ -40,21 +40,39 @@ def _get_group_for_category(category: str) -> str:
     return "unknown"
 
 
-def _estimate_remaining_s(worker: GpuWorker) -> float:
-    """Estimate seconds until a GPU worker becomes idle.
+def _estimate_remaining_s(worker: GpuWorker, for_stage_type=None) -> float:
+    """Estimate seconds until a GPU worker can start a new stage.
 
-    For denoise stages with progress, extrapolates from step timing.
-    Uses gpu_stage_times for per-stage timing to avoid counting text-encode
-    time in the denoise rate estimate.  Falls back to job.started_at if no
-    stage timing is available.
+    With concurrent stage execution, only counts remaining time for
+    stages that CONFLICT with the requested stage type.  For example,
+    if a TE stage is running and we're scoring for UNet, the wait is 0
+    because TE and UNet run concurrently.
+
+    If for_stage_type is None, estimates time until fully idle.
     """
     from datetime import datetime
+    from scheduling.scheduler import get_session_key
+
+    # Determine which session keys conflict with the requested stage
+    conflicting_keys: set[str] | None = None
+    if for_stage_type is not None:
+        req_key = get_session_key(for_stage_type)
+        if req_key:
+            conflicting_keys = {req_key}
+            # Also the stage type itself conflicts (only 1 per type)
+        # If no session key, treat all as conflicting
 
     max_remaining = 0.0
     for job in worker.active_jobs:
         stage = job.current_stage
         if stage is None:
             continue
+
+        # Skip stages that don't conflict with the requested type
+        if conflicting_keys is not None and for_stage_type is not None:
+            active_key = get_session_key(stage.type)
+            if active_key not in conflicting_keys and stage.type != for_stage_type:
+                continue
 
         is_denoise = stage.type.value == "GpuDenoise"
         if is_denoise and job.denoise_step > 0 and job.denoise_total_steps > 0:

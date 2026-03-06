@@ -267,7 +267,9 @@ class GpuScheduler:
         # Score by *how soon* this GPU can actually start the job:
         # wait time + model load time.  Components covered by TRT are
         # treated as "loaded" — no PyTorch model loading needed.
-        wait_s = _estimate_remaining_s(worker) if not is_idle else 0.0
+        # With concurrent stages, only count wait time for CONFLICTING
+        # stage types (e.g., UNet doesn't wait for TE).
+        wait_s = _estimate_remaining_s(worker, for_stage_type=stage.type) if not is_idle else 0.0
 
         missing_vram = 0
         loaded_count = 0
