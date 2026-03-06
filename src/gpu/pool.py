@@ -297,14 +297,8 @@ class GpuInstance:
 
     @property
     def is_busy(self) -> bool:
-        return self._busy_count > 0
-
-    def try_acquire(self) -> bool:
         with self._busy_lock:
-            if self._busy_count > 0:
-                return False
-            self._busy_count += 1
-            return True
+            return self._busy_count > 0
 
     def acquire(self) -> None:
         """Increment busy ref count. Use for concurrent stage execution."""
@@ -457,10 +451,6 @@ class GpuInstance:
         with self._active_fp_lock:
             return {fp for fp, count in self._active_fp_counts.items() if count > 0}
 
-    # Legacy compatibility
-    def set_active_fingerprints(self, fingerprints: set[str]) -> None:
-        self.add_active_fingerprints(fingerprints)
-
     def _is_evictable(self, fp: str, protect: set[str] | None) -> bool:
         """Check if a cached model can be evicted."""
         if protect and fp in protect:
@@ -551,17 +541,21 @@ class GpuInstance:
                 return None
 
             model_entry = self._cache.pop(best_fp)
-            vram_mb = (model_entry.actual_vram if model_entry.actual_vram > 0
-                       else model_entry.estimated_vram) // (1024 * 1024)
-            idle_s = now - model_entry.last_used if model_entry.last_used > 0 else 0
-            if model_entry.evict_callback:
-                model_entry.evict_callback()
-            self._safe_to_cpu(model_entry)
-            torch.cuda.empty_cache()
-            log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
-                     f"(~{vram_mb}MB, {model_entry.use_count} uses, "
-                     f"idle {idle_s:.0f}s, score={best_score:.0f})")
-            return model_entry
+
+        # Release cache lock before calling callbacks and CPU transfer —
+        # these can be slow (model.to("cpu") releases GIL during CUDA→CPU
+        # transfer) and would block all other cache reads if held.
+        vram_mb = (model_entry.actual_vram if model_entry.actual_vram > 0
+                   else model_entry.estimated_vram) // (1024 * 1024)
+        idle_s = now - model_entry.last_used if model_entry.last_used > 0 else 0
+        if model_entry.evict_callback:
+            model_entry.evict_callback()
+        self._safe_to_cpu(model_entry)
+        torch.cuda.empty_cache()
+        log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
+                 f"(~{vram_mb}MB, {model_entry.use_count} uses, "
+                 f"idle {idle_s:.0f}s, score={best_score:.0f})")
+        return model_entry
 
     def ensure_free_vram(self, min_free_bytes: int, protect: set[str] | None = None) -> None:
         """Evict cached models until at least min_free_bytes VRAM is free."""

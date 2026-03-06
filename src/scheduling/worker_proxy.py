@@ -1028,18 +1028,32 @@ class GpuWorkerProxy:
         if not self.can_accept_work(next_stage):
             return False
 
-        # Don't fast-dispatch if there are higher-priority jobs waiting
-        # in the queue that could use this GPU instead
+        # Don't fast-dispatch if there are incompatible higher-priority jobs
+        # waiting that this GPU could serve instead.  Only check groups that
+        # genuinely compete for the same GPU session slot — compatible-with-all
+        # groups (bgremove, upscale) can coexist with anything, and concurrent
+        # SDXL stages (TE, UNet, VAE) don't block each other.
         from state import app_state
+        next_group = get_session_group(next_stage.type)
         queue = app_state.queue
         groups = queue.get_work_groups()
         for g in groups:
             if g.stage.is_cpu_only:
                 continue
-            # If a different work group has older/higher-priority jobs
-            # waiting, let the scheduler handle it — don't starve them
-            if g.oldest_age_seconds > 5.0 and g.stage.type != next_stage.type:
-                return False
+            if g.stage.type == next_stage.type:
+                continue
+            if g.oldest_age_seconds <= 5.0:
+                continue
+            waiting_group = get_session_group(g.stage.type)
+            # Compatible-with-all groups can coexist — not competing
+            if waiting_group in _COMPATIBLE_WITH_ALL or next_group in _COMPATIBLE_WITH_ALL:
+                continue
+            # Same session group (e.g. both sdxl) with different stage types
+            # can run concurrently — not competing
+            if waiting_group == next_group:
+                continue
+            # Genuinely incompatible group is starving — let scheduler handle it
+            return False
 
         # VRAM budget check
         if not self.check_vram_budget(next_stage, job):
