@@ -262,15 +262,25 @@ def gpu_worker_main(
     def _run_stage_in_thread(cmd: ExecuteStageCmd) -> None:
         """Execute a stage in the thread pool and send the result."""
         try:
-            result = _execute_stage_cmd(gpu, cmd, gpu_model_name, tracer)
+            result = _execute_stage_cmd(gpu, cmd, gpu_model_name, tracer, _worker_loop)
             result_queue.put(result)
         except Exception as ex:
             fatal = _is_cuda_fatal_local(ex)
-            log.log_exception(ex, f"GPU worker [{gpu_uuid}]: Stage failed")
-            result_queue.put(ProcessError(
-                error=f"{type(ex).__name__}: {ex}",
-                fatal=fatal,
-            ))
+            log.log_exception(ex, f"GPU worker [{gpu_uuid}]: Stage failed (unhandled)")
+            if fatal:
+                # Fatal CUDA error: mark GPU dead and fail everything
+                result_queue.put(ProcessError(
+                    error=f"{type(ex).__name__}: {ex}",
+                    fatal=True,
+                ))
+            else:
+                # Non-fatal: fail only this job via StageResult
+                result_queue.put(StageResult(
+                    job_id=cmd.job_id,
+                    success=False,
+                    error=f"{type(ex).__name__}: {ex}",
+                    current_stage_index=cmd.current_stage_index,
+                ))
         finally:
             # Send fresh status after every stage completion
             try:
@@ -419,7 +429,7 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
 
 # ── Stage execution ───────────────────────────────────────────────
 
-def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -> StageResult:
+def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer, loop) -> StageResult:
     """Execute a single pipeline stage. Returns StageResult with all outputs on CPU."""
     import torch
     from gpu import torch_ext
@@ -509,10 +519,10 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
         from utils.regional import RegionalPromptResult
         job.regional_info = RegionalPromptResult.from_dict(cmd.regional_info_data)
 
-    # Use the worker-level event loop (created once in gpu_worker_main).
+    # Use the worker-level event loop passed from gpu_worker_main.
     # Handlers use job._loop for WebSocket progress broadcasts.
-    import asyncio
-    loop = asyncio.get_event_loop()
+    # The loop is passed explicitly because ThreadPoolExecutor threads
+    # don't inherit the main thread's event loop (Python 3.12+ raises).
     job._loop = loop
     job.completion = loop.create_future()
 
@@ -556,8 +566,11 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
             if min_free > 0:
                 gpu.ensure_free_vram(min_free)
 
+            # Capture VRAM delta inside lock so concurrent threads
+            # don't pollute the measurement.
+            vram_delta = torch.cuda.memory_allocated(device) - vram_before
+
         load_duration = _time.monotonic() - load_start
-        vram_delta = torch.cuda.memory_allocated(device) - vram_before
 
         # Record model load event
         if load_duration > 0.01:
@@ -750,7 +763,7 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
             "SdxlGenerateLatents", "SdxlEncodeLatents", "SdxlHiresLatents") else None,
         encode_result_tensors=encode_tensors,
         regional_encode_tensors=regional_tensors,
-        latents=latents_cpu,
+        latents=latents_cpu if error is None else None,
         tokenize_result=job.tokenize_result,
         regional_tokenize_results=job.regional_tokenize_results,
         regional_base_tokenize=job.regional_base_tokenize,

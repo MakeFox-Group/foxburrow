@@ -580,9 +580,10 @@ class GpuInstance:
         evicted immediately — they stay cached and are only evicted when VRAM
         is needed (via ensure_free_vram/evict_lru, which prefers evicting
         non-current-group models first)."""
-        if self._current_group != group:
-            log.debug(f"  GPU [{self.uuid}]: Session group → {group}")
-        self._current_group = group
+        with self._cache_lock:
+            if self._current_group != group:
+                log.debug(f"  GPU [{self.uuid}]: Session group → {group}")
+            self._current_group = group
 
     @property
     def session_cache_count(self) -> int:
