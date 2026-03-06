@@ -442,6 +442,10 @@ def _execute_stage_cmd(gpu, cmd: ExecuteStageCmd, gpu_model_name: str, tracer) -
     job._loop = loop
     job.completion = loop.create_future()
 
+    # Pass TE fingerprints from proxy so non-TE stages can protect
+    # TE TRT engines from eviction during model loading.
+    job._te_fingerprints = cmd.te_fingerprints
+
     # ── Model loading ─────────────────────────────────────────────
     load_start = _time.monotonic()
 
@@ -706,12 +710,14 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str) -> No
     # loading completes (lines 676-678).
     all_required_fps = {c.fingerprint for c in stage.required_components}
 
-    # Also protect TE TRT engines from eviction during non-TE stages
+    # Also protect TE TRT engines from eviction during non-TE stages.
+    # Uses _te_fingerprints passed from the proxy (extracted from the
+    # job's pipeline TE stage) since each stage gets a fresh job object.
     te_protect_fps: set[str] = set()
     if stage.type != StageType.GPU_TEXT_ENCODE:
-        fps = getattr(job, '_stage_model_fps', {})
+        te_fps = getattr(job, '_te_fingerprints', None) or {}
         for te_key, comp_name in (("sdxl_te1", "te1"), ("sdxl_te2", "te2")):
-            base = fps.get(te_key)
+            base = te_fps.get(te_key)
             if base:
                 te_fp = f"{base}:{comp_name}_trt:default"
                 if gpu.is_component_loaded(te_fp):

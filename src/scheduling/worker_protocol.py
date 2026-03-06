@@ -68,6 +68,11 @@ class ExecuteStageCmd:
     orig_width: int | None = None
     orig_height: int | None = None
 
+    # TE fingerprints from the pipeline (category -> fingerprint).
+    # Populated by the proxy from the job's TE stage so non-TE stages
+    # can protect TE TRT engines from eviction during model loading.
+    te_fingerprints: dict[str, str] | None = None
+
 
 @dataclass
 class DrainCmd:

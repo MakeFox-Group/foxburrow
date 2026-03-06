@@ -15,6 +15,11 @@ from utils import fingerprint
 # Supported LoRA file extensions
 _LORA_EXTENSIONS = frozenset({".safetensors", ".pt", ".pth", ".ckpt", ".bin"})
 
+# Protects in-place mutations of the shared lora_index dict.
+# rescan_loras() is called from background threads (TUI, API, fs_watcher)
+# and does multi-step dict mutations that aren't atomic.
+_rescan_lock = threading.Lock()
+
 
 @dataclass
 class LoraEntry:
@@ -100,46 +105,47 @@ def rescan_loras(
     """
     fresh = discover_loras(loras_dir)
 
-    old_names = set(current_index.keys())
-    new_names = set(fresh.keys())
+    with _rescan_lock:
+        old_names = set(current_index.keys())
+        new_names = set(fresh.keys())
 
-    added = new_names - old_names
-    removed = old_names - new_names
-    updated = 0
+        added = new_names - old_names
+        removed = old_names - new_names
+        updated = 0
 
-    # Remove deleted entries and notify
-    for name in removed:
-        entry = current_index.pop(name)
-        streamer.fire_event("model_removed", {
-            "model_type": "lora", "name": name, "path": entry.path})
+        # Remove deleted entries and notify
+        for name in removed:
+            entry = current_index.pop(name)
+            streamer.fire_event("model_removed", {
+                "model_type": "lora", "name": name, "path": entry.path})
 
-    # Add new entries and notify
-    for name in added:
-        entry = fresh[name]
-        current_index[name] = entry
-        streamer.fire_event("model_discovered", {
-            "model_type": "lora", "name": name, "path": entry.path,
-            "fingerprint": entry.fingerprint,
-            "size_bytes": entry.size_bytes})
-
-    # Check for changes in existing entries (mtime or size changed)
-    for name in old_names & new_names:
-        old = current_index[name]
-        new = fresh[name]
-        if old.path != new.path or old.mtime != new.mtime or old.size_bytes != new.size_bytes:
-            current_index[name] = new
-            updated += 1
+        # Add new entries and notify
+        for name in added:
+            entry = fresh[name]
+            current_index[name] = entry
             streamer.fire_event("model_discovered", {
-                "model_type": "lora", "name": name, "path": new.path,
-                "fingerprint": new.fingerprint,
-                "size_bytes": new.size_bytes})
+                "model_type": "lora", "name": name, "path": entry.path,
+                "fingerprint": entry.fingerprint,
+                "size_bytes": entry.size_bytes})
 
-    unchanged = len(old_names & new_names) - updated
+        # Check for changes in existing entries (mtime or size changed)
+        for name in old_names & new_names:
+            old = current_index[name]
+            new = fresh[name]
+            if old.path != new.path or old.mtime != new.mtime or old.size_bytes != new.size_bytes:
+                current_index[name] = new
+                updated += 1
+                streamer.fire_event("model_discovered", {
+                    "model_type": "lora", "name": name, "path": new.path,
+                    "fingerprint": new.fingerprint,
+                    "size_bytes": new.size_bytes})
 
-    # Background-hash any new/updated entries missing fingerprints
-    unhashed = [e for e in current_index.values() if e.fingerprint is None]
-    if unhashed:
-        start_background_hashing(current_index)
+        unchanged = len(old_names & new_names) - updated
+
+        # Background-hash any new/updated entries missing fingerprints
+        unhashed = [e for e in current_index.values() if e.fingerprint is None]
+        if unhashed:
+            start_background_hashing(current_index)
 
     summary = {
         "added": len(added),

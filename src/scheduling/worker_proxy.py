@@ -563,6 +563,16 @@ class GpuWorkerProxy:
         if job.regional_info is not None:
             regional_info_data = job.regional_info.to_dict()
 
+        # Extract TE fingerprints from the job's pipeline so non-TE stages
+        # can protect TE TRT engines from eviction during model loading.
+        te_fps: dict[str, str] | None = None
+        if stage.type != StageType.GPU_TEXT_ENCODE:
+            for ps in job.pipeline:
+                if ps.type == StageType.GPU_TEXT_ENCODE:
+                    te_fps = {c.category: c.fingerprint
+                              for c in ps.required_components}
+                    break
+
         return ExecuteStageCmd(
             job_id=job.job_id,
             job_type_value=job.type.value,
@@ -591,6 +601,7 @@ class GpuWorkerProxy:
             vae_tile_height=job.vae_tile_height,
             orig_width=getattr(job, "orig_width", None),
             orig_height=getattr(job, "orig_height", None),
+            te_fingerprints=te_fps,
         )
 
     # ── TRT drain control ─────────────────────────────────────────
