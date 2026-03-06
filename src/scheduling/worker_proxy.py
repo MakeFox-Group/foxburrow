@@ -1066,7 +1066,7 @@ class GpuWorkerProxy:
         job.active_gpus = []
         self._active_jobs.pop(job.job_id, None)
 
-        self._active_count -= 1
+        self._active_count = max(0, self._active_count - 1)
         self._active_stage_counts[stage.type] = max(
             0, self._active_stage_counts[stage.type] - 1)
         key = get_session_key(stage.type)
