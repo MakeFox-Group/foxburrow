@@ -734,9 +734,10 @@ class GpuInstance:
                     if comp_type:
                         active_comp_types.add(comp_type)
 
+        known_comp_types = set(cat_to_comp.values())
         total = 0
         for comp_type, buf in pool_items:
-            if comp_type not in active_comp_types:
+            if comp_type not in active_comp_types and comp_type in known_comp_types:
                 total += buf.nbytes
         return total
 
