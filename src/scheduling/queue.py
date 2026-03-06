@@ -163,10 +163,12 @@ class AdmissionControl:
             if current >= cap_limit:
                 return f"No {cap} capacity: {current}/{cap_limit}"
 
-            # Global limit: total pipeline capacity across all GPUs
-            num_active = sum(1 for g in self._gpu_pool.gpus
-                             if not g.is_failed and not g._trt_building)
-            global_limit = num_active * max(self._PIPELINE_DEPTH.values(), default=1)
+            # Global limit: idle GPUs + 2 buffer slots to allow some pipelining
+            # without overwhelming the system with queued work
+            num_idle = sum(1 for g in self._gpu_pool.gpus
+                           if not g.is_busy and not g.is_failed
+                           and not g._trt_building)
+            global_limit = num_idle + 2
             if self._total >= global_limit:
                 return f"Server at capacity: {self._total}/{global_limit}"
 
@@ -194,10 +196,11 @@ class AdmissionControl:
 
     @property
     def max_concurrent(self) -> int:
-        """Current global limit: active_gpus × max pipeline depth."""
-        num_active = sum(1 for g in self._gpu_pool.gpus
-                         if not g.is_failed and not g._trt_building)
-        return num_active * max(self._PIPELINE_DEPTH.values(), default=1)
+        """Current global limit: idle GPUs + 2 buffer slots."""
+        num_idle = sum(1 for g in self._gpu_pool.gpus
+                       if not g.is_busy and not g.is_failed
+                       and not g._trt_building)
+        return num_idle + 2
 
     def snapshot(self) -> dict:
         """Return current admission state for the status endpoint."""
@@ -206,13 +209,13 @@ class AdmissionControl:
         # so we iterate once and derive everything from that single read.
         gpus = self._gpu_pool.gpus
         non_failed = [g for g in gpus if not g.is_failed and not g._trt_building]
-        num_active = len(non_failed)
+        num_idle = sum(1 for g in non_failed if not g.is_busy)
         cap_limits = {
             cap: sum(1 for g in non_failed if g.supports_capability(cap))
                  * self._PIPELINE_DEPTH.get(cap, 1)
             for cap in sorted(set(self._CAPABILITY_MAP.values()))
         }
-        max_conc = num_active * max(self._PIPELINE_DEPTH.values(), default=1)
+        max_conc = num_idle + 2
 
         with self._lock:
             return {
