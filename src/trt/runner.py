@@ -368,6 +368,117 @@ class TrtVaeRunner:
         log.debug(f"  TRT: VAE runner unloaded from {self.device}")
 
 
+class TrtVaeEncoderRunner:
+    """TensorRT inference runner for the SDXL VAE encoder.
+
+    Same pattern as TrtVaeRunner but for VAE encode:
+    Input: image [1, 3, img_h, img_w] (float32)
+    Output: latents [1, 4, lat_h, lat_w] (float32, already scaled by VAE_SCALE_FACTOR)
+    """
+
+    def __init__(self, engine_path: str, device: torch.device,
+                 shared_memory_getter: Callable[[int], torch.Tensor] | None = None):
+        import tensorrt as trt
+
+        self.device = device
+        self.engine_path = engine_path
+        self._stream = torch.cuda.Stream(device=device)
+        self._shared_memory_getter = shared_memory_getter
+
+        self._trt_logger = _get_trt_logger()
+        self._runtime = trt.Runtime(self._trt_logger)
+
+        with open(engine_path, "rb") as f:
+            engine_bytes = f.read()
+
+        self._engine = self._runtime.deserialize_cuda_engine(engine_bytes)
+        if self._engine is None:
+            raise RuntimeError(f"Failed to deserialize TRT engine: {engine_path}")
+
+        self._device_memory_size = self._engine.device_memory_size
+
+        if shared_memory_getter is not None:
+            shared_memory_getter(self._device_memory_size)
+            self._context = self._engine.create_execution_context_without_device_memory()
+        else:
+            self._context = self._engine.create_execution_context()
+
+        if self._context is None:
+            raise RuntimeError(f"Failed to create TRT execution context: {engine_path}")
+
+        self._output_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype("latents"))
+
+        self._output_buffer: torch.Tensor | None = None
+        self._engine_size = os.path.getsize(engine_path)
+
+        engine_mb = self._engine_size / (1024 * 1024)
+        dev_mb = self._device_memory_size / (1024 * 1024)
+        shared_tag = " [shared]" if self._shared_memory_getter is not None else ""
+        log.debug(f"  TRT: VAE encoder runner loaded ({engine_mb:.0f}MB on disk, "
+                  f"{dev_mb:.0f}MB device mem{shared_tag}, "
+                  f"output={self._output_dtype}) on {device}")
+
+    def run(self, image: torch.Tensor) -> torch.Tensor:
+        """Run VAE encoder inference through TRT engine.
+
+        Input must be a contiguous float32 CUDA tensor on self.device.
+        Returns the encoded latent tensor [1, 4, lat_h, lat_w] (already scaled).
+        """
+        ctx = self._context
+        stream_ptr = self._stream.cuda_stream
+
+        if self._shared_memory_getter is not None:
+            buf = self._shared_memory_getter(self._device_memory_size)
+            ctx.device_memory = buf.data_ptr()
+
+        image = image.contiguous()
+        if image.data_ptr() % 8 != 0:
+            image = image.clone()
+
+        ctx.set_input_shape("image", tuple(image.shape))
+        ctx.set_tensor_address("image", image.data_ptr())
+
+        output_shape = ctx.get_tensor_shape("latents")
+        if (self._output_buffer is None
+                or list(self._output_buffer.shape) != list(output_shape)
+                or self._output_buffer.device != self.device):
+            self._output_buffer = torch.empty(
+                tuple(output_shape), dtype=self._output_dtype, device=self.device)
+
+        ctx.set_tensor_address("latents", self._output_buffer.data_ptr())
+
+        ok = ctx.execute_async_v3(stream_ptr)
+        if not ok:
+            raise RuntimeError("TRT VAE encoder execute_async_v3 failed")
+
+        self._stream.synchronize()
+        return self._output_buffer.clone()
+
+    @property
+    def vram_usage(self) -> int:
+        buf_bytes = 0
+        if self._output_buffer is not None:
+            buf_bytes = self._output_buffer.nelement() * self._output_buffer.element_size()
+        if self._shared_memory_getter is not None:
+            return self._engine_size + buf_bytes
+        return self._engine_size + self._device_memory_size + buf_bytes
+
+    def unload(self) -> None:
+        if self._context is not None:
+            del self._context
+            self._context = None
+        if self._engine is not None:
+            del self._engine
+            self._engine = None
+        self._runtime = None
+        self._trt_logger = None
+        self._output_buffer = None
+        self._stream = None
+        self._shared_memory_getter = None
+        torch.cuda.empty_cache()
+        log.debug(f"  TRT: VAE encoder runner unloaded from {self.device}")
+
+
 class TrtTe1Runner:
     """TensorRT inference runner for the SDXL CLIP-L text encoder (TE1).
 

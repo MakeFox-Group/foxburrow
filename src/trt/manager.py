@@ -39,6 +39,7 @@ from trt.exporter import (
     export_te2_onnx,
     export_unet_onnx,
     export_vae_onnx,
+    export_vae_enc_onnx,
 )
 
 if TYPE_CHECKING:
@@ -245,7 +246,7 @@ class TrtBuildManager:
 
             all_exist = True
             for arch_key in arch_keys:
-                for component_type in ("te1", "te2", "unet", "vae"):
+                for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
                     if not all_engines_exist(self._cache_dir, model_hash,
                                              component_type, arch_key,
                                              dynamic_only=self._trt_config.dynamic_only):
@@ -295,7 +296,7 @@ class TrtBuildManager:
         # UNet uses external data (>2GB protobuf) that can be incomplete from
         # interrupted exports — validate before skipping.
         needs_export = False
-        for ct in ("te1", "te2", "unet", "vae"):
+        for ct in ("te1", "te2", "unet", "vae", "vae_enc"):
             onnx_path = get_onnx_path(self._cache_dir, request.model_hash, ct)
             if not os.path.isfile(onnx_path):
                 needs_export = True
@@ -344,7 +345,7 @@ class TrtBuildManager:
         dispatched = False
         for arch_key in self._arch_workers:
             needs_build = False
-            for component_type in ("te1", "te2", "unet", "vae"):
+            for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
                 onnx = get_onnx_path(self._cache_dir, request.model_hash, component_type)
                 if not os.path.isfile(onnx):
                     continue
@@ -491,7 +492,7 @@ class TrtBuildManager:
 
                 # Skip if another GPU already built these engines
                 needs_build = False
-                for component_type in ("te1", "te2", "unet", "vae"):
+                for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
                     onnx = get_onnx_path(self._cache_dir, request.model_hash,
                                          component_type)
                     if not os.path.isfile(onnx):
@@ -530,11 +531,13 @@ class TrtBuildManager:
                         built_te2 = results.get("te2", [])
                         built_unet = results.get("unet", [])
                         built_vae = results.get("vae", [])
+                        built_vae_enc = results.get("vae_enc", [])
                         log.info(f"  TRT: [{arch_key}] {short_hash}: "
                                  f"TE1 [{', '.join(built_te1)}] + "
                                  f"TE2 [{', '.join(built_te2)}] + "
                                  f"UNet [{', '.join(built_unet)}] + "
-                                 f"VAE [{', '.join(built_vae)}]")
+                                 f"VAE [{', '.join(built_vae)}] + "
+                                 f"VAE-Enc [{', '.join(built_vae_enc)}]")
                         self._check_model_ready(request.model_hash)
                     else:
                         log.error(f"  TRT: [{arch_key}] Engine build failed for "
@@ -561,7 +564,7 @@ class TrtBuildManager:
             return
 
         for arch_key in self._arch_workers:
-            for component_type in ("te1", "te2", "unet", "vae"):
+            for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
                 onnx = get_onnx_path(self._cache_dir, model_hash, component_type)
                 if not os.path.isfile(onnx):
                     # If no ONNX exists, engines can't exist either — not ready
@@ -589,6 +592,7 @@ class TrtBuildManager:
         te2_onnx = get_onnx_path(self._cache_dir, request.model_hash, "te2")
         unet_onnx = get_onnx_path(self._cache_dir, request.model_hash, "unet")
         vae_onnx = get_onnx_path(self._cache_dir, request.model_hash, "vae")
+        vae_enc_onnx = get_onnx_path(self._cache_dir, request.model_hash, "vae_enc")
 
         log.info(f"  TRT: Exporting ONNX for {short_hash}...")
 
@@ -633,14 +637,23 @@ class TrtBuildManager:
             except Exception as ex:
                 log.log_exception(ex, f"TRT: UNet ONNX export failed for {short_hash}")
 
-        # Export VAE
+        # Export VAE decoder
         if not os.path.isfile(vae_onnx):
             try:
                 vae = load_component("sdxl_vae", model_dir, torch.device("cpu"))
                 export_vae_onnx(vae, vae_onnx)
                 del vae
             except Exception as ex:
-                log.log_exception(ex, f"TRT: VAE ONNX export failed for {short_hash}")
+                log.log_exception(ex, f"TRT: VAE decoder ONNX export failed for {short_hash}")
+
+        # Export VAE encoder
+        if not os.path.isfile(vae_enc_onnx):
+            try:
+                vae = load_component("sdxl_vae", model_dir, torch.device("cpu"))
+                export_vae_enc_onnx(vae, vae_enc_onnx)
+                del vae
+            except Exception as ex:
+                log.log_exception(ex, f"TRT: VAE encoder ONNX export failed for {short_hash}")
 
         log.info(f"  TRT: ONNX export complete for {short_hash}")
 

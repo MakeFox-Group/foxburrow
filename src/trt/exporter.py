@@ -167,6 +167,21 @@ class _VaeDecoderOnnxWrapper(nn.Module):
         return self.vae.decode(latents).sample
 
 
+class _VaeEncoderOnnxWrapper(nn.Module):
+    """Wrapper for VAE encoder-only export.
+
+    Bakes in VAE_SCALE_FACTOR so TRT output = scaled latent mean.
+    """
+
+    def __init__(self, vae: nn.Module, scale_factor: float = 0.13025):
+        super().__init__()
+        self.vae = vae
+        self.scale_factor = scale_factor
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(image).latent_dist.mean * self.scale_factor
+
+
 class _Te1OnnxWrapper(nn.Module):
     """Wrapper for CLIP-L text encoder (TE1) ONNX export.
 
@@ -438,4 +453,58 @@ def export_vae_onnx(
         )
 
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    log.info(f"  TRT: VAE ONNX exported ({file_size_mb:.0f}MB): {output_path}")
+    log.info(f"  TRT: VAE decoder ONNX exported ({file_size_mb:.0f}MB): {output_path}")
+
+
+def export_vae_enc_onnx(
+    vae: nn.Module,
+    output_path: str,
+    opset: int = 17,
+) -> None:
+    """Export an SDXL VAE encoder to ONNX in float32.
+
+    VAE must remain float32 — FP16 causes NaN overflow (same as decoder).
+    Bakes in VAE_SCALE_FACTOR (0.13025) so TRT output matches
+    ``vae.encode(x).latent_dist.mean * VAE_SCALE_FACTOR`` exactly.
+
+    Args:
+        vae: A loaded AutoencoderKL (can be on CPU or GPU).
+        output_path: Where to write the .onnx file.
+        opset: ONNX opset version.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    device = torch.device("cpu")
+    vae_cpu = vae.to(device, dtype=torch.float32)
+    vae_cpu.eval()
+
+    wrapper = _VaeEncoderOnnxWrapper(vae_cpu)
+
+    # Dummy input: batch=1, 3 RGB channels, mid-range pixel-space size
+    dummy_image = torch.randn(1, 3, 768, 768, dtype=torch.float32, device=device)
+
+    input_names = ["image"]
+    output_names = ["latents"]
+
+    dynamic_axes = {
+        "image": {2: "image_h", 3: "image_w"},
+        "latents": {2: "latent_h", 3: "latent_w"},
+    }
+
+    log.info(f"  TRT: Exporting VAE encoder to ONNX (opset {opset})...")
+
+    with _onnx_lock, torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (dummy_image,),
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    log.info(f"  TRT: VAE encoder ONNX exported ({file_size_mb:.0f}MB): {output_path}")

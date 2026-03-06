@@ -592,6 +592,7 @@ class GpuInstance:
         comp_to_cat = {
             "unet": "sdxl_unet_trt",
             "vae": "sdxl_vae_trt",
+            "vae_enc": "sdxl_vae_enc_trt",
             "te1": "sdxl_te1_trt",
             "te2": "sdxl_te2_trt",
         }
@@ -706,6 +707,7 @@ class GpuInstance:
         cat_to_comp = {
             "sdxl_unet_trt": "unet",
             "sdxl_vae_trt": "vae",
+            "sdxl_vae_enc_trt": "vae_enc",
             "sdxl_te1_trt": "te1",
             "sdxl_te2_trt": "te2",
         }

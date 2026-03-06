@@ -91,8 +91,12 @@ def _optimal_tile_for_axis(dim: int, min_tile: int, max_tile: int) -> int | None
 
 
 def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
-                        job: "InferenceJob") -> tuple[int, int]:
+                        job: "InferenceJob",
+                        component_type: str = "vae") -> tuple[int, int]:
     """Pick VAE tile size, TRT-aware with smart engine selection.
+
+    Args:
+        component_type: "vae" for decoder, "vae_enc" for encoder.
 
     Priority (respects dynamic_only — skips all static engines when set):
     1. Static TRT engine already cached on GPU (zero load cost)
@@ -124,28 +128,28 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
         for ew, eh in VAE_STATIC_RESOLUTIONS:
             if ew > img_w or eh > img_h:
                 continue
-            trt_fp = f"{fp}:vae_trt:{ew}x{eh}"
+            trt_fp = f"{fp}:{component_type}_trt:{ew}x{eh}"
             if gpu.is_component_loaded(trt_fp):
                 cached_static.append((ew, eh))
             else:
-                engine_path = get_engine_path(cache_dir, fp, "vae", arch_key, ew, eh)
+                engine_path = get_engine_path(cache_dir, fp, component_type, arch_key, ew, eh)
                 if os.path.isfile(engine_path):
                     disk_static.append((ew, eh))
 
         if cached_static:
             best = max(cached_static, key=lambda r: r[0] * r[1])
             log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
-                      f"{best[0]}x{best[1]} (cached static TRT)")
+                      f"{best[0]}x{best[1]} (cached static TRT {component_type})")
             return best
 
         if disk_static:
             best = max(disk_static, key=lambda r: r[0] * r[1])
             log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
-                      f"{best[0]}x{best[1]} (on-disk static TRT)")
+                      f"{best[0]}x{best[1]} (on-disk static TRT {component_type})")
             return best
 
     # --- Phase 2: Dynamic engines ---
-    dynamic_engines = discover_dynamic_engines(cache_dir, fp, "vae", arch_key)
+    dynamic_engines = discover_dynamic_engines(cache_dir, fp, component_type, arch_key)
 
     best_cached_tile: tuple[int, int] | None = None
     best_cached_tiles = float('inf')
@@ -171,7 +175,7 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
         n_h = max(1, math.ceil(max(1, img_h - ovl) / stride_h))
         total = n_w * n_h
 
-        trt_fp = f"{fp}:vae_trt:{eng['label']}"
+        trt_fp = f"{fp}:{component_type}_trt:{eng['label']}"
         is_cached = gpu.is_component_loaded(trt_fp)
 
         if is_cached and total < best_cached_tiles:
@@ -1668,39 +1672,58 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     """Stage: GPU VAE encode. Encodes job.input_image → job.latents.
 
-    Uses the same TRT-aware tile selection as vae_decode so both directions
-    choose tiles consistently based on available engines, not GPU VRAM.
+    TRT-first pattern mirrors vae_decode():
+    1. Try TRT encoder for full image
+    2. If not, check tiling threshold with TRT-aware tile selection
+    3. Fall back to PyTorch if no TRT coverage
     """
     if job.input_image is None:
         raise RuntimeError("input_image is required for VAE encode.")
 
-    vae = _get_cached_model_optional(gpu, "sdxl_vae", job)
-    if vae is None:
-        log.warning(f"  SDXL: VAE not cached for encode — loading PyTorch fallback")
-        inp = job.sdxl_input
-        vae = load_component("sdxl_vae", inp.model_dir if inp else None, gpu.device)
-        fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae", "sdxl_vae_fallback")
-        gpu.cache_model(fp, "sdxl_vae", vae, estimated_vram=400 * 1024 * 1024,
-                        source="PyTorch-fallback")
     device = gpu.device
     img_w, img_h = job.input_image.size
+
+    # Try TRT encoder for full image first
+    trt_enc = _get_trt_vae_enc_runner(gpu, job, img_w, img_h)
 
     # Handle explicit user overrides first
     has_user_override = job.vae_tile_width > 0 and job.vae_tile_height > 0
     if has_user_override:
         tile_w = (job.vae_tile_width // 8) * 8
         tile_h = (job.vae_tile_height // 8) * 8
+        if trt_enc is None or img_w > tile_w or img_h > tile_h:
+            # User override forces tiling — try TRT for tile size
+            trt_enc = _get_trt_vae_enc_runner(gpu, job, tile_w, tile_h)
+    elif trt_enc is not None:
+        # TRT covers full image — no tiling needed
+        tile_w, tile_h = img_w, img_h
     elif img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
-        # Use the same TRT-aware tile selection as decode
-        tile_w, tile_h = _pick_vae_tile_size(img_w, img_h, gpu, job)
+        # Use TRT-aware tile selection for encoder
+        tile_w, tile_h = _pick_vae_tile_size(img_w, img_h, gpu, job, component_type="vae_enc")
+        trt_enc = _get_trt_vae_enc_runner(gpu, job, tile_w, tile_h)
     else:
         tile_w, tile_h = img_w, img_h
 
+    # Only load PyTorch VAE if TRT is not available
+    vae = None
+    if trt_enc is None:
+        vae = _get_cached_model_optional(gpu, "sdxl_vae", job)
+        if vae is None:
+            log.warning(f"  SDXL: VAE not cached for encode — loading PyTorch fallback")
+            inp = job.sdxl_input
+            vae = load_component("sdxl_vae", inp.model_dir if inp else None, device)
+            fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae", "sdxl_vae_fallback")
+            gpu.cache_model(fp, "sdxl_vae", vae, estimated_vram=400 * 1024 * 1024,
+                            source="PyTorch-fallback")
+
     if img_w > tile_w or img_h > tile_h:
-        log.debug(f"  SDXL: Tiled VAE encode {img_w}x{img_h} → tile {tile_w}x{tile_h}")
-    latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
+        log.debug(f"  SDXL: Tiled VAE encode {img_w}x{img_h} → tile {tile_w}x{tile_h}"
+                  f" ({'TRT' if trt_enc else 'PyTorch'})")
+    latents = _vae_encode(job.input_image, vae, device, tile_w=tile_w, tile_h=tile_h,
+                          job=job, trt_runner=trt_enc)
     job.latents = latents
-    log.debug(f"  SDXL: VAE encode complete. shape={list(latents.shape)}")
+    log.debug(f"  SDXL: VAE encode complete. shape={list(latents.shape)}"
+              f" ({'TRT' if trt_enc else 'PyTorch'})")
 
 
 def latent_upscale(job: InferenceJob) -> None:
@@ -1804,11 +1827,22 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
         log.debug(f"  HiresTransform: Resize → {target_w}x{target_h} "
                  f"({(time.monotonic()-t0)*1000:.0f}ms)")
 
-    tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
-    tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
-    encoded = _vae_encode(upscaled, vae, device, tile_w=tile_w, tile_h=tile_h, job=job)
+    # Try TRT encoder for the encode step
+    trt_enc = _get_trt_vae_enc_runner(gpu, job, target_w, target_h)
+    enc_tile_w = job.vae_tile_width if job.vae_tile_width > 0 else 0
+    enc_tile_h = job.vae_tile_height if job.vae_tile_height > 0 else 0
+    if trt_enc is None and (target_w >= VAE_TILE_THRESHOLD or target_h >= VAE_TILE_THRESHOLD):
+        enc_tile_w, enc_tile_h = _pick_vae_tile_size(target_w, target_h, gpu, job,
+                                                      component_type="vae_enc")
+        trt_enc = _get_trt_vae_enc_runner(gpu, job, enc_tile_w, enc_tile_h)
+
+    # Only load PyTorch VAE for encode if TRT is not available and not already loaded
+    enc_vae = None if trt_enc is not None else vae
+    encoded = _vae_encode(upscaled, enc_vae, device, tile_w=enc_tile_w, tile_h=enc_tile_h,
+                          job=job, trt_runner=trt_enc)
     log.debug(f"  HiresTransform: VAE encode → {list(encoded.shape)} "
-             f"({(time.monotonic()-t0)*1000:.0f}ms)")
+             f"({'TRT' if trt_enc else 'PyTorch'}, "
+             f"{(time.monotonic()-t0)*1000:.0f}ms)")
     upscaled.close()
 
     job.latents = encoded
@@ -2052,12 +2086,17 @@ def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr, "RGB")
 
 
-def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
+def _vae_encode(image: Image.Image, vae: "AutoencoderKL | None", device: torch.device,
                 tile_w: int = 0, tile_h: int = 0,
-                job: InferenceJob | None = None) -> torch.Tensor:
+                job: InferenceJob | None = None,
+                trt_runner=None) -> torch.Tensor:
     """VAE-encode a PIL image to latent space. Returns [1,4,H/8,W/8].
     Forces tiled encoding when any dimension >= VAE_TILE_THRESHOLD, with
-    non-square tiles auto-computed per axis for optimal coverage."""
+    non-square tiles auto-computed per axis for optimal coverage.
+
+    When trt_runner is provided, uses TRT for encoding (output is already
+    scaled by VAE_SCALE_FACTOR). Either vae or trt_runner must be provided.
+    """
     img_w, img_h = image.size
 
     if tile_w > 0 and tile_h > 0:
@@ -2069,25 +2108,33 @@ def _vae_encode(image: Image.Image, vae: AutoencoderKL, device: torch.device,
         eff_w, eff_h = img_w, img_h
 
     if img_w > eff_w or img_h > eff_h:
-        return _vae_encode_tiled(image, vae, device, eff_w, eff_h, job=job)
+        return _vae_encode_tiled(image, vae, device, eff_w, eff_h, job=job,
+                                 trt_runner=trt_runner)
 
     arr = np.array(image.convert("RGB"), dtype=np.float32)
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
 
-    with torch.no_grad():
-        dist = vae.encode(t).latent_dist
-        latents = dist.mean * VAE_SCALE_FACTOR
+    if trt_runner is not None:
+        t = (t / 127.5 - 1.0).to(dtype=torch.float32, device=device)
+        with torch.no_grad():
+            latents = trt_runner.run(t)  # already scaled by VAE_SCALE_FACTOR
+    else:
+        t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
+        with torch.no_grad():
+            dist = vae.encode(t).latent_dist
+            latents = dist.mean * VAE_SCALE_FACTOR
 
     return latents
 
 
-def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
+def _vae_encode_tiled(image: Image.Image, vae: "AutoencoderKL | None",
                       device: torch.device,
                       tile_w_px: int, tile_h_px: int,
-                      *, job: InferenceJob | None = None) -> torch.Tensor:
+                      *, job: InferenceJob | None = None,
+                      trt_runner=None) -> torch.Tensor:
     """Tiled VAE encode for large images. Supports non-square tiles.
-    Tiles in pixel space, blends in latent space with linear feathering."""
+    Tiles in pixel space, blends in latent space with linear feathering.
+    Either vae or trt_runner must be provided."""
     import time as _time
     from profiling.tracer import get_current_tracer
     _tracer = get_current_tracer()
@@ -2136,11 +2183,16 @@ def _vae_encode_tiled(image: Image.Image, vae: AutoencoderKL,
 
             tile_np = arr[py:py2, px:px2]
             t = torch.from_numpy(tile_np).permute(2, 0, 1).unsqueeze(0)
-            t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
 
             _tile_start = _time.monotonic()
-            with torch.no_grad():
-                tile_lat_t = vae.encode(t).latent_dist.mean * VAE_SCALE_FACTOR
+            if trt_runner is not None:
+                t = (t / 127.5 - 1.0).to(dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    tile_lat_t = trt_runner.run(t)  # already scaled
+            else:
+                t = (t / 127.5 - 1.0).to(dtype=vae.dtype, device=device)
+                with torch.no_grad():
+                    tile_lat_t = vae.encode(t).latent_dist.mean * VAE_SCALE_FACTOR
             _tile_dur = _time.monotonic() - _tile_start
 
             tile_lat_np = tile_lat_t.squeeze(0).cpu().float().numpy()  # [4, th, tw]
@@ -2821,6 +2873,85 @@ def _get_trt_vae_runner(gpu: GpuInstance, job: InferenceJob,
             log.warning(f"  TRT: Failed to load VAE {label} engine for {width}x{height}: {ex}")
     else:
         log.debug(f"  TRT: No dynamic VAE engine covers {width}x{height}")
+
+    return None
+
+
+def _get_trt_vae_enc_runner(gpu: "GpuInstance", job: InferenceJob,
+                             width: int, height: int):
+    """Try to get a TRT VAE encoder runner for the given resolution.
+
+    Mirrors _get_trt_vae_runner() but for the encoder component type.
+    Uses the same VAE model fingerprint (same weights, different ONNX graph).
+    Returns a TrtVaeEncoderRunner or None.
+    """
+    from trt.builder import get_arch_key, get_engine_path
+    from trt.runner import TrtVaeEncoderRunner
+
+    fp = getattr(job, '_stage_model_fps', {}).get("sdxl_vae")
+    if not fp:
+        return None
+
+    arch_key = get_arch_key(gpu.device_id)
+
+    from state import app_state
+    cache_dir = app_state.config.server.tensorrt_cache
+    dynamic_only = app_state.config.tensorrt.dynamic_only
+
+    # 1. Try static engine for exact resolution match (skip if dynamic_only)
+    if not dynamic_only:
+        static_path = get_engine_path(cache_dir, fp, "vae_enc", arch_key, width, height)
+        if os.path.isfile(static_path):
+            trt_fp = f"{fp}:vae_enc_trt:{width}x{height}"
+            cached = gpu.get_cached_model(trt_fp)
+            if cached is not None:
+                log.debug(f"  TRT: Using cached VAE encoder static runner {width}x{height}")
+                return cached.model
+            try:
+                engine_size = os.path.getsize(static_path)
+                gpu.ensure_free_vram(engine_size, protect={trt_fp})
+                enc_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae_enc", min_bytes)
+                runner = TrtVaeEncoderRunner(static_path, gpu.device, shared_memory_getter=enc_getter)
+                gpu.cache_model(
+                    trt_fp, "sdxl_vae_enc_trt", runner,
+                    estimated_vram=runner.vram_usage,
+                    source=f"TRT-VAE-Enc-static-{width}x{height}",
+                    evict_callback=runner.unload,
+                )
+                log.debug(f"  TRT: Loaded VAE encoder static runner {width}x{height} on GPU [{gpu.uuid}]")
+                return runner
+            except Exception as ex:
+                log.warning(f"  TRT: Failed to load VAE encoder static engine {width}x{height}: {ex}")
+
+    # 2. Fall back to best-fitting dynamic engine
+    from trt.builder import find_best_dynamic_engine
+
+    dyn = find_best_dynamic_engine(cache_dir, fp, "vae_enc", arch_key, width, height)
+    if dyn is not None:
+        label = dyn["label"]
+        dynamic_path = dyn["path"]
+        trt_fp = f"{fp}:vae_enc_trt:{label}"
+        cached = gpu.get_cached_model(trt_fp)
+        if cached is not None:
+            log.debug(f"  TRT: Using cached VAE encoder {label} runner for {width}x{height}")
+            return cached.model
+        try:
+            engine_size = os.path.getsize(dynamic_path)
+            gpu.ensure_free_vram(engine_size, protect={trt_fp})
+            enc_getter = lambda min_bytes: gpu.get_trt_shared_memory("vae_enc", min_bytes)
+            runner = TrtVaeEncoderRunner(dynamic_path, gpu.device, shared_memory_getter=enc_getter)
+            gpu.cache_model(
+                trt_fp, "sdxl_vae_enc_trt", runner,
+                estimated_vram=runner.vram_usage,
+                source=f"TRT-VAE-Enc-{label}",
+                evict_callback=runner.unload,
+            )
+            log.debug(f"  TRT: Loaded VAE encoder {label} runner for {width}x{height} on GPU [{gpu.uuid}]")
+            return runner
+        except Exception as ex:
+            log.warning(f"  TRT: Failed to load VAE encoder {label} engine for {width}x{height}: {ex}")
+    else:
+        log.debug(f"  TRT: No dynamic VAE encoder engine covers {width}x{height}")
 
     return None
 

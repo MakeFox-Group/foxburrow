@@ -92,7 +92,8 @@ DYNAMIC_PROFILES: list[dict] = [
 # Which dynamic profiles to build per component type.
 _COMPONENT_DYNAMIC_PROFILES: dict[str, list[dict]] = {
     "unet": DYNAMIC_PROFILES,
-    "vae": [DYNAMIC_PROFILES[0]],  # VAE: standard only (hires uses tiled decode)
+    "vae": [DYNAMIC_PROFILES[0]],  # VAE decoder: standard only (hires uses tiled decode)
+    "vae_enc": [DYNAMIC_PROFILES[0]],  # VAE encoder: standard only
 }
 
 # Backward compat alias
@@ -353,6 +354,9 @@ def build_static_engine(
             profile.set_shape("time_ids", (2, 6), (2, 6), (2, 6))
         elif component_type == "vae":
             profile.set_shape("latents", (1, 4, lat_h, lat_w), (1, 4, lat_h, lat_w), (1, 4, lat_h, lat_w))
+        elif component_type == "vae_enc":
+            # Encoder input is pixel-space (3 channels), not latent-space
+            profile.set_shape("image", (1, 3, height, width), (1, 3, height, width), (1, 3, height, width))
         else:
             log.error(f"  TRT: Unknown component type: {component_type}")
             return False
@@ -447,6 +451,13 @@ def build_dynamic_engine(
                               (1, 4, min_lat_h, min_lat_w),
                               (1, 4, opt_lat_h, opt_lat_w),
                               (1, 4, max_lat_h, max_lat_w))
+        elif component_type == "vae_enc":
+            # Encoder input is pixel-space: full pixel dimensions, not latent
+            # min_res etc. are (width, height)
+            profile.set_shape("image",
+                              (1, 3, min_res[1], min_res[0]),
+                              (1, 3, opt_res[1], opt_res[0]),
+                              (1, 3, max_res[1], max_res[0]))
         else:
             log.error(f"  TRT: Unknown component type: {component_type}")
             return False
@@ -687,7 +698,7 @@ def find_best_dynamic_engine(
 
 def _get_static_resolutions(component_type: str) -> list[tuple[int, int]]:
     """Return the static resolution list for a component type."""
-    if component_type == "vae":
+    if component_type in ("vae", "vae_enc"):
         return VAE_STATIC_RESOLUTIONS
     return UNET_STATIC_RESOLUTIONS
 
@@ -780,14 +791,14 @@ def build_all_engines(
     Returns:
         Dict mapping component_type -> list of successfully built engine labels.
     """
-    results: dict[str, list[str]] = {"unet": [], "vae": [], "te1": [], "te2": []}
+    results: dict[str, list[str]] = {"unet": [], "vae": [], "vae_enc": [], "te1": [], "te2": []}
 
     # Set CUDA device for the entire build pipeline — TRT's Builder and
     # OnnxParser bind to the current CUDA context at creation time.
     # Without this, parallel builds on different GPUs all target device 0,
     # causing memory contention and corrupt parser state.
     with torch.cuda.device(device_id):
-        for component_type in ("te1", "te2", "unet", "vae"):
+        for component_type in ("te1", "te2", "unet", "vae", "vae_enc"):
             onnx_path = get_onnx_path(cache_dir, model_hash, component_type)
             if not os.path.isfile(onnx_path):
                 log.error(f"  TRT: ONNX not found for {component_type}: {onnx_path}")

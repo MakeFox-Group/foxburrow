@@ -936,8 +936,10 @@ def _trt_covers_component(gpu, stage, job, component) -> bool:
         if inp.loras:
             return False
         trt_component = "unet"
-    elif component.category in ("sdxl_vae", "sdxl_vae_enc"):
+    elif component.category == "sdxl_vae":
         trt_component = "vae"
+    elif component.category == "sdxl_vae_enc":
+        trt_component = "vae_enc"
     elif component.category == "sdxl_te1":
         trt_component = "te1"
     elif component.category == "sdxl_te2":
@@ -1011,8 +1013,11 @@ def _preload_trt_engine(gpu, stage, job, component) -> set[str]:
     try:
         if component.category == "sdxl_unet":
             _get_trt_unet_runner(gpu, job, width, height)
-        elif component.category in ("sdxl_vae", "sdxl_vae_enc"):
+        elif component.category == "sdxl_vae":
             _get_trt_vae_runner(gpu, job, width, height)
+        elif component.category == "sdxl_vae_enc":
+            from handlers.sdxl import _get_trt_vae_enc_runner
+            _get_trt_vae_enc_runner(gpu, job, width, height)
         elif component.category == "sdxl_te1":
             _get_trt_te1_runner(gpu, job)
         elif component.category == "sdxl_te2":
@@ -1025,7 +1030,7 @@ def _preload_trt_engine(gpu, stage, job, component) -> set[str]:
                 "sdxl_vae_enc": "sdxl_vae", "sdxl_te1": "sdxl_te1",
                 "sdxl_te2": "sdxl_te2"}
     _trt_comps = {"sdxl_unet": "unet", "sdxl_vae": "vae",
-                  "sdxl_vae_enc": "vae", "sdxl_te1": "te1",
+                  "sdxl_vae_enc": "vae_enc", "sdxl_te1": "te1",
                   "sdxl_te2": "te2"}
     fp_key = _fp_keys.get(component.category)
     trt_comp = _trt_comps.get(component.category)
