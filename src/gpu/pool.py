@@ -9,7 +9,7 @@ import ctypes
 import itertools
 import threading
 import time as _time
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -225,21 +225,19 @@ class GpuInstance:
         self.nvml_handle = nvml_device.handle
         self.total_memory = nvml_device.total_memory
 
-        # Busy semaphore for status reporting
+        # Busy flag for status reporting (one job at a time per GPU)
         self._busy_lock = threading.Lock()
-        self._busy_count = 0
+        self._busy = False
 
         # Model cache: fingerprint -> CachedModel (LRU ordered)
         self._cache: OrderedDict[str, CachedModel] = OrderedDict()
         self._cache_lock = threading.Lock()
 
-        # Active model pointers — ref-counted so concurrent jobs don't clobber each other
-        self._active_fp_counts: Counter[str] = Counter()
+        # Active model fingerprints — simple set (one job at a time)
+        self._active_fps: set[str] = set()
         self._active_fp_lock = threading.Lock()
 
-        # Model loading lock — serializes _ensure_models_for_stage calls
-        # so concurrent stage threads don't race on VRAM allocation.
-        # CUDA kernels release the GIL so actual stage execution is parallel.
+        # Model loading lock — serializes model loading and eviction.
         self.model_load_lock = threading.Lock()
 
         # Session group tracking
@@ -298,16 +296,16 @@ class GpuInstance:
     @property
     def is_busy(self) -> bool:
         with self._busy_lock:
-            return self._busy_count > 0
+            return self._busy
 
     def acquire(self) -> None:
-        """Increment busy ref count. Use for concurrent stage execution."""
+        """Mark GPU as busy (one job at a time)."""
         with self._busy_lock:
-            self._busy_count += 1
+            self._busy = True
 
     def release(self) -> None:
         with self._busy_lock:
-            self._busy_count = max(0, self._busy_count - 1)
+            self._busy = False
 
     def supports_capability(self, cap: str) -> bool:
         return cap.lower() in self.capabilities
@@ -435,21 +433,24 @@ class GpuInstance:
             )
 
     def add_active_fingerprints(self, fingerprints: set[str]) -> None:
-        """Increment ref counts for fingerprints actively in use by a job."""
+        """Mark fingerprints as actively in use by the current job."""
         with self._active_fp_lock:
-            self._active_fp_counts.update(fingerprints)
+            self._active_fps.update(fingerprints)
 
     def remove_active_fingerprints(self, fingerprints: set[str]) -> None:
-        """Decrement ref counts when a job finishes using these fingerprints."""
+        """Remove fingerprints from active set when a job finishes."""
         with self._active_fp_lock:
-            self._active_fp_counts.subtract(fingerprints)
-            # Clean up zero/negative counts
-            self._active_fp_counts += Counter()
+            self._active_fps.difference_update(fingerprints)
+
+    def clear_active_fingerprints(self) -> None:
+        """Clear all active fingerprints (called when job completes)."""
+        with self._active_fp_lock:
+            self._active_fps.clear()
 
     def get_active_fingerprints(self) -> set[str]:
-        """Return the set of all fingerprints currently in use by any job."""
+        """Return the set of all fingerprints currently in use."""
         with self._active_fp_lock:
-            return {fp for fp, count in self._active_fp_counts.items() if count > 0}
+            return set(self._active_fps)
 
     def _is_evictable(self, fp: str, protect: set[str] | None) -> bool:
         """Check if a cached model can be evicted."""

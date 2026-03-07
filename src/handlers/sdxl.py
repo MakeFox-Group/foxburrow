@@ -932,12 +932,33 @@ def _unet_tiled(
     return noise_sum / weight_sum
 
 
+_progress_callback = None
+
+
+def set_progress_callback(cb) -> None:
+    """Set a callback for broadcasting denoise/stage progress.
+
+    Called by the worker subprocess to redirect progress updates
+    through IPC instead of the in-process WebSocket streamer.
+    Signature: cb(job: InferenceJob) -> None
+    """
+    global _progress_callback
+    _progress_callback = cb
+
+
 def _broadcast_ws_progress(job: InferenceJob) -> None:
-    """Broadcast denoise progress via WebSocket (thread-safe — called from executor)."""
+    """Broadcast denoise/stage progress.
+
+    In the worker subprocess, this sends ProgressUpdate via IPC.
+    Falls back to direct WebSocket broadcast for in-process execution.
+    """
     try:
-        from api.websocket import streamer as _ws_streamer
-        import asyncio as _asyncio
-        _asyncio.run_coroutine_threadsafe(_ws_streamer.broadcast_progress(job), job._loop)
+        if _progress_callback is not None:
+            _progress_callback(job)
+        else:
+            from api.websocket import streamer as _ws_streamer
+            import asyncio as _asyncio
+            _asyncio.run_coroutine_threadsafe(_ws_streamer.broadcast_progress(job), job._loop)
     except Exception:
         pass
 

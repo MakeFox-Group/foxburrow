@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import random
 import string
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utils.regional import RegionalPromptResult
@@ -205,8 +204,11 @@ class InferenceJob:
         self.oom_retries: int = 0
         self.oom_gpu_ids: set[str] = set()  # GPUs that OOM'd this job
 
-        # GPU affinity — which GPU last ran a stage for this job
-        self.last_gpu_uuid: str | None = None
+        # CPU readiness — True once all CPU preprocessing (tokenization) is done
+        self._cpu_ready: bool = False
+
+        # GPU assignment — which GPU this job is dispatched to (whole pipeline)
+        self.assigned_gpu_uuid: str | None = None
 
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
         self.unet_tile_width: int = 0   # UNet / MultiDiffusion tile width (pixels)

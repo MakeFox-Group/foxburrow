@@ -24,17 +24,6 @@ if TYPE_CHECKING:
     from scheduling.worker_proxy import GpuProxy, GpuWorkerProxy
 
 
-# Per-session concurrency limits
-_SESSION_MAX_CONCURRENCY: dict[str, int] = {
-    "sdxl_unet": 1,
-    "sdxl_vae": 1,
-    "sdxl_te": 1,
-    "upscale": 1,
-    "bgremove": 1,
-}
-
-MAX_CONCURRENCY = 4
-
 # ---- Working-memory VRAM thresholds (resolution-aware) ----
 #
 # Three-tier prediction system (checked in priority order):
@@ -239,106 +228,10 @@ def _get_min_free_vram(stage_type: StageType, job: InferenceJob,
 
 # ── Slot estimation (main process, uses proxy data) ──────────────
 
-# Reference resolutions for conservative VRAM estimation.
-# Using 1536x1024 (common large-format SDXL size) rather than 1024x1024
-# to avoid underestimating working memory for typical high-res jobs.
-_REF_DENOISE_LATENT_PX = (1536 // 8) * (1024 // 8)  # 24576 latent pixels
-_REF_IMAGE_PX = 1536 * 1024                           # 1572864 image pixels
-
-
-def _vram_available(gpu: GpuProxy) -> int:
-    """Return VRAM available for new allocations.
-
-    Includes NVML free, PyTorch allocator slack, evictable model cache,
-    and TRT shared memory that can be freed (re-allocated on next use).
-    Works with GpuProxy's cached vram_stats from StatusSnapshot.
-    """
-    vram = gpu.get_vram_stats()
-    if not vram:
-        return 0
-    nvml_free = vram.get("free", 0)
-    pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
-    evictable = gpu.get_evictable_vram()
-    trt_freeable = gpu.get_trt_freeable_vram()
-    return nvml_free + pt_slack + evictable + trt_freeable
-
-
-def _unloaded_model_cost(gpu: GpuProxy, categories: list[str]) -> int:
-    """Sum VRAM for model categories not currently loaded on the GPU.
-
-    Uses measured VRAM from global registry (populated by worker processes)
-    for each loaded category, falling back to static estimates.
-    """
-    from scheduling.model_registry import VramEstimates
-
-    _model_vram = {
-        "sdxl_unet": VramEstimates.SDXL_UNET,
-        "sdxl_te1": VramEstimates.SDXL_TEXT_ENCODER_1,
-        "sdxl_te2": VramEstimates.SDXL_TEXT_ENCODER_2,
-        "sdxl_vae": VramEstimates.SDXL_VAE_DECODER,
-        "upscale": VramEstimates.UPSCALE,
-        "bgremove": VramEstimates.BGREMOVE,
-    }
-    loaded_cats = set(gpu.get_cached_categories())
-    total = 0
-    for cat in categories:
-        if cat in loaded_cats:
-            continue
-        # Check global measured VRAM for any model of this category
-        measured = _find_measured_vram_for_category(cat)
-        if measured is not None:
-            total += measured
-        else:
-            total += _model_vram.get(cat, 500 * 1024**2)
-    return total
-
-
-def _find_measured_vram_for_category(category: str) -> int | None:
-    """Find the largest measured VRAM for any model of the given category.
-
-    Uses the global category → max VRAM mapping built from worker StatusSnapshots.
-    Returns the maximum observed VRAM for this category across all workers.
-    """
-    from scheduling.worker_proxy import get_measured_category_vram
-    return get_measured_category_vram(category)
-
-
-def _working_memory_cost(stage_type: StageType, ref_pixels: int,
-                         gpu_model: str | None = None) -> int:
-    """Estimate working memory for slot estimation.
-
-    Uses workspace profiler -> BPP -> hardcoded fallback.
-    The reference resolution (ref_pixels) is used for BPP scaling.
-    For the workspace profiler, we use a reference resolution of 1536x1024.
-    """
-    # Tier 1: workspace profiler
-    if gpu_model is not None:
-        comp = _STAGE_TO_PROFILER_COMPONENT.get(stage_type)
-        if comp is not None:
-            from gpu.workspace_profiler import get_working_memory
-            # Use reference resolution for slot estimation
-            profiled = get_working_memory(comp, gpu_model, 1536, 1024)
-            if profiled is not None:
-                return int(profiled * 1.10)
-
-    # Tier 2: BPP
-    with _bpp_lock:
-        bpp = _measured_bpp.get(stage_type, 0.0)
-    if bpp > 0:
-        return int(bpp * ref_pixels * _VRAM_HEADROOM)
-
-    # Tier 3: hardcoded
-    return _VRAM_FALLBACK_BYTES.get(stage_type, 1 * 1024**3)
-
-
 def estimate_gpu_slots(worker: GpuWorkerProxy) -> dict[str, int]:
     """Estimate available job slots on a single GPU, per capability.
 
-    Uses ``check_slot_availability`` for atomic concurrency + group checks,
-    then VRAM budget for busy GPUs.  For SDXL, the bottleneck is UNet
-    denoise (concurrency=1, ~5GB model + working memory), but total cost
-    includes all pipeline components that need loading.
-
+    With one-job-per-GPU, each idle GPU = 1 slot for each of its capabilities.
     Returns ``{capability: 0_or_1}`` per GPU.
     """
     gpu = worker.gpu
@@ -349,45 +242,15 @@ def estimate_gpu_slots(worker: GpuWorkerProxy) -> dict[str, int]:
     if worker._draining or worker._building:
         return {}
 
-    # Use cached GPU model name (avoids CUDA driver call on every scheduling cycle)
-    gpu_model = worker._gpu_model_name
+    if not worker.can_accept_work():
+        return {}
 
+    # Idle GPU — 1 slot per capability
     slots: dict[str, int] = {}
-
-    # -- SDXL slot --
     if gpu.supports_capability("sdxl"):
-        can_accept, active = worker.check_slot_availability("sdxl_unet", "sdxl")
-        if not can_accept:
-            slots["sdxl"] = 0
-        elif active == 0:
-            slots["sdxl"] = 1  # idle GPU — _ensure_models_for_stage handles eviction
-        else:
-            # Busy — check VRAM for UNet + working memory.
-            # Also include TE1/TE2/VAE loading cost if not cached, since
-            # the full pipeline will need them across stages.
-            available = _vram_available(gpu)
-            model_cost = _unloaded_model_cost(
-                gpu, ["sdxl_unet", "sdxl_te1", "sdxl_te2", "sdxl_vae"])
-            working_cost = _working_memory_cost(
-                StageType.GPU_DENOISE, _REF_DENOISE_LATENT_PX, gpu_model)
-            slots["sdxl"] = 1 if available >= (model_cost + working_cost) else 0
-
-    # -- Simple-task slots --
-    for cap, session_key, group, stage_type in [
-        ("upscale", "upscale", "upscale", StageType.GPU_UPSCALE),
-        ("bgremove", "bgremove", "bgremove", StageType.GPU_BGREMOVE),
-    ]:
-        if not gpu.supports_capability(cap):
-            continue
-        can_accept, active = worker.check_slot_availability(session_key, group)
-        if not can_accept:
-            slots[cap] = 0
-        elif active == 0:
-            slots[cap] = 1
-        else:
-            available = _vram_available(gpu)
-            model_cost = _unloaded_model_cost(gpu, [session_key])
-            working_cost = _working_memory_cost(stage_type, _REF_IMAGE_PX, gpu_model)
-            slots[cap] = 1 if available >= (model_cost + working_cost) else 0
-
+        slots["sdxl"] = 1
+    if gpu.supports_capability("upscale"):
+        slots["upscale"] = 1
+    if gpu.supports_capability("bgremove"):
+        slots["bgremove"] = 1
     return slots

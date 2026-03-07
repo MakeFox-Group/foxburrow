@@ -1,65 +1,39 @@
-"""GPU scheduler: dispatch loop with model affinity scoring."""
+"""GPU scheduler: dispatch loop with model affinity scoring.
+
+Each GPU runs one job at a time (entire pipeline start-to-finish).
+No concurrent stages, no cross-GPU stage dispatch.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
 import time as _time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import log
 from config import SchedulerConfig
 from scheduling.job import (
-    InferenceJob, JobResult, StageType, WorkStage,
+    InferenceJob, JobResult, StageType,
 )
-from scheduling.queue import JobQueue, WorkGroup
-from scheduling.readiness import _estimate_remaining_s
-
+from scheduling.pipeline import get_all_components
 if TYPE_CHECKING:
     from scheduling.worker_proxy import GpuWorkerProxy as GpuWorker
 
 
-# Session key/group mappings
-_SESSION_MAP: dict[StageType, tuple[str, str]] = {
-    StageType.GPU_TEXT_ENCODE:     ("sdxl_te",          "sdxl"),
-    StageType.GPU_DENOISE:        ("sdxl_unet",        "sdxl"),
-    StageType.GPU_VAE_DECODE:     ("sdxl_vae",         "sdxl"),
-    StageType.GPU_VAE_ENCODE:     ("sdxl_vae",         "sdxl"),
-    StageType.GPU_UPSCALE:        ("upscale",          "upscale"),
-    StageType.GPU_BGREMOVE:       ("bgremove",         "bgremove"),
-}
-
-_KEY_TO_GROUP: dict[str, str] = {v[0]: v[1] for v in _SESSION_MAP.values()}
-
-# Lightweight groups that can coexist with any other group on the same GPU.
-_COMPATIBLE_WITH_ALL: frozenset[str] = frozenset({"bgremove", "upscale"})
-
-
-def get_session_key(stage_type: StageType) -> str | None:
-    entry = _SESSION_MAP.get(stage_type)
-    return entry[0] if entry else None
-
-
-def get_session_group(stage_type: StageType) -> str | None:
-    entry = _SESSION_MAP.get(stage_type)
-    return entry[1] if entry else None
-
-
-def get_session_group_from_key(key: str) -> str | None:
-    return _KEY_TO_GROUP.get(key)
-
-
 class GpuScheduler:
     """Central scheduling loop. Dispatches CPU stages to thread pool,
-    GPU stages to the best-scoring worker."""
+    GPU jobs to the best-scoring worker (entire pipeline per GPU)."""
 
-    def __init__(self, queue: JobQueue, config: SchedulerConfig | None = None):
+    def __init__(self, queue, config: SchedulerConfig | None = None):
         self._queue = queue
         self._config = config or SchedulerConfig()
         self._workers: list[GpuWorker] = []
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._cpu_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._cpu_submitted: set[str] = set()  # job_ids submitted to CPU pool
 
         # Wire queue to wake us
         self._queue.scheduler_wake = self._wake
@@ -92,266 +66,194 @@ class GpuScheduler:
             log.debug("  GpuScheduler: Stopped")
 
     def _run_scheduling_round(self) -> None:
-        groups = self._queue.get_work_groups()
-        if not groups:
+        # Kick off CPU preprocessing for any new jobs
+        self._process_pending_cpu_jobs()
+
+        jobs = self._queue.get_ready_jobs()
+        if not jobs:
             return
 
-        cpu_groups = [g for g in groups if g.stage.is_cpu_only]
-        gpu_groups = [g for g in groups if not g.stage.is_cpu_only]
-
-        # Dispatch CPU stages to thread pool
-        for group in cpu_groups:
-            jobs = list(group.jobs)
-            self._queue.remove(jobs)
-            for job in jobs:
-                self._cpu_pool.submit(self._execute_cpu_stage, job)
-
-        # Fail jobs that have OOM'd on every healthy GPU — they can never
-        # be dispatched and would otherwise block the entire work group.
-        # Exclude failed GPUs: a job shouldn't survive just because a dead
-        # GPU inflates the set (it can never run on a failed GPU anyway).
+        # Fail jobs that have OOM'd on every healthy GPU
         all_gpu_uuids = {w.gpu.uuid for w in self._workers if not w.gpu.is_failed}
         if not all_gpu_uuids:
-            return  # no healthy GPUs — nothing to dispatch
-        for group in list(gpu_groups):
-            failed = []
-            for job in group.jobs:
-                if job.oom_gpu_ids >= all_gpu_uuids:
-                    failed.append(job)
-            if failed:
-                for job in failed:
-                    group.jobs.remove(job)
-                    log.error(f"  GpuScheduler: Job[{job.job_id}] OOM on all "
-                              f"{len(all_gpu_uuids)} GPUs — failing")
-                    from datetime import datetime
-                    job.completed_at = datetime.utcnow()
-                    job.set_result(JobResult(
-                        success=False,
-                        error="Out of memory on all available GPUs"))
-                self._queue.remove(failed)
-            if not group.jobs:
-                gpu_groups.remove(group)
+            return
+        for job in list(jobs):
+            if job.oom_gpu_ids >= all_gpu_uuids:
+                self._queue.remove(job)
+                jobs.remove(job)
+                log.error(f"  GpuScheduler: Job[{job.job_id}] OOM on all "
+                          f"{len(all_gpu_uuids)} GPUs — failing")
+                job.completed_at = datetime.utcnow()
+                # Release admission slot before setting result
+                from state import app_state
+                if app_state.admission is not None:
+                    app_state.admission.release(job.type)
+                job.set_result(JobResult(
+                    success=False,
+                    error="Out of memory on all available GPUs"))
 
-        # Dispatch GPU stages using scoring — find best (worker, group) match
-        # and dispatch, repeating until no more valid matches.  Each dispatch
-        # updates concurrency counts and pending VRAM cost so subsequent
-        # iterations in the same round see accurate state.
+        if not jobs:
+            return
+
+        # Greedy dispatch: find best (worker, job) match and dispatch,
+        # repeating until no more valid matches.
         dispatched = True
-        while dispatched and gpu_groups:
+        while dispatched and jobs:
             dispatched = False
             best_score = -2**31
             best_worker: GpuWorker | None = None
-            best_group: WorkGroup | None = None
+            best_job: InferenceJob | None = None
 
-            for worker in self._workers:
-                for group in gpu_groups:
-                    if not group.jobs:
-                        continue
-                    score = self._score_worker(worker, group)
+            for job in jobs:
+                for worker in self._workers:
+                    score = self._score_worker(worker, job)
                     if score > best_score:
                         best_score = score
                         best_worker = worker
-                        best_group = group
+                        best_job = job
 
-            if best_worker is None or best_group is None or best_score == -2**31:
+            if best_worker is None or best_job is None or best_score == -2**31:
                 break
 
-            # Pick the first job not OOM'd on the chosen GPU (skip blocked ones)
-            job = None
-            for j in best_group.jobs:
-                if best_worker.gpu.uuid not in j.oom_gpu_ids:
-                    job = j
-                    break
-            if job is None:
-                # Defensive: scoring should prevent this. If reached, it
-                # means _score_worker failed to reject a fully-blocked group.
-                log.warning(f"  GpuScheduler: All jobs in {best_group} OOM'd on "
-                            f"{best_worker.gpu.uuid} — scoring check missed this")
-                gpu_groups.remove(best_group)
-                dispatched = True
-                continue
-            best_group.jobs.remove(job)
-            self._queue.remove([job])
+            self._queue.remove(best_job)
+            jobs.remove(best_job)
 
-            log.debug(f"  GpuScheduler: Dispatching 1 job [{best_group.stage}] "
+            log.debug(f"  GpuScheduler: Dispatching {best_job} "
                       f"to GPU [{best_worker.gpu.uuid}] "
-                      f"(score={best_score}, active={best_worker.active_count})")
+                      f"(score={best_score})")
 
-            best_worker.dispatch(best_group.stage, job)
+            best_worker.dispatch(best_job)
             dispatched = True
 
-            if not best_group.jobs:
-                gpu_groups.remove(best_group)
-
-    def _score_worker(self, worker: "GpuWorker", group: WorkGroup) -> int:
-        """Score how well a worker matches a work group. Higher is better."""
+    def _score_worker(self, worker: "GpuWorker", job: InferenceJob) -> int:
+        """Score how well a worker matches a job. Higher is better."""
         if worker.gpu.is_failed:
             return -2**31
 
-        stage = group.stage
-
-        if not worker.can_accept_work(stage):
+        if not worker.can_accept_work():
             return -2**31
 
-        # VRAM budget gate: reject if this GPU can't fit the new stage's
-        # model loading cost + working memory alongside active jobs.
-        # Use the first non-OOM'd job for budget estimation (the one that
-        # will actually be dispatched), not jobs[0] which may be blocked.
-        budget_job = None
-        if group.jobs:
-            budget_job = next(
-                (j for j in group.jobs if worker.gpu.uuid not in j.oom_gpu_ids),
-                group.jobs[0],  # fallback: all blocked, OOM check below rejects
-            )
-            if not worker.check_vram_budget(stage, budget_job):
+        # OOM avoidance
+        if worker.gpu.uuid in job.oom_gpu_ids:
+            return -2**31
+
+        # Capability check — all GPU stages must be supported
+        for stage in job.pipeline:
+            if stage.required_capability and not worker.gpu.supports_capability(stage.required_capability):
                 return -2**31
+
+        # VRAM budget gate
+        if not worker.check_vram_budget(job):
+            return -2**31
 
         from scheduling.worker_proxy import _global_measured_vram
 
         score = 0
-        is_idle = worker.is_idle
-        loaded_cats = worker.get_loaded_categories()
-        required_group = get_session_group(stage.type)
 
-        # ── TRT coverage detection ────────────────────────────────────
-        # Determine which required components are covered by cached TRT
-        # engines on this GPU.  TRT-covered components don't need PyTorch
-        # model loading — they're ready instantly.  This is critical for
-        # cross-GPU specialization: GPU1 can have TRT UNet engines while
-        # GPU2 has TRT VAE engines, and stages route accordingly.
+        # ── Model affinity (DOMINANT) ─────────────────────────────
+        all_components = get_all_components(job.pipeline)
+        component_weights = {
+            "sdxl_unet": 500,
+            "sdxl_te2": 150,
+            "sdxl_te1": 50,
+            "sdxl_vae": 30,
+            "sdxl_vae_enc": 30,
+            "upscale": 100,
+            "bgremove": 100,
+        }
+
+        loaded_count = 0
+        missing_vram = 0
+        num_missing = 0
         trt_covered_fps: set[str] = set()
+
+        # ── TRT coverage detection ────────────────────────────────
         trt_affinity_score = 0
-        if stage.required_components and budget_job is not None:
-            inp = budget_job.sdxl_input
-            if inp is not None:
-                w, h = inp.width, inp.height
-                # Use hires resolution for hires denoise/decode stages
-                if budget_job.is_hires_pass and budget_job.hires_input:
-                    hi = budget_job.hires_input
-                    if hi.hires_width > 0 and hi.hires_height > 0:
-                        w, h = hi.hires_width, hi.hires_height
-                for c in stage.required_components:
-                    if c.category == "sdxl_unet":
-                        aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)
+        inp = job.sdxl_input
+        if inp is not None:
+            w, h = inp.width, inp.height
+            # Check hires resolution for hires jobs
+            if job.hires_input:
+                hi = job.hires_input
+                if hi.hires_width > 0 and hi.hires_height > 0:
+                    w, h = max(w, hi.hires_width), max(h, hi.hires_height)
+
+            for c in all_components:
+                if c.category == "sdxl_unet":
+                    aff = worker.gpu.check_trt_affinity(c.fingerprint, "unet", w, h)
+                    if aff >= 1:
+                        trt_covered_fps.add(c.fingerprint)
+                    if aff == 2:
+                        trt_affinity_score += 200
+                    elif aff == 1:
+                        trt_affinity_score += 150
+                    elif aff == -1:
+                        trt_affinity_score -= 150
+                elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
+                    # Check both VAE decode and encode TRT
+                    for trt_comp in ("vae", "vae_enc"):
+                        aff = worker.gpu.check_trt_affinity(c.fingerprint, trt_comp, w, h)
                         if aff >= 1:
                             trt_covered_fps.add(c.fingerprint)
-                        if aff == 2:
-                            trt_affinity_score += 200   # exact static TRT match
-                        elif aff == 1:
-                            trt_affinity_score += 150   # dynamic TRT covers resolution
+                            trt_affinity_score += 200 if aff == 2 else 150
+                            break
                         elif aff == -1:
-                            trt_affinity_score -= 150   # wrong TRT — will evict
-                    elif c.category in ("sdxl_vae", "sdxl_vae_enc"):
-                        if stage.type == StageType.GPU_VAE_DECODE:
-                            aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae", w, h)
-                            if aff >= 1:
-                                trt_covered_fps.add(c.fingerprint)
-                            if aff == 2:
-                                trt_affinity_score += 200
-                            elif aff == 1:
-                                trt_affinity_score += 150
-                            elif aff == -1:
-                                trt_affinity_score -= 150
-                        elif stage.type == StageType.GPU_VAE_ENCODE:
-                            aff = worker.gpu.check_trt_affinity(c.fingerprint, "vae_enc", w, h)
-                            if aff >= 1:
-                                trt_covered_fps.add(c.fingerprint)
-                            if aff == 2:
-                                trt_affinity_score += 200
-                            elif aff == 1:
-                                trt_affinity_score += 150
-                            elif aff == -1:
-                                trt_affinity_score -= 150
-                    elif c.category == "sdxl_te1":
-                        te_fp = f"{c.fingerprint}:te1_trt:default"
-                        if worker.gpu.is_component_loaded(te_fp):
-                            trt_covered_fps.add(c.fingerprint)
-                            trt_affinity_score += 100
-                    elif c.category == "sdxl_te2":
-                        te_fp = f"{c.fingerprint}:te2_trt:default"
-                        if worker.gpu.is_component_loaded(te_fp):
-                            trt_covered_fps.add(c.fingerprint)
-                            trt_affinity_score += 100
+                            trt_affinity_score -= 150
+                            break
+                elif c.category == "sdxl_te1":
+                    te_fp = f"{c.fingerprint}:te1_trt:default"
+                    if worker.gpu.is_component_loaded(te_fp):
+                        trt_covered_fps.add(c.fingerprint)
+                        trt_affinity_score += 100
+                elif c.category == "sdxl_te2":
+                    te_fp = f"{c.fingerprint}:te2_trt:default"
+                    if worker.gpu.is_component_loaded(te_fp):
+                        trt_covered_fps.add(c.fingerprint)
+                        trt_affinity_score += 100
 
         score += trt_affinity_score
 
-        # ── Time-to-ready (dominant factor) ──────────────────────────
-        # Score by *how soon* this GPU can actually start the job:
-        # wait time + model load time.  Components covered by TRT are
-        # treated as "loaded" — no PyTorch model loading needed.
-        # With concurrent stages, only count wait time for CONFLICTING
-        # stage types (e.g., UNet doesn't wait for TE).
-        wait_s = _estimate_remaining_s(worker, for_stage_type=stage.type) if not is_idle else 0.0
+        # ── Component affinity scoring ────────────────────────────
+        for c in all_components:
+            if worker.gpu.is_component_loaded(c.fingerprint):
+                loaded_count += 1
+                score += component_weights.get(c.category, 30)
+            elif c.fingerprint in trt_covered_fps:
+                loaded_count += 1
+            else:
+                measured = _global_measured_vram.get(c.fingerprint)
+                missing_vram += measured if measured is not None else c.estimated_vram_bytes
+                num_missing += 1
 
-        missing_vram = 0
-        loaded_count = 0
-        num_missing = 0
-        if stage.required_components:
-            for c in stage.required_components:
-                if worker.gpu.is_component_loaded(c.fingerprint):
-                    loaded_count += 1
-                elif c.fingerprint in trt_covered_fps:
-                    loaded_count += 1  # TRT engine handles this — no load needed
-                else:
-                    # Use measured VRAM from global registry when available
-                    measured = _global_measured_vram.get(c.fingerprint)
-                    missing_vram += measured if measured is not None else c.estimated_vram_bytes
-                    num_missing += 1
+        # Full pipeline loaded bonus
+        if loaded_count == len(all_components) and all_components:
+            score += 300
 
-        # Model load time estimate: configurable MB/s + 0.5s per-component overhead
-        # (eviction, empty_cache, tensor allocation)
+        # ── Time-to-ready ─────────────────────────────────────────
+        # GPU is always idle when dispatching (one job at a time, checked by can_accept_work)
         load_rate = self._config.load_rate_mb_s * 1024 * 1024
         load_s = (missing_vram / load_rate + 0.5 * num_missing) if num_missing > 0 else 0.0
-        estimated_ready_s = wait_s + load_s
+        score -= int(load_s * 50)
 
-        score -= int(estimated_ready_s * 50)  # 50 pts/second penalty
-
-        # Tiebreakers (only matter when estimated_ready_s values are close)
-        if stage.required_components:
-            if loaded_count == len(stage.required_components):
-                score += 100       # prefer "ready now" over "ready in 0.01s"
+        # Tiebreakers
+        if all_components:
+            if loaded_count == len(all_components):
+                score += 100
             elif loaded_count > 0:
-                score += 50        # partial cache saves some load time
+                score += 50
 
-        # Same-GPU affinity: prefer the GPU that ran the previous stage for
-        # this job.  The previous stage's models + TRT engines are likely still
-        # cached, and the CUDA allocator has warm memory pools.  This avoids
-        # unnecessary cross-GPU latent transfers and model reloading.
-        if budget_job is not None and budget_job.last_gpu_uuid == worker.gpu.uuid:
-            score += 75  # significant but not overwhelming — a better GPU can still win
+        score += 20  # idle bonus (GPU is always idle when scoring)
 
-        if is_idle:
-            score += 20            # slight preference for idle GPUs at equal time
+        # Diversification: prefer GPUs that haven't been dispatched recently
+        idle_since = _time.monotonic() - worker._last_dispatch_time
+        score += min(int(idle_since * 2), 30)
 
-            # Diversification: prefer GPUs that haven't been dispatched recently.
-            # Breaks ties when all GPUs score equally (e.g., all empty after
-            # TRT drain) so work spreads across GPUs instead of snowballing
-            # onto whichever GPU happens to be listed first.
-            idle_since = _time.monotonic() - worker._last_dispatch_time
-            score += min(int(idle_since * 2), 30)  # up to +30 pts, ramps over 15s
-
-        # Cross-group penalty — only when busy. An idle GPU has zero
-        # context-switch cost so switching session groups is free.
-        # Skip penalty when either side is a lightweight compatible-with-all group.
-        if required_group and not is_idle:
-            for cat in loaded_cats:
-                cat_group = get_session_group_from_key(cat)
-                if cat_group and cat_group != required_group:
-                    if required_group in _COMPATIBLE_WITH_ALL or cat_group in _COMPATIBLE_WITH_ALL:
-                        continue
-                    score -= 300
-
-        # Batch size bonus
-        score += 50 * len(group.jobs)
-
-        # Starvation prevention — configurable 3-phase ramp:
-        #   0..linear_s:  linear (normal scheduling priority)
-        #   linear_s..hard_s: quadratic acceleration
-        #   >=hard_s:     hard override (+50000, guarantees dispatch)
-        age = group.oldest_age_seconds
+        # ── Starvation prevention ─────────────────────────────────
+        # 3-phase ramp: linear → quadratic → hard override
+        age = (datetime.utcnow() - job.created_at).total_seconds()
         linear_s = self._config.starvation_linear_s
         hard_s = self._config.starvation_hard_s
-        base_mult = 25 if is_idle else 10
+        base_mult = 25
         if age <= linear_s:
             starvation = int(base_mult * age)
         elif age <= hard_s:
@@ -362,21 +264,26 @@ class GpuScheduler:
             starvation = 50000
         score += starvation
 
-        # OOM avoidance: hard-reject only if EVERY job in the group already
-        # OOM'd on this GPU.  Previously checked only jobs[0], which caused
-        # head-of-line blocking when one job OOM'd on all GPUs.
-        if group.jobs:
-            if all(worker.gpu.uuid in j.oom_gpu_ids for j in group.jobs):
-                return -2**31
-
         return score
 
-    def estimate_available_slots(self) -> dict[str, int]:
-        """Estimate available job slots per capability based on real-time VRAM.
+    def _process_pending_cpu_jobs(self) -> None:
+        """Submit CPU preprocessing for jobs that need it."""
+        pending = self._queue.get_pending_cpu_jobs()
+        for job in pending:
+            if job.job_id in self._cpu_submitted:
+                continue
+            stage = job.current_stage
+            if stage is not None and stage.is_cpu_only:
+                self._cpu_submitted.add(job.job_id)
+                self._cpu_pool.submit(self._execute_cpu_stage, job)
+            elif stage is not None and not stage.is_cpu_only:
+                # No CPU stage needed — mark as ready immediately
+                job._cpu_ready = True
 
-        For SDXL, estimates how many more UNet denoise stages (the bottleneck)
-        can run across all GPUs.  For simple tasks, checks per-model capacity.
-        Sums across all workers.
+    def estimate_available_slots(self) -> dict[str, int]:
+        """Estimate available job slots per capability.
+
+        With one-job-per-GPU, each idle GPU = 1 slot for each of its capabilities.
         """
         from scheduling.worker import estimate_gpu_slots
 
@@ -394,7 +301,6 @@ class GpuScheduler:
                 return
 
             if job.started_at is None:
-                from datetime import datetime
                 job.started_at = datetime.utcnow()
 
             if stage.type == StageType.CPU_TOKENIZE:
@@ -404,16 +310,14 @@ class GpuScheduler:
                 raise RuntimeError(f"Not a CPU stage: {stage.type}")
 
             job.current_stage_index += 1
+            job._cpu_ready = True
 
-            if job.is_complete:
-                from datetime import datetime
-                job.completed_at = datetime.utcnow()
-                job.set_result(JobResult(success=True))
-            else:
-                self._queue.re_enqueue(job)
+            # Wake scheduler so it picks up the now-ready job
+            self._wake.set()
 
         except Exception as ex:
             log.log_exception(ex, f"CPU stage failed for {job}")
-            from datetime import datetime
             job.completed_at = datetime.utcnow()
             job.set_result(JobResult(success=False, error=str(ex)))
+        finally:
+            self._cpu_submitted.discard(job.job_id)

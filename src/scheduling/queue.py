@@ -1,34 +1,16 @@
-"""Async job queue with work grouping for the scheduler."""
+"""Async job queue for the scheduler."""
 
 from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 import log
 
 if TYPE_CHECKING:
     from gpu.pool import GpuPool
-    from scheduling.job import InferenceJob, JobType, WorkStage, JobResult
-
-
-@dataclass
-class WorkGroup:
-    """A group of jobs that all need the same work stage (same model components)."""
-    stage: WorkStage
-    jobs: list[InferenceJob] = field(default_factory=list)
-
-    @property
-    def oldest_age_seconds(self) -> float:
-        if not self.jobs:
-            return 0
-        return (datetime.utcnow() - self.jobs[0].created_at).total_seconds()
-
-    def __str__(self):
-        return f"WorkGroup[{self.stage}] ({len(self.jobs)} jobs, oldest={self.oldest_age_seconds:.1f}s)"
+    from scheduling.job import InferenceJob, JobType
 
 
 class JobQueue:
@@ -54,42 +36,32 @@ class JobQueue:
         log.debug(f"  Queue: Enqueued {job} (queue depth: {self.count})")
         self._wake_scheduler()
 
-    def get_work_groups(self) -> list[WorkGroup]:
-        """Get all pending jobs grouped by their current stage's required components."""
-        from scheduling.job import JobResult
+    def get_ready_jobs(self) -> list[InferenceJob]:
+        """Get all pending jobs that have completed CPU preprocessing.
 
+        Returns jobs sorted by priority then creation time.
+        Removes completed/cancelled jobs as a side effect.
+        """
         with self._lock:
             # Remove completed/cancelled jobs
             self._jobs = [j for j in self._jobs if not j.completion.done()]
 
-            groups: dict[str, WorkGroup] = {}
+            ready = [j for j in self._jobs if j._cpu_ready]
+            ready.sort(key=lambda j: (j.priority, j.created_at))
+            return ready
 
-            for job in self._jobs:
-                stage = job.current_stage
-                if stage is None:
-                    continue
+    def get_pending_cpu_jobs(self) -> list[InferenceJob]:
+        """Get jobs that need CPU preprocessing (not yet _cpu_ready).
 
-                # Build key from stage type + sorted component fingerprints
-                if stage.is_cpu_only:
-                    key = f"CPU:{stage.type.value}"
-                else:
-                    comp_keys = sorted(c.fingerprint for c in stage.required_components)
-                    key = f"GPU:{stage.type.value}:{':'.join(comp_keys)}"
-
-                if key not in groups:
-                    groups[key] = WorkGroup(stage=stage)
-                groups[key].jobs.append(job)
-
-            # Sort jobs within each group by priority then creation time
-            for group in groups.values():
-                group.jobs.sort(key=lambda j: (j.priority, j.created_at))
-
-            return list(groups.values())
-
-    def remove(self, jobs: list[InferenceJob]) -> None:
-        to_remove = set(id(j) for j in jobs)
+        Returns a snapshot list; jobs are NOT removed from the queue.
+        """
         with self._lock:
-            self._jobs = [j for j in self._jobs if id(j) not in to_remove]
+            return [j for j in self._jobs
+                    if not j._cpu_ready and not j.completion.done()]
+
+    def remove(self, job: InferenceJob) -> None:
+        with self._lock:
+            self._jobs = [j for j in self._jobs if j is not job]
 
     def re_enqueue(self, job: InferenceJob) -> None:
         with self._lock:
@@ -109,8 +81,8 @@ class AdmissionControl:
     """Gate job submission by per-capability and global in-flight limits.
 
     A job holds its admission slot from enqueue until completion (all stages
-    done, success or failure).  OOM retries and stage re-enqueues do NOT
-    release the slot — the job is still in-flight.
+    done, success or failure).  OOM retries and re-enqueues do NOT release
+    the slot — the job is still in-flight.
 
     Limits are dynamic: per-capability limits query GpuPool.available_count()
     live (excludes failed GPUs), so limits shrink automatically if a GPU fails.
@@ -130,12 +102,9 @@ class AdmissionControl:
         "BGRemove":            "bgremove",
     }
 
-    # Pipeline depth per capability: how many concurrent jobs can a single GPU
-    # handle via stage pipelining.  SDXL has 3 GPU stage types (TE, UNet, VAE)
-    # that can each run on a different job simultaneously, so up to 3 SDXL jobs
-    # can pipeline through one GPU.  Non-pipelined capabilities are 1.
+    # Pipeline depth = 1: one job at a time per GPU (no stage pipelining).
     _PIPELINE_DEPTH: dict[str, int] = {
-        "sdxl": 3,
+        "sdxl": 1,
         "upscale": 1,
         "bgremove": 1,
     }
@@ -154,17 +123,14 @@ class AdmissionControl:
             return None
 
         with self._lock:
-            # Per-capability limit: GPUs × pipeline depth for stage pipelining.
-            # Worker-level controls (per-stage-type exclusivity, VRAM budget)
-            # handle the fine-grained scheduling decisions.
+            # Per-capability limit: GPUs × pipeline depth (1 per GPU).
             depth = self._PIPELINE_DEPTH.get(cap, 1)
             cap_limit = self._gpu_pool.available_count(cap) * depth
             current = self._counts.get(cap, 0)
             if current >= cap_limit:
                 return f"No {cap} capacity: {current}/{cap_limit}"
 
-            # Global limit: idle GPUs + 2 buffer slots to allow some pipelining
-            # without overwhelming the system with queued work
+            # Global limit: idle GPUs + 2 buffer slots for queuing
             num_idle = sum(1 for g in self._gpu_pool.gpus
                            if not g.is_busy and not g.is_failed
                            and not g._trt_building)
@@ -204,9 +170,6 @@ class AdmissionControl:
 
     def snapshot(self) -> dict:
         """Return current admission state for the status endpoint."""
-        # Snapshot GPU pool state once to get a consistent view across all
-        # derived values (limits, max_concurrent).  GpuPool.gpus is unsynchronized,
-        # so we iterate once and derive everything from that single read.
         gpus = self._gpu_pool.gpus
         non_failed = [g for g in gpus if not g.is_failed and not g._trt_building]
         num_idle = sum(1 for g in non_failed if not g.is_busy)

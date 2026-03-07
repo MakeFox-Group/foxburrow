@@ -228,7 +228,6 @@ async def status():
                 progress = (denoise_step / denoise_total) if is_denoise and denoise_total > 0 else None
                 elapsed_s = None
                 if job.started_at:
-                    from datetime import datetime
                     elapsed_s = round((datetime.utcnow() - job.started_at).total_seconds(), 1)
 
                 model_name = None

@@ -3,6 +3,8 @@
 Presents the same interface as the old GpuWorker so the scheduler,
 TRT manager, and status APIs work without changes.  Backed by IPC
 queues to the actual GPU worker process.
+
+Each GPU runs one job at a time (entire pipeline start-to-finish).
 """
 
 from __future__ import annotations
@@ -11,27 +13,20 @@ import asyncio
 import multiprocessing as mp
 import os
 import time as _time
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 import log
 from config import GpuConfig
 from scheduling.job import (
-    InferenceJob, JobResult, JobType, StageType, WorkStage,
-    SdxlTokenizeResult, SdxlEncodeResult, SdxlRegionalEncodeResult,
-)
-from scheduling.queue import JobQueue
-from scheduling.scheduler import (
-    get_session_key, get_session_group, get_session_group_from_key,
-    _COMPATIBLE_WITH_ALL,
+    InferenceJob, JobResult, StageType,
 )
 from scheduling.worker_protocol import (
     DrainCmd,
     DrainComplete,
-    ExecuteStageCmd,
+    ExecuteJobCmd,
     GetStatusCmd,
+    JobComplete,
     LogMessage,
     OnloadCmd,
     OnloadComplete,
@@ -39,7 +34,6 @@ from scheduling.worker_protocol import (
     ProgressUpdate,
     ReleaseDrainCmd,
     ShutdownCmd,
-    StageResult,
     StatusSnapshot,
     TagImageCmd,
     TagResult,
@@ -51,19 +45,6 @@ from scheduling.worker_protocol import (
     WorkerReady,
 )
 
-if TYPE_CHECKING:
-    pass
-
-# Per-session concurrency limits (mirrors worker.py constants)
-_SESSION_MAX_CONCURRENCY: dict[str, int] = {
-    "sdxl_unet": 1,
-    "sdxl_vae": 1,
-    "sdxl_te": 1,
-    "upscale": 1,
-    "bgremove": 1,
-}
-
-MAX_CONCURRENCY = 4
 
 # CUDA context + driver + allocator fragmentation overhead.
 # Subtracted from total GPU memory for idle-GPU budget checks.
@@ -77,7 +58,6 @@ _global_measured_vram: dict[str, int] = {}
 
 # Global category → max measured VRAM — tracks the largest observed VRAM
 # per model category (e.g. "sdxl_unet", "sdxl_te1") across all workers.
-# Used by _unloaded_model_cost() for slot estimation.
 _global_category_vram: dict[str, int] = {}
 
 
@@ -290,8 +270,8 @@ class GpuProxy:
 class GpuWorkerProxy:
     """Main-process proxy that replaces GpuWorker.
 
-    Presents the same interface (gpu, is_idle, active_count, dispatch,
-    can_accept_work, etc.) backed by IPC to the worker subprocess.
+    Each GPU runs one job at a time (entire pipeline start-to-finish).
+    No concurrent stages, no cross-GPU dispatch.
     """
 
     def __init__(
@@ -325,12 +305,8 @@ class GpuWorkerProxy:
         self._reader_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # State tracking (main process side)
-        self._pending: tuple[WorkStage, InferenceJob] | None = None
-        self._active_count = 0
-        self._active_session_counts: dict[str, int] = defaultdict(int)
-        self._active_stage_counts: dict[StageType, int] = defaultdict(int)
-        self._active_jobs: dict[str, InferenceJob] = {}
+        # State tracking — one job at a time
+        self._active_job: InferenceJob | None = None
 
         # TRT drain state
         self._draining = False
@@ -359,8 +335,6 @@ class GpuWorkerProxy:
         self._ready = False
         self._ready_event = asyncio.Event()
 
-        # Cross-GPU failure propagation
-
         # Scheduler wake reference (set by scheduler)
         self._scheduler_wake: asyncio.Event | None = None
 
@@ -371,27 +345,23 @@ class GpuWorkerProxy:
         # Dispatch tracking (for scheduler diversification)
         self._last_dispatch_time: float = 0.0  # monotonic timestamp
 
-        # Pending VRAM cost: VRAM committed by dispatches not yet reflected
-        # in the worker's StatusSnapshot.  Deducted from available VRAM in
-        # check_vram_budget so multiple dispatches in the same scheduling
-        # round don't overcommit.  Reset when a fresh snapshot arrives.
-        self._pending_vram_cost: int = 0
-
     @property
     def gpu(self) -> GpuProxy:
         return self._gpu_proxy
 
     @property
     def is_idle(self) -> bool:
-        return self._active_count == 0
+        return self._active_job is None
 
     @property
     def active_count(self) -> int:
-        return self._active_count
+        return 0 if self._active_job is None else 1
 
     @property
     def active_jobs(self) -> list[InferenceJob]:
-        return list(self._active_jobs.values())
+        if self._active_job is not None:
+            return [self._active_job]
+        return []
 
     def start(self) -> None:
         """Start the reader loop as an asyncio task."""
@@ -422,238 +392,124 @@ class GpuWorkerProxy:
             cats.add("sdxl_te")
         return cats
 
-    def can_accept_work(self, stage: WorkStage) -> bool:
-        """Whether this worker can accept a new work item for the given stage."""
+    def can_accept_work(self) -> bool:
+        """Whether this worker can accept a new job."""
         if self._gpu_proxy.is_failed:
             return False
         if self._draining or self._building:
             return False
         if not self._ready:
             return False
-        if stage.required_capability and not self._gpu_proxy.supports_capability(stage.required_capability):
+        if self._active_job is not None:
             return False
-
-        session_key = get_session_key(stage.type)
-        if session_key is None:
-            return False
-
-        if self._active_count >= MAX_CONCURRENCY:
-            return False
-
-        # Per-stage-type limit
-        if self._active_stage_counts[stage.type] >= 1:
-            return False
-
-        max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
-        if self._active_session_counts[session_key] >= max_for_session:
-            return False
-
-        # Session group conflict
-        if self._active_count > 0:
-            new_group = get_session_group(stage.type)
-            if new_group not in _COMPATIBLE_WITH_ALL:
-                for key, count in self._active_session_counts.items():
-                    if count <= 0:
-                        continue
-                    active_group = get_session_group_from_key(key)
-                    if active_group and active_group != new_group:
-                        if active_group not in _COMPATIBLE_WITH_ALL:
-                            return False
-
         return True
 
-    def check_slot_availability(self, session_key: str, group: str) -> tuple[bool, int]:
-        """Atomically check capacity + group conflict and return active_count."""
-        if self._active_count >= MAX_CONCURRENCY:
-            return False, self._active_count
-        max_for_session = _SESSION_MAX_CONCURRENCY.get(session_key, 1)
-        if self._active_session_counts.get(session_key, 0) >= max_for_session:
-            return False, self._active_count
-        if self._active_count > 0:
-            if group not in _COMPATIBLE_WITH_ALL:
-                for key, count in self._active_session_counts.items():
-                    if count <= 0:
-                        continue
-                    active_group = get_session_group_from_key(key)
-                    if active_group and active_group != group:
-                        if active_group not in _COMPATIBLE_WITH_ALL:
-                            return False, self._active_count
-        return True, self._active_count
-
-    def check_vram_budget(self, stage: WorkStage, job: InferenceJob) -> bool:
-        """Check if this GPU has enough VRAM for a new stage.
+    def check_vram_budget(self, job: InferenceJob) -> bool:
+        """Check if this GPU has enough VRAM for the heaviest stage of a job.
 
         This is the PRIMARY OOM prevention gate.  The scheduler MUST verify
         VRAM budget before dispatching — workers should never hit OOM because
         the scheduler guaranteed the work fits.
 
-        Accounts for:
-        - Models not yet loaded (need VRAM for loading)
-        - Working memory for execution (resolution-scaled)
-        - Pending VRAM from recently-dispatched jobs not yet in the snapshot
-        - Reclaimable VRAM (evictable models + freeable TRT shared memory)
+        Since the entire pipeline runs on one GPU, we check the single
+        heaviest stage (max model cost + working memory) against available VRAM.
+        The GPU is always idle when this is called (one job at a time).
         """
         status = self._gpu_proxy._status
         if status is None:
             return True  # No status yet, be optimistic
 
-        # Cost: models not loaded + working memory.
-        # Use measured VRAM from the global registry (populated by any worker
-        # that has loaded this model) instead of static estimates.
-        model_cost = 0
-        for c in stage.required_components:
-            if self._gpu_proxy.is_component_loaded(c.fingerprint):
+        # Find the heaviest stage in the pipeline
+        max_needed = 0
+        for stage in job.pipeline:
+            if stage.is_cpu_only:
                 continue
-            measured = _global_measured_vram.get(c.fingerprint)
-            if measured is not None:
-                model_cost += measured
-            else:
-                model_cost += c.estimated_vram_bytes
 
-        from scheduling.worker import _get_min_free_vram
-        working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
-        total_needed = model_cost + working_cost
+            # Model cost for this stage
+            model_cost = 0
+            for c in stage.required_components:
+                if self._gpu_proxy.is_component_loaded(c.fingerprint):
+                    continue
+                measured = _global_measured_vram.get(c.fingerprint)
+                if measured is not None:
+                    model_cost += measured
+                else:
+                    model_cost += c.estimated_vram_bytes
 
-        # Idle GPU (no active + no pending): check against total usable memory.
-        # The worker can evict everything, so budget = total - overhead.
-        if self._active_count == 0 and self._pending_vram_cost == 0:
-            vram = status.vram_stats
-            total_memory = vram.get("total", 0)
-            usable = total_memory - _VRAM_OVERHEAD_BYTES
-            if usable > 0 and total_needed > usable:
-                return False
-            return True
+            # Working memory cost
+            from scheduling.worker import _get_min_free_vram
+            working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
+            stage_total = model_cost + working_cost
+            if stage_total > max_needed:
+                max_needed = stage_total
 
-        # Busy or recently-dispatched GPU: check available VRAM.
-        # Available = NVML free + PyTorch slack + evictable + TRT freeable
-        #           - pending cost from dispatches not yet in the snapshot.
+        # GPU is idle when dispatching (one job at a time).
+        # Worker can evict everything, so budget = total - overhead.
         vram = status.vram_stats
-        nvml_free = vram.get("free", 0)
-        pt_slack = max(0, vram.get("reserved", 0) - vram.get("allocated", 0))
-        evictable = status.evictable_vram
-        trt_freeable = status.trt_freeable_vram
+        total_memory = vram.get("total", 0)
+        usable = total_memory - _VRAM_OVERHEAD_BYTES
+        if usable > 0 and max_needed > usable:
+            return False
+        return True
 
-        available = nvml_free + pt_slack + evictable + trt_freeable - self._pending_vram_cost
-        return available >= total_needed
-
-    def dispatch(self, stage: WorkStage, job: InferenceJob) -> None:
-        """Dispatch a work item to the worker process."""
+    def dispatch(self, job: InferenceJob) -> None:
+        """Dispatch an entire job to the worker process."""
         if self._gpu_proxy.is_failed:
             raise RuntimeError(f"GPU [{self._gpu_proxy.uuid}] is permanently failed")
 
         self._last_dispatch_time = _time.monotonic()
 
-        # Update local concurrency tracking
-        if self._active_count == 0:
-            self._gpu_proxy._busy = True
-        self._active_count += 1
-        self._active_stage_counts[stage.type] += 1
-        key = get_session_key(stage.type)
-        if key:
-            self._active_session_counts[key] += 1
+        # Mark busy
+        self._gpu_proxy._busy = True
+        self._active_job = job
 
-        # Track pending VRAM cost so subsequent check_vram_budget calls in
-        # the same scheduling round see reduced available VRAM.
-        dispatch_cost = 0
-        for c in stage.required_components:
-            if not self._gpu_proxy.is_component_loaded(c.fingerprint):
-                measured = _global_measured_vram.get(c.fingerprint)
-                dispatch_cost += measured if measured is not None else c.estimated_vram_bytes
-        from scheduling.worker import _get_min_free_vram
-        dispatch_cost += _get_min_free_vram(stage.type, job, self._gpu_model_name)
-        self._pending_vram_cost += dispatch_cost
-
-        # Track active job
+        # Track job state
         if job.started_at is None:
             job.started_at = datetime.utcnow()
+        job.assigned_gpu_uuid = self._gpu_proxy.uuid
         job.stage_status = "loading"
         job.active_gpus = [{"uuid": self._gpu_proxy.uuid,
                             "name": self._gpu_proxy.name,
-                            "stage": stage.type.value}]
-        self._active_jobs[job.job_id] = job
-        self._pending = (stage, job)
+                            "stage": "pipeline"}]
 
-        # Serialize job data into command
-        cmd = self._build_execute_cmd(stage, job)
+        # Build and send command
+        cmd = self._build_execute_cmd(job)
         self._cmd_queue.put(cmd)
         self._last_activity = _time.monotonic()
 
-    def _build_execute_cmd(self, stage: WorkStage, job: InferenceJob) -> ExecuteStageCmd:
-        """Serialize job data into an ExecuteStageCmd for cross-process transfer."""
-        # Move tensors to CPU for pickling
-        encode_tensors = None
-        if job.encode_result is not None:
-            er = job.encode_result
-            encode_tensors = {}
-            for name in ("prompt_embeds", "neg_prompt_embeds",
-                          "pooled_prompt_embeds", "neg_pooled_prompt_embeds"):
-                t = getattr(er, name, None)
-                if t is not None:
-                    encode_tensors[name] = t.cpu() if t.device.type != "cpu" else t
-
-        regional_tensors = None
-        if job.regional_encode_result is not None:
-            rer = job.regional_encode_result
-            def _cpu(t):
-                return t.cpu() if t is not None and t.device.type != "cpu" else t
-
-            regional_tensors = {
-                "region_embeds": [_cpu(e) for e in rer.region_embeds],
-                "neg_prompt_embeds": _cpu(rer.neg_prompt_embeds),
-                "neg_region_embeds": [_cpu(e) for e in rer.neg_region_embeds] if rer.neg_region_embeds else None,
-                "pooled_prompt_embeds": _cpu(rer.pooled_prompt_embeds),
-                "neg_pooled_prompt_embeds": _cpu(rer.neg_pooled_prompt_embeds),
-                "base_embeds": _cpu(rer.base_embeds),
-                "base_ratio": rer.base_ratio,
-            }
-
-        latents = None
+    def _build_execute_cmd(self, job: InferenceJob) -> ExecuteJobCmd:
+        """Serialize job data into an ExecuteJobCmd for cross-process transfer."""
+        # Move input latents to CPU for pickling
+        input_latents = None
         if job.latents is not None:
-            latents = job.latents.cpu() if job.latents.device.type != "cpu" else job.latents
+            input_latents = job.latents.cpu() if job.latents.device.type != "cpu" else job.latents
 
         regional_info_data = None
         if job.regional_info is not None:
             regional_info_data = job.regional_info.to_dict()
 
-        # Extract TE fingerprints from the job's pipeline so non-TE stages
-        # can protect TE TRT engines from eviction during model loading.
-        te_fps: dict[str, str] | None = None
-        if stage.type != StageType.GPU_TEXT_ENCODE:
-            for ps in job.pipeline:
-                if ps.type == StageType.GPU_TEXT_ENCODE:
-                    te_fps = {c.category: c.fingerprint
-                              for c in ps.required_components}
-                    break
-
-        return ExecuteStageCmd(
+        return ExecuteJobCmd(
             job_id=job.job_id,
             job_type_value=job.type.value,
-            stage_type=stage.type,
-            required_components=list(stage.required_components),
-            required_capability=stage.required_capability,
+            pipeline=job.pipeline,
             sdxl_input=job.sdxl_input,
             hires_input=job.hires_input,
             input_image=job.input_image,
+            input_latents=input_latents,
             tokenize_result=job.tokenize_result,
-            encode_result_tensors=encode_tensors,
-            regional_encode_tensors=regional_tensors,
             regional_tokenize_results=job.regional_tokenize_results,
             regional_base_tokenize=job.regional_base_tokenize,
             regional_shared_neg_tokenize=job.regional_shared_neg_tokenize,
-            latents=latents,
             regional_info_data=regional_info_data,
-            is_hires_pass=job.is_hires_pass,
-            oom_retries=job.oom_retries,
-            current_stage_index=job.current_stage_index,
-            pipeline_length=len(job.pipeline),
             priority=job.priority,
+            oom_retries=job.oom_retries,
+            is_hires_pass=job.is_hires_pass,
             unet_tile_width=job.unet_tile_width,
             unet_tile_height=job.unet_tile_height,
             vae_tile_width=job.vae_tile_width,
             vae_tile_height=job.vae_tile_height,
             orig_width=getattr(job, "orig_width", None),
             orig_height=getattr(job, "orig_height", None),
-            te_fingerprints=te_fps,
         )
 
     # ── TRT drain control ─────────────────────────────────────────
@@ -661,8 +517,8 @@ class GpuWorkerProxy:
     async def request_drain(self) -> None:
         """Request the worker to drain for TRT build.
 
-        Waits for all active jobs to complete (tracked locally), then
-        sends DrainCmd to evict models in the worker process.
+        Waits for the active job to complete (if any), then sends DrainCmd
+        to evict models in the worker process.
         """
         if self._draining or self._building:
             raise RuntimeError(f"GPU [{self._gpu_proxy.uuid}] is already draining/building")
@@ -670,11 +526,12 @@ class GpuWorkerProxy:
         self._drain_event = asyncio.Event()
         self._draining = True
 
+        active = 1 if self._active_job is not None else 0
         log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Drain requested — "
-                 f"waiting for {self._active_count} active job(s)")
+                 f"waiting for {active} active job(s)")
 
         # If already idle, drain is instant
-        if self._active_count == 0:
+        if self._active_job is None:
             self._drain_event.set()
 
         await self._drain_event.wait()
@@ -860,13 +717,11 @@ class GpuWorkerProxy:
                     log.info(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Worker ready "
                              f"(arch={msg.arch_key})")
 
-                elif isinstance(msg, StageResult):
-                    self._handle_stage_result(msg)
+                elif isinstance(msg, JobComplete):
+                    self._handle_job_complete(msg)
 
                 elif isinstance(msg, StatusSnapshot):
                     self._gpu_proxy._update(msg)
-                    # Fresh snapshot supersedes pending cost estimates
-                    self._pending_vram_cost = 0
                     # Merge measured model VRAM into global registry
                     if msg.fingerprint_vram:
                         _global_measured_vram.update(msg.fingerprint_vram)
@@ -910,82 +765,38 @@ class GpuWorkerProxy:
                               f"Worker error: {msg.error}")
                     if msg.fatal:
                         self._gpu_proxy.mark_failed(msg.error)
-                        # No cross-GPU propagation: each worker has an isolated
-                        # CUDA context (separate process + CUDA_VISIBLE_DEVICES),
-                        # so one GPU's fatal error cannot corrupt another's.
                     # Fail any pending futures
                     self._fail_pending_futures(msg.error)
 
         except asyncio.CancelledError:
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Reader loop cancelled")
 
-    def _handle_stage_result(self, msg: StageResult) -> None:
-        """Process a stage result from the worker."""
-        job = self._active_jobs.get(msg.job_id)
-        if job is None:
+    def _handle_job_complete(self, msg: JobComplete) -> None:
+        """Process a job completion from the worker."""
+        job = self._active_job
+        if job is None or job.job_id != msg.job_id:
             log.warning(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
                         f"Received result for unknown job {msg.job_id}")
             return
 
-        stage = job.current_stage
-        if stage is None:
-            log.warning(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
-                        f"Job {msg.job_id} has no current stage")
-            return
-
-        # Track GPU affinity for same-GPU scheduling preference
-        job.last_gpu_uuid = self._gpu_proxy.uuid
-
         # Update job timing
         job.model_load_time_s += msg.model_load_time_s
         job.gpu_time_s += msg.gpu_time_s
-        job.gpu_stage_times.extend(msg.gpu_stage_times)
-        job.denoise_step = msg.denoise_step
-        job.denoise_total_steps = msg.denoise_total_steps
-        job.is_hires_pass = msg.is_hires_pass
+        job.gpu_stage_times.extend(msg.stage_times)
 
-        # Restore tensors to job
-        if msg.encode_result_tensors:
-            job.encode_result = SdxlEncodeResult(
-                prompt_embeds=msg.encode_result_tensors.get("prompt_embeds"),
-                neg_prompt_embeds=msg.encode_result_tensors.get("neg_prompt_embeds"),
-                pooled_prompt_embeds=msg.encode_result_tensors.get("pooled_prompt_embeds"),
-                neg_pooled_prompt_embeds=msg.encode_result_tensors.get("neg_pooled_prompt_embeds"),
-            )
-        if msg.regional_encode_tensors:
-            job.regional_encode_result = SdxlRegionalEncodeResult(
-                region_embeds=msg.regional_encode_tensors.get("region_embeds", []),
-                neg_prompt_embeds=msg.regional_encode_tensors.get("neg_prompt_embeds"),
-                neg_region_embeds=msg.regional_encode_tensors.get("neg_region_embeds"),
-                pooled_prompt_embeds=msg.regional_encode_tensors.get("pooled_prompt_embeds"),
-                neg_pooled_prompt_embeds=msg.regional_encode_tensors.get("neg_pooled_prompt_embeds"),
-                base_embeds=msg.regional_encode_tensors.get("base_embeds"),
-                base_ratio=msg.regional_encode_tensors.get("base_ratio", 0.2),
-            )
-        if msg.latents is not None:
-            job.latents = msg.latents
-        if msg.tokenize_result is not None:
-            job.tokenize_result = msg.tokenize_result
-        if msg.regional_tokenize_results is not None:
-            job.regional_tokenize_results = msg.regional_tokenize_results
-        if msg.regional_base_tokenize is not None:
-            job.regional_base_tokenize = msg.regional_base_tokenize
-        if msg.regional_shared_neg_tokenize is not None:
-            job.regional_shared_neg_tokenize = msg.regional_shared_neg_tokenize
-        if msg.regional_info_data is not None:
-            from utils.regional import RegionalPromptResult
-            job.regional_info = RegionalPromptResult.from_dict(msg.regional_info_data)
+        # Mark GPU state BEFORE releasing (so scheduler sees correct state)
+        if msg.fatal:
+            self._gpu_proxy.mark_failed("CUDA context corrupted")
+        elif not msg.oom and not msg.success:
+            self._gpu_proxy.record_failure()
+        elif msg.success:
+            self._gpu_proxy.record_success()
 
-        # Update intermediate image
-        if msg.output_image is not None and msg.success:
-            if msg.current_stage_index < len(job.pipeline):
-                job.input_image = msg.output_image
-
-        # Release concurrency tracking
-        self._release_job(job, stage)
+        # Release the GPU (wakes scheduler)
+        self._release_job(job)
 
         if msg.oom:
-            # OOM — re-enqueue
+            # OOM — re-enqueue to a different GPU
             job.oom_retries += 1
             job.oom_gpu_ids.add(self._gpu_proxy.uuid)
             log.warning(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} OOM "
@@ -994,24 +805,20 @@ class GpuWorkerProxy:
             app_state.queue.re_enqueue(job)
 
         elif msg.fatal:
-            # Fatal CUDA error — only this GPU is affected (isolated process)
-            self._gpu_proxy.mark_failed(f"CUDA context corrupted")
             job.completed_at = datetime.utcnow()
             self._release_admission(job)
             job.set_result(JobResult(success=False, error=msg.error))
             self._broadcast_complete(job, success=False, error=msg.error)
 
         elif not msg.success:
-            # Non-fatal error
-            self._gpu_proxy.record_failure()
+            error_msg = msg.error or "Unknown worker error"
             job.completed_at = datetime.utcnow()
             self._release_admission(job)
-            job.set_result(JobResult(success=False, error=msg.error))
-            self._broadcast_complete(job, success=False, error=msg.error)
+            job.set_result(JobResult(success=False, error=error_msg))
+            self._broadcast_complete(job, success=False, error=error_msg)
 
-        elif msg.current_stage_index >= len(job.pipeline):
-            # Job complete
-            self._gpu_proxy.record_success()
+        else:
+            # Job completed successfully
             result = JobResult(
                 success=True,
                 output_image=msg.output_image,
@@ -1024,108 +831,37 @@ class GpuWorkerProxy:
             self._broadcast_complete(job, success=True)
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
-        else:
-            # More stages — advance and try fast re-dispatch
-            self._gpu_proxy.record_success()
-            job.current_stage_index = msg.current_stage_index
-            if not self._try_fast_redispatch(job):
-                from state import app_state
-                app_state.queue.re_enqueue(job)
-
-    def _try_fast_redispatch(self, job: InferenceJob) -> bool:
-        """Try to immediately dispatch the next stage to this same GPU.
-
-        Avoids the full scheduler round-trip (re-enqueue → wake → score all
-        GPUs → dispatch) when this GPU is clearly the best choice.  The
-        tensors still go through IPC (unavoidable with multiprocessing) but
-        we skip the scheduling latency.
-
-        Returns True if the job was dispatched, False if it should be
-        re-enqueued normally.
-        """
-        next_stage = job.current_stage
-        if next_stage is None:
-            return False
-
-        # Only fast-dispatch GPU stages (CPU stages go to the thread pool)
-        if next_stage.is_cpu_only:
-            return False
-
-        # Don't fast-dispatch if GPU is draining or failed
-        if self._draining or self._building or self._gpu_proxy.is_failed:
-            return False
-
-        # Don't fast-dispatch if GPU can't accept this stage type
-        if not self.can_accept_work(next_stage):
-            return False
-
-        # Don't fast-dispatch if there are incompatible higher-priority jobs
-        # waiting that this GPU could serve instead.  Only check groups that
-        # genuinely compete for the same GPU session slot — compatible-with-all
-        # groups (bgremove, upscale) can coexist with anything, and concurrent
-        # SDXL stages (TE, UNet, VAE) don't block each other.
-        from state import app_state
-        next_group = get_session_group(next_stage.type)
-        queue = app_state.queue
-        groups = queue.get_work_groups()
-        for g in groups:
-            if g.stage.is_cpu_only:
-                continue
-            if g.stage.type == next_stage.type:
-                continue
-            if g.oldest_age_seconds <= 5.0:
-                continue
-            waiting_group = get_session_group(g.stage.type)
-            # Compatible-with-all groups can coexist — not competing
-            if waiting_group in _COMPATIBLE_WITH_ALL or next_group in _COMPATIBLE_WITH_ALL:
-                continue
-            # Same session group (e.g. both sdxl) with different stage types
-            # can run concurrently — not competing
-            if waiting_group == next_group:
-                continue
-            # Genuinely incompatible group is starving — let scheduler handle it
-            return False
-
-        # VRAM budget check
-        if not self.check_vram_budget(next_stage, job):
-            return False
-
-        # All checks passed — dispatch immediately
-        log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: Fast re-dispatch "
-                  f"{job} → {next_stage.type.value}")
-        self.dispatch(next_stage, job)
-        return True
-
     def _handle_progress(self, msg: ProgressUpdate) -> None:
-        """Update job progress from worker."""
-        job = self._active_jobs.get(msg.job_id)
-        if job is not None:
+        """Update job progress from worker and broadcast to WebSocket clients."""
+        job = self._active_job
+        if job is not None and job.job_id == msg.job_id:
             job.denoise_step = msg.denoise_step
             job.denoise_total_steps = msg.denoise_total_steps
             job.stage_step = msg.stage_step
             job.stage_total_steps = msg.stage_total_steps
+            job.current_stage_index = msg.stage_index
 
-    def _release_job(self, job: InferenceJob, stage: WorkStage) -> None:
-        """Release concurrency tracking for a completed stage."""
+            # Broadcast to WebSocket clients
+            try:
+                from api.websocket import streamer
+                if self._loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        streamer.broadcast_progress(job), self._loop)
+            except Exception:
+                pass
+
+    def _release_job(self, job: InferenceJob) -> None:
+        """Release tracking for a completed job."""
         job.stage_status = ""
         job.active_gpus = []
-        self._active_jobs.pop(job.job_id, None)
+        job.assigned_gpu_uuid = None
 
-        self._active_count = max(0, self._active_count - 1)
-        self._active_stage_counts[stage.type] = max(
-            0, self._active_stage_counts[stage.type] - 1)
-        key = get_session_key(stage.type)
-        if key:
-            self._active_session_counts[key] = max(
-                0, self._active_session_counts[key] - 1)
+        self._active_job = None
+        self._gpu_proxy._busy = False
 
-        if self._active_count == 0:
-            self._gpu_proxy._busy = False
-            # Signal drain completion if draining
-            if self._draining and self._drain_event is not None:
-                self._drain_event.set()
-
-        self._pending = None
+        # Signal drain completion if draining
+        if self._draining and self._drain_event is not None:
+            self._drain_event.set()
 
         # Wake scheduler
         if self._scheduler_wake:
@@ -1201,11 +937,10 @@ class GpuWorkerProxy:
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(error))
 
-        # Fail all active jobs
-        for job_id, job in list(self._active_jobs.items()):
-            stage = job.current_stage
-            if stage:
-                self._release_job(job, stage)
+        # Fail the active job
+        job = self._active_job
+        if job is not None:
+            self._release_job(job)
             job.completed_at = datetime.utcnow()
             self._release_admission(job)
             job.set_result(JobResult(success=False, error=error))

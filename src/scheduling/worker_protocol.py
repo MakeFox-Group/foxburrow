@@ -8,14 +8,13 @@ Tensors crossing the boundary must be on CPU.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
 
 from PIL import Image
 import torch
 
 from scheduling.job import (
     StageType,
+    WorkStage,
     SdxlJobInput,
     SdxlHiresInput,
     SdxlTokenizeResult,
@@ -26,37 +25,33 @@ from scheduling.job import (
 # ── Commands (main → worker) ─────────────────────────────────────
 
 @dataclass
-class ExecuteStageCmd:
-    """Execute a single pipeline stage on the GPU."""
+class ExecuteJobCmd:
+    """Execute an entire job pipeline on the GPU (all stages, start to finish)."""
     job_id: str
-    job_type_value: str
-    stage_type: StageType
-    required_components: list[ModelComponentId]
-    required_capability: str | None
+    job_type_value: str                          # JobType value
+    pipeline: list[WorkStage]                    # Full pipeline stages
 
     # Job input data (immutable)
     sdxl_input: SdxlJobInput | None
     hires_input: SdxlHiresInput | None
-    input_image: Image.Image | None
+    input_image: Image.Image | None              # For enhance/img2img
+    input_latents: torch.Tensor | None           # CPU tensor for decode/hires latent jobs
 
-    # Intermediate state (CPU tensors only)
+    # CPU tokenization results (already completed in main process)
     tokenize_result: SdxlTokenizeResult | None
-    encode_result_tensors: dict[str, torch.Tensor] | None
-    regional_encode_tensors: dict[str, Any] | None
     regional_tokenize_results: list[SdxlTokenizeResult] | None
     regional_base_tokenize: SdxlTokenizeResult | None
     regional_shared_neg_tokenize: SdxlTokenizeResult | None
-    latents: torch.Tensor | None  # CPU tensor
 
     # Regional prompting info (serializable parts only)
     regional_info_data: dict | None
 
-    # Job progress / state
-    is_hires_pass: bool
-    oom_retries: int
-    current_stage_index: int
-    pipeline_length: int
+    # Job state
     priority: int
+    oom_retries: int
+
+    # Hires pass flag (set by routes for SdxlHiresLatents / SdxlGenerateHires)
+    is_hires_pass: bool = False
 
     # Tiling overrides
     unet_tile_width: int = 0
@@ -67,11 +62,6 @@ class ExecuteStageCmd:
     # Original dimensions for final resize
     orig_width: int | None = None
     orig_height: int | None = None
-
-    # TE fingerprints from the pipeline (category -> fingerprint).
-    # Populated by the proxy from the job's TE stage so non-TE stages
-    # can protect TE TRT engines from eviction during model loading.
-    te_fingerprints: dict[str, str] | None = None
 
 
 @dataclass
@@ -144,40 +134,22 @@ class GetStatusCmd:
 # ── Responses (worker → main) ────────────────────────────────────
 
 @dataclass
-class StageResult:
-    """Result of executing a pipeline stage."""
+class JobComplete:
+    """Result of executing an entire job pipeline."""
     job_id: str
     success: bool
     error: str | None = None
-    oom: bool = False
-    fatal: bool = False
+    oom: bool = False                   # True = re-route to different GPU
+    fatal: bool = False                 # True = GPU context corrupted
 
     # Output data
     output_image: Image.Image | None = None
     output_latents: torch.Tensor | None = None  # CPU tensor
 
-    # Updated intermediate state (CPU tensors)
-    encode_result_tensors: dict[str, torch.Tensor] | None = None
-    regional_encode_tensors: dict[str, Any] | None = None
-    latents: torch.Tensor | None = None  # CPU tensor
-    tokenize_result: SdxlTokenizeResult | None = None
-    regional_tokenize_results: list[SdxlTokenizeResult] | None = None
-    regional_base_tokenize: SdxlTokenizeResult | None = None
-    regional_shared_neg_tokenize: SdxlTokenizeResult | None = None
-    regional_info_data: dict | None = None
-
-    # Updated job state
-    is_hires_pass: bool = False
-    current_stage_index: int = 0
-
-    # Progress info
-    denoise_step: int = 0
-    denoise_total_steps: int = 0
-
     # Timing
-    model_load_time_s: float = 0.0
     gpu_time_s: float = 0.0
-    gpu_stage_times: list[dict] = field(default_factory=list)
+    model_load_time_s: float = 0.0
+    stage_times: list[dict] = field(default_factory=list)  # Per-stage timing breakdown
 
 
 @dataclass
@@ -217,6 +189,7 @@ class ProgressUpdate:
     denoise_total_steps: int
     stage_step: int = 0
     stage_total_steps: int = 0
+    stage_index: int = 0
 
 
 @dataclass

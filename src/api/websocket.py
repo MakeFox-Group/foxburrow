@@ -56,16 +56,19 @@ class ProgressStreamer:
             pass
 
         # Calculate overall pipeline progress (0.0 - 1.0)
-        stage_count = len(job.pipeline)
-        if stage_count > 0:
-            # Each stage contributes equally to overall progress
-            base_progress = job.current_stage_index / stage_count
-            # Within the current stage, denoise steps add fractional progress
+        # Count only GPU stages for accurate progress (CPU stages already complete)
+        gpu_stage_count = sum(1 for s in job.pipeline if not s.is_cpu_only)
+        gpu_stage_idx = sum(
+            1 for s in job.pipeline[:job.current_stage_index]
+            if not s.is_cpu_only
+        )
+        if gpu_stage_count > 0:
+            base_progress = gpu_stage_idx / gpu_stage_count
             if job.denoise_total_steps > 0:
                 stage_frac = job.denoise_step / job.denoise_total_steps
             else:
                 stage_frac = 0.5  # Non-denoise stages: assume halfway
-            overall_progress = base_progress + (stage_frac / stage_count)
+            overall_progress = base_progress + (stage_frac / gpu_stage_count)
         else:
             overall_progress = 0.0
 
@@ -76,8 +79,8 @@ class ProgressStreamer:
             "total": job.denoise_total_steps,
             "progress": round(overall_progress, 4),
             "stage": stage_type,
-            "stage_index": job.current_stage_index,
-            "stage_count": stage_count,
+            "stage_index": gpu_stage_idx,
+            "stage_count": gpu_stage_count,
             "gpu_count": gpu_count,
             "gpus": job.active_gpus,
         })

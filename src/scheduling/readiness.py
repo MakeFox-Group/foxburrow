@@ -12,7 +12,6 @@ Penalty/bonus magnitudes are calibrated so that:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -40,66 +39,41 @@ def _get_group_for_category(category: str) -> str:
     return "unknown"
 
 
-def _estimate_remaining_s(worker: GpuWorker, for_stage_type=None) -> float:
-    """Estimate seconds until a GPU worker can start a new stage.
+def _estimate_remaining_s(worker: GpuWorker) -> float:
+    """Estimate seconds until a GPU worker becomes idle.
 
-    With concurrent stage execution, only counts remaining time for
-    stages that CONFLICT with the requested stage type.  For example,
-    if a TE stage is running and we're scoring for UNet, the wait is 0
-    because TE and UNet run concurrently.
-
-    If for_stage_type is None, estimates time until fully idle.
+    With one-job-per-GPU, this estimates the remaining time for the
+    single active job (if any).
     """
     from datetime import datetime
-    from scheduling.scheduler import get_session_key
 
-    # Determine which session keys conflict with the requested stage
-    conflicting_keys: set[str] | None = None
-    if for_stage_type is not None:
-        req_key = get_session_key(for_stage_type)
-        if req_key:
-            conflicting_keys = {req_key}
-            # Also the stage type itself conflicts (only 1 per type)
-        # If no session key, treat all as conflicting
+    jobs = worker.active_jobs
+    if not jobs:
+        return 0.0
 
-    max_remaining = 0.0
-    for job in worker.active_jobs:
-        stage = job.current_stage
-        if stage is None:
-            continue
+    job = jobs[0]
 
-        # Skip stages that don't conflict with the requested type
-        if conflicting_keys is not None and for_stage_type is not None:
-            active_key = get_session_key(stage.type)
-            if active_key not in conflicting_keys and stage.type != for_stage_type:
-                continue
+    # If the job is in denoise and we have step progress, estimate from that
+    if job.denoise_step > 0 and job.denoise_total_steps > 0:
+        # Try to use per-stage timing from gpu_stage_times to get
+        # an accurate per-step rate that excludes text-encode time.
+        denoise_elapsed = None
+        for st in job.gpu_stage_times:
+            if st.get("stage") == "GpuDenoise":
+                denoise_elapsed = (denoise_elapsed or 0) + st.get("duration_s", 0)
 
-        is_denoise = stage.type.value == "GpuDenoise"
-        if is_denoise and job.denoise_step > 0 and job.denoise_total_steps > 0:
-            # Try to use per-stage timing from gpu_stage_times to get
-            # an accurate per-step rate that excludes text-encode time.
-            denoise_elapsed = None
-            for st in job.gpu_stage_times:
-                if st.get("stage") == "GpuDenoise":
-                    denoise_elapsed = (denoise_elapsed or 0) + st.get("duration_s", 0)
-
-            if denoise_elapsed is not None and denoise_elapsed > 0:
-                time_per_step = denoise_elapsed / job.denoise_step
-            elif job.started_at:
-                # Fallback: use total elapsed but clamp per-step to a
-                # reasonable max to avoid the text-encode inflation bug.
-                elapsed = (datetime.utcnow() - job.started_at).total_seconds()
-                time_per_step = min(elapsed / job.denoise_step, 5.0)
-            else:
-                time_per_step = 0.5  # reasonable default for SDXL
-
-            remaining = (job.denoise_total_steps - job.denoise_step) * time_per_step
+        if denoise_elapsed is not None and denoise_elapsed > 0:
+            time_per_step = denoise_elapsed / job.denoise_step
+        elif job.started_at:
+            elapsed = (datetime.utcnow() - job.started_at).total_seconds()
+            time_per_step = min(elapsed / job.denoise_step, 5.0)
         else:
-            remaining = 3.0  # flat estimate for non-denoise stages
+            time_per_step = 0.5
 
-        max_remaining = max(max_remaining, remaining)
+        return (job.denoise_total_steps - job.denoise_step) * time_per_step
 
-    return max_remaining
+    # Non-denoise or no progress yet
+    return 3.0
 
 
 def _would_evict_for_vram(gpu: GpuProxy, target_group: str, needed_vram: int) -> list[str]:

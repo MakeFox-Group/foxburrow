@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from scheduling.job import StageType, WorkStage
+from scheduling.job import ModelComponentId, StageType, WorkStage
 from scheduling.model_registry import ModelRegistry
+
+
+def get_all_components(pipeline: list[WorkStage]) -> list[ModelComponentId]:
+    """Return deduplicated components across all stages in the pipeline."""
+    seen: set[str] = set()
+    result: list[ModelComponentId] = []
+    for stage in pipeline:
+        for c in stage.required_components:
+            if c.fingerprint not in seen:
+                seen.add(c.fingerprint)
+                result.append(c)
+    return result
 
 
 class PipelineFactory:
