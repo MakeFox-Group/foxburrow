@@ -53,7 +53,7 @@ def _get_model_name(job: InferenceJob) -> str | None:
 
 # Constants
 VAE_SCALE_FACTOR = 0.13025
-VAE_TILE_THRESHOLD = 1024    # force tiled mode when any image dimension >= this (pixels)
+VAE_TILE_THRESHOLD = 1025    # force tiled mode when any dimension exceeds 1024 (pixels)
 VAE_TILE_MAX = 768           # max tile size per axis when tiling (pixels)
 LATENT_TILE_OVERLAP = 16     # latent overlap for VAE encode/decode tiles
 
