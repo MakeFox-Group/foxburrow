@@ -189,12 +189,6 @@ class GpuProxy:
         return self._status.trt_freeable_vram
 
     @property
-    def current_group(self) -> str | None:
-        if self._status is None:
-            return None
-        return self._status.session_group
-
-    @property
     def loaded_lora_count(self) -> int:
         if self._status is None:
             return 0

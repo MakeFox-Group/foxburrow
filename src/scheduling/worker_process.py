@@ -467,7 +467,7 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
         cached_fingerprints=cached_fps,
         cached_categories=cached_cats,
         cached_models_info=gpu.get_cached_models_info(),
-        session_group=gpu._current_group,
+        session_group=None,
         vram_stats=vram_stats,
         loaded_models_vram=gpu.get_loaded_models_vram(),
         evictable_vram=gpu.get_evictable_vram(),
@@ -515,6 +515,16 @@ def _execute_job(
     # Mark GPU busy
     gpu.acquire()
     preloader.clear()
+
+    # One GPU = one checkpoint.  Evict any models from a different
+    # checkpoint so the current model's components all fit.
+    if cmd.sdxl_input and cmd.sdxl_input.model_dir:
+        source_name = os.path.basename(cmd.sdxl_input.model_dir)
+        for ext in (".safetensors", ".ckpt"):
+            if source_name.endswith(ext):
+                source_name = source_name[:-len(ext)]
+                break
+        gpu.evict_other_sources(source_name)
 
     try:
         for stage_idx, stage in enumerate(pipeline):
@@ -835,13 +845,10 @@ def _ensure_models_for_stage(gpu, stage, job, gpu_model_name: str,
 
     if stage.type in (StageType.GPU_TEXT_ENCODE, StageType.GPU_DENOISE,
                       StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
-        gpu.ensure_session_group("sdxl")
         _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name, preloader)
     elif stage.type == StageType.GPU_UPSCALE:
-        gpu.ensure_session_group("upscale")
         _load_upscale_model(gpu)
     elif stage.type == StageType.GPU_BGREMOVE:
-        gpu.ensure_session_group("bgremove")
         _load_bgremove_model(gpu)
 
     # Add active fingerprints for eviction protection

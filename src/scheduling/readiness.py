@@ -24,20 +24,6 @@ if TYPE_CHECKING:
 # 500 MB/s = NVMe safetensors sequential read speed.
 LOAD_RATE = 500 * 1024 * 1024
 
-# Duplicated from gpu/pool.py to avoid circular imports at runtime.
-# Must stay in sync with gpu.pool._get_group_for_category.
-def _get_group_for_category(category: str) -> str:
-    """Map model category to session group."""
-    if category.startswith("sdxl") or category == "sdxl_lora":
-        return "sdxl"
-    if category == "upscale":
-        return "upscale"
-    if category == "bgremove":
-        return "bgremove"
-    if category == "tagger":
-        return "tagger"
-    return "unknown"
-
 
 def _estimate_remaining_s(worker: GpuWorker) -> float:
     """Estimate seconds until a GPU worker becomes idle.
@@ -76,58 +62,14 @@ def _estimate_remaining_s(worker: GpuWorker) -> float:
     return 3.0
 
 
-def _would_evict_for_vram(gpu: GpuProxy, target_group: str, needed_vram: int) -> list[str]:
-    """Return categories that would actually need evicting to free needed_vram.
-
-    Uses the proxy's cached_models_info (LRU-ordered) to estimate which models
-    would be evicted.  Returns empty list if enough free VRAM exists without
-    eviction.
-
-    Note: active/unevictable filtering is approximate since that data lives
-    in the worker process.  Slightly optimistic but acceptable for advisory scoring.
-    """
-    vram = gpu.get_vram_stats()
-    if not vram:
-        return []
-    deficit = needed_vram - vram.get("free", 0)
-    if deficit <= 0:
-        return []
-
-    models = gpu.get_cached_models_info()  # LRU-ordered list of dicts
-    evicted = []
-    freed = 0
-
-    # Pass 1: non-target-group models (prefer evicting cross-group first)
-    for m in models:
-        if freed >= deficit:
-            break
-        cat = m.get("category", "")
-        if _get_group_for_category(cat) != target_group:
-            evicted.append(cat)
-            freed += m.get("vram", 0)
-
-    # Pass 2: any model (if still short)
-    if freed < deficit:
-        for m in models:
-            if freed >= deficit:
-                break
-            cat = m.get("category", "")
-            if cat not in evicted:
-                evicted.append(cat)
-                freed += m.get("vram", 0)
-
-    return evicted
-
-
 def _score_simple_task(
     gpu: GpuProxy,
     worker: GpuWorker,
     target_category: str,
-    target_group: str,
 ) -> dict:
     """Score a simple task (upscale/bgremove/tag) for a specific GPU+worker.
 
-    Returns dict with score, estimated_wait_s, model_loaded, would_evict.
+    Returns dict with score, estimated_wait_s, model_loaded.
     """
     score = 0
     model_loaded = target_category in gpu.get_cached_categories()
@@ -145,8 +87,8 @@ def _score_simple_task(
     else:
         score -= int(15 * wait_s)
 
-    # Eviction analysis — only penalize models that would actually be evicted
-    # due to VRAM pressure, not all cross-group cached models
+    # VRAM deficit penalty — if model isn't loaded and VRAM is tight,
+    # loading it may require evicting something.
     from scheduling.model_registry import VramEstimates
     needed = {
         "upscale": VramEstimates.UPSCALE,
@@ -155,16 +97,11 @@ def _score_simple_task(
     }.get(target_category, 300 * 1024 * 1024)
 
     if not model_loaded:
-        would_evict = _would_evict_for_vram(gpu, target_group, needed)
-    else:
-        would_evict = []
-
-    for cat in would_evict:
-        cat_group = _get_group_for_category(cat)
-        if cat_group == "sdxl":
-            score -= 300
-        else:
-            score -= 100
+        vram = gpu.get_vram_stats()
+        free = vram.get("free", 0) if vram else 0
+        deficit = max(0, needed - free)
+        if deficit > 0:
+            score -= (deficit // (100 * 1024 * 1024)) * 30
 
     load_time = (needed / LOAD_RATE) if not model_loaded else 0.0
     return {
@@ -173,7 +110,6 @@ def _score_simple_task(
         "estimated_wait_s": round(wait_s, 1),
         "estimated_ready_s": round(wait_s + load_time, 1),
         "model_loaded": model_loaded,
-        "would_evict": would_evict,
     }
 
 
@@ -231,13 +167,6 @@ def _score_sdxl_checkpoint(
     else:
         score -= int(15 * wait_s)
 
-    # Session group affinity
-    current_group = gpu.current_group
-    if current_group == "sdxl":
-        score += 50
-    elif current_group is not None:
-        score -= 50
-
     # VRAM eviction penalty — 30 points per 100MB of deficit,
     # so a full 3.5GB deficit = ~1050 penalty (competitive with component bonuses)
     if missing_vram > 0:
@@ -284,19 +213,19 @@ def compute_readiness(
 
     # Simple tasks: upscale, bgremove, tag
     simple_tasks = {
-        "upscale": ("upscale", "upscale"),
-        "bgremove": ("bgremove", "bgremove"),
-        "tag": ("tagger", "tagger"),
+        "upscale": "upscale",
+        "bgremove": "bgremove",
+        "tag": "tagger",
     }
 
-    for task_key, (category, group) in simple_tasks.items():
+    for task_key, category in simple_tasks.items():
         best: dict | None = None
 
         for worker in workers:
             if not worker.gpu.supports_capability(task_key):
                 continue
 
-            entry = _score_simple_task(worker.gpu, worker, category, group)
+            entry = _score_simple_task(worker.gpu, worker, category)
             if best is None or entry["score"] > best["score"]:
                 best = entry
 
