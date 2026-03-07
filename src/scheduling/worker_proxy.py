@@ -780,6 +780,8 @@ class GpuWorkerProxy:
             self._release_admission(job)
             job.set_result(result)
             self._broadcast_complete(job, success=True)
+            if msg.clip_cache is not None:
+                self._broadcast_clip_cache(msg.clip_cache)
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
     def _handle_progress(self, msg: ProgressUpdate) -> None:
@@ -863,6 +865,29 @@ class GpuWorkerProxy:
                 app_state.job_results[job.job_id] = (buf.getvalue(), "application/x-fox-latent")
         except Exception as ex:
             log.log_exception(ex, f"GpuWorkerProxy: Failed to store result for {job}")
+
+    def _broadcast_clip_cache(self, cache_data: dict) -> None:
+        """Send CLIP embeddings to makefoxsrv for database caching."""
+        try:
+            import base64
+            entries = []
+            for e in cache_data["entries"]:
+                entries.append({
+                    "encoder_type": e.encoder_type,
+                    "polarity": e.polarity,
+                    "data": base64.b64encode(e.data).decode("ascii"),
+                    "dtype": e.dtype,
+                    "dim0": e.dim0,
+                    "dim1": e.dim1,
+                })
+            from api.websocket import streamer
+            streamer.fire_event("clip_embeddings", {
+                "prompt_hash": base64.b64encode(cache_data["prompt_hash"]).decode("ascii"),
+                "model": cache_data["model"],
+                "entries": entries,
+            })
+        except Exception as ex:
+            log.warning(f"  Failed to broadcast clip_embeddings: {ex}")
 
     def _broadcast_complete(self, job: InferenceJob, success: bool,
                             error: str | None = None) -> None:

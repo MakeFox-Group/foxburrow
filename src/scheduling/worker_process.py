@@ -27,6 +27,7 @@ from scheduling.worker_protocol import (
     ExecuteJobCmd,
     GetStatusCmd,
     JobComplete,
+    ClipCacheEntry,
     LogMessage,
     OnloadCmd,
     OnloadComplete,
@@ -695,6 +696,49 @@ def _execute_job(
             }
             stage_times.append(_stage_timing)
 
+            # Serialize CLIP tensors for caching after text_encode stage
+            if (stage.type == StageType.GPU_TEXT_ENCODE
+                    and hasattr(job, '_clip_cache_tensors')
+                    and job._clip_cache_tensors is not None):
+                try:
+                    import hashlib
+
+                    inp = job.sdxl_input
+                    model_name = _get_model_name_from_job(job)
+                    if not model_name:
+                        raise ValueError("No model name — skipping CLIP cache")
+                    hash_input = f"{inp.prompt}\0{inp.negative_prompt}\0{model_name}"
+                    prompt_hash = hashlib.sha256(hash_input.encode("utf-8")).digest()
+
+                    p_h1, n_h1, p_h2, n_h2, p_pooled, n_pooled = job._clip_cache_tensors
+
+                    def _ser(tensor, enc_type, polarity):
+                        t = tensor.squeeze(0).contiguous().half().cpu()
+                        return ClipCacheEntry(
+                            encoder_type=enc_type, polarity=polarity,
+                            data=t.numpy().tobytes(), dtype="fp16",
+                            dim0=t.shape[0],
+                            dim1=t.shape[1] if t.dim() >= 2 else None,
+                        )
+
+                    job._clip_cache_result = {
+                        "prompt_hash": prompt_hash,
+                        "model": model_name,
+                        "entries": [
+                            _ser(p_h1, "clip_l", "positive"),
+                            _ser(n_h1, "clip_l", "negative"),
+                            _ser(p_h2, "clip_g", "positive"),
+                            _ser(n_h2, "clip_g", "negative"),
+                            _ser(p_pooled, "clip_g_pooled", "positive"),
+                            _ser(n_pooled, "clip_g_pooled", "negative"),
+                        ],
+                    }
+                except Exception as ex:
+                    log.warning(f"  CLIP cache serialization failed: {ex}")
+                    job._clip_cache_result = None
+                finally:
+                    job._clip_cache_tensors = None  # Release GPU tensor references
+
             # Record stage completion for profiling
             if error is None:
                 _stage_w = job.sdxl_input.width if job.sdxl_input else 0
@@ -723,6 +767,10 @@ def _execute_job(
         gpu.clear_active_fingerprints()
         gpu.release()
         preloader.clear()
+        # Release GPU tensor references from CLIP capture if serialization was
+        # skipped due to break-on-error (OOM, CUDA fatal, etc.)
+        if hasattr(job, '_clip_cache_tensors'):
+            job._clip_cache_tensors = None
 
     # ── Build result ──────────────────────────────────────────────
     output_latents = None
@@ -741,6 +789,7 @@ def _execute_job(
         gpu_time_s=total_gpu_time,
         model_load_time_s=total_load_time,
         stage_times=stage_times,
+        clip_cache=getattr(job, '_clip_cache_result', None),
     )
 
 

@@ -134,6 +134,17 @@ class GetStatusCmd:
 # ── Responses (worker → main) ────────────────────────────────────
 
 @dataclass
+class ClipCacheEntry:
+    """Single CLIP encoder output for caching. Pickle-safe (raw bytes, no torch)."""
+    encoder_type: str       # "clip_l", "clip_g", "clip_g_pooled"
+    polarity: str           # "positive" or "negative"
+    data: bytes             # raw tensor bytes (contiguous, CPU, fp16)
+    dtype: str              # "fp16", "bf16", "fp32"
+    dim0: int
+    dim1: int | None
+
+
+@dataclass
 class JobComplete:
     """Result of executing an entire job pipeline."""
     job_id: str
@@ -150,6 +161,10 @@ class JobComplete:
     gpu_time_s: float = 0.0
     model_load_time_s: float = 0.0
     stage_times: list[dict] = field(default_factory=list)  # Per-stage timing breakdown
+
+    # CLIP embedding cache data (serialized tensors for DB storage)
+    clip_cache: dict | None = None
+    # {"prompt_hash": bytes(32), "model": str, "entries": list[ClipCacheEntry]}
 
 
 @dataclass

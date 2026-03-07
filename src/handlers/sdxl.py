@@ -768,6 +768,16 @@ def text_encode(job: InferenceJob, gpu: GpuInstance) -> None:
     log.debug(f"  SDXL: Text encoding complete. embeds={list(prompt_embeds.shape)} "
              f"pooled={list(pooled_prompt_embeds.shape)}")
 
+    # Capture individual CLIP tensors for caching (after emphasis + empty-neg zeroing)
+    # n_pooled is zeroed in-place by line 766 when negative is empty.
+    # n_h1/n_h2 are NOT zeroed (torch.cat at 756 created a new tensor), so zero explicitly.
+    _cache_n_h1 = n_h1
+    _cache_n_h2 = n_h2
+    if not inp.negative_prompt or not inp.negative_prompt.strip():
+        _cache_n_h1 = torch.zeros_like(n_h1)
+        _cache_n_h2 = torch.zeros_like(n_h2)
+    job._clip_cache_tensors = (p_h1, _cache_n_h1, p_h2, _cache_n_h2, p_pooled, n_pooled)
+
     job.encode_result = SdxlEncodeResult(
         prompt_embeds=prompt_embeds,
         neg_prompt_embeds=neg_prompt_embeds,
