@@ -22,12 +22,14 @@ from datetime import datetime
 # Do not import torch at module level.
 
 from scheduling.worker_protocol import (
+    ClipCacheEntry,
+    ClipCacheReady,
     DrainCmd,
     DrainComplete,
     ExecuteJobCmd,
     GetStatusCmd,
     JobComplete,
-    ClipCacheEntry,
+    LatentCacheReady,
     LogMessage,
     OnloadCmd,
     OnloadComplete,
@@ -356,7 +358,8 @@ def gpu_worker_main(
                 # Execute entire job pipeline on main thread (single-threaded)
                 try:
                     job_result = _execute_job(
-                        gpu, cmd, gpu_model_name, tracer, _worker_loop, preloader)
+                        gpu, cmd, gpu_model_name, tracer, _worker_loop, preloader,
+                        result_queue)
                     result_queue.put(job_result)
                 except Exception as ex:
                     fatal = _is_cuda_fatal_local(ex)
@@ -489,6 +492,7 @@ def _build_status_snapshot(gpu, gpu_model_name: str, arch_key: str) -> StatusSna
 
 def _execute_job(
     gpu, cmd: ExecuteJobCmd, gpu_model_name: str, tracer, loop, preloader: ModelPreloader,
+    result_queue,
 ) -> JobComplete:
     """Execute an entire job pipeline sequentially on one GPU."""
     import log
@@ -696,10 +700,11 @@ def _execute_job(
             }
             stage_times.append(_stage_timing)
 
-            # Serialize CLIP tensors for caching after text_encode stage
+            # Serialize CLIP tensors and send IPC immediately after text_encode
             if (stage.type == StageType.GPU_TEXT_ENCODE
                     and hasattr(job, '_clip_cache_tensors')
-                    and job._clip_cache_tensors is not None):
+                    and job._clip_cache_tensors is not None
+                    and error is None):
                 try:
                     p_h1, n_h1, p_h2, n_h2, p_pooled, n_pooled = job._clip_cache_tensors
 
@@ -712,9 +717,9 @@ def _execute_job(
                             dim1=t.shape[1] if t.dim() >= 2 else None,
                         )
 
-                    job._clip_cache_result = {
-                        "job_id": cmd.job_id,
-                        "entries": [
+                    result_queue.put(ClipCacheReady(
+                        job_id=cmd.job_id,
+                        entries=[
                             _ser(p_h1, "clip_l", "positive"),
                             _ser(n_h1, "clip_l", "negative"),
                             _ser(p_h2, "clip_g", "positive"),
@@ -722,28 +727,26 @@ def _execute_job(
                             _ser(p_pooled, "clip_g_pooled", "positive"),
                             _ser(n_pooled, "clip_g_pooled", "negative"),
                         ],
-                    }
+                    ))
                 except Exception as ex:
                     log.warning(f"  CLIP cache serialization failed: {ex}")
-                    job._clip_cache_result = None
                 finally:
                     job._clip_cache_tensors = None  # Release GPU tensor references
 
-            # Serialize latent tensor for caching after denoise stage
+            # Serialize latent tensor and send IPC immediately after denoise
             if (stage.type == StageType.GPU_DENOISE
                     and job.latents is not None
                     and error is None):
                 try:
                     t = job.latents.contiguous().half().cpu()
-                    job._latent_cache_result = {
-                        "job_id": cmd.job_id,
-                        "data": t.numpy().tobytes(),
-                        "dtype": "fp16",
-                        "shape": list(t.shape),
-                    }
+                    result_queue.put(LatentCacheReady(
+                        job_id=cmd.job_id,
+                        data=t.numpy().tobytes(),
+                        dtype="fp16",
+                        shape=list(t.shape),
+                    ))
                 except Exception as ex:
                     log.warning(f"  Latent cache serialization failed: {ex}")
-                    job._latent_cache_result = None
 
             # Record stage completion for profiling
             if error is None:
@@ -795,8 +798,41 @@ def _execute_job(
         gpu_time_s=total_gpu_time,
         model_load_time_s=total_load_time,
         stage_times=stage_times,
-        clip_cache=getattr(job, '_clip_cache_result', None),
-        latent_cache=getattr(job, '_latent_cache_result', None),
+    )
+
+
+def _rebuild_encode_result(entries: list):
+    """Reconstruct SdxlEncodeResult from cached ClipCacheEntry list."""
+    import numpy as np
+    import torch
+    from scheduling.job import SdxlEncodeResult
+
+    lookup = {(e.encoder_type, e.polarity): e for e in entries}
+
+    def _to_tensor(entry):
+        arr = np.frombuffer(entry.data, dtype=np.float16)
+        if entry.dim1 is not None:
+            arr = arr.reshape(entry.dim0, entry.dim1)
+        else:
+            arr = arr.reshape(entry.dim0)
+        return torch.from_numpy(arr.copy()).unsqueeze(0)  # restore batch dim
+
+    p_h1 = _to_tensor(lookup[("clip_l", "positive")])          # [1, 77*N, 768]
+    n_h1 = _to_tensor(lookup[("clip_l", "negative")])
+    p_h2 = _to_tensor(lookup[("clip_g", "positive")])          # [1, 77*N, 1280]
+    n_h2 = _to_tensor(lookup[("clip_g", "negative")])
+    p_pooled = _to_tensor(lookup[("clip_g_pooled", "positive")])  # [1, 1280]
+    n_pooled = _to_tensor(lookup[("clip_g_pooled", "negative")])
+
+    # Concatenate to match text_encode output format
+    prompt_embeds = torch.cat([p_h1, p_h2], dim=2)             # [1, 77*N, 2048]
+    neg_prompt_embeds = torch.cat([n_h1, n_h2], dim=2)
+
+    return SdxlEncodeResult(
+        prompt_embeds=prompt_embeds,
+        neg_prompt_embeds=neg_prompt_embeds,
+        pooled_prompt_embeds=p_pooled,
+        neg_pooled_prompt_embeds=n_pooled,
     )
 
 
@@ -834,6 +870,9 @@ def _reconstruct_job(cmd: ExecuteJobCmd, loop) -> object:
     job.vae_tile_width = cmd.vae_tile_width
     job.vae_tile_height = cmd.vae_tile_height
     job.encode_result = None
+    # If cached CLIP embeddings were provided, reconstruct encode_result
+    if cmd.cached_clip_entries:
+        job.encode_result = _rebuild_encode_result(cmd.cached_clip_entries)
     job.regional_encode_result = None
     job.regional_info = None
     job.regional_tokenize_results = cmd.regional_tokenize_results
@@ -845,6 +884,10 @@ def _reconstruct_job(cmd: ExecuteJobCmd, loop) -> object:
         job.orig_width = cmd.orig_width
     if cmd.orig_height is not None:
         job.orig_height = cmd.orig_height
+
+    # Preserve stripped TE components for TRT protection on cache-hit jobs
+    if cmd.stripped_te_components:
+        job.stripped_te_components = cmd.stripped_te_components
 
     # Reconstruct regional info
     if cmd.regional_info_data:
@@ -944,6 +987,11 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str,
             if ps.type == StageType.GPU_TEXT_ENCODE:
                 te_fps = {c.category: c.fingerprint for c in ps.required_components}
                 break
+        # Fallback: TE stage was stripped by CLIP cache — use preserved components
+        if not te_fps:
+            stripped = getattr(job, 'stripped_te_components', None)
+            if stripped:
+                te_fps = {c.category: c.fingerprint for c in stripped}
         for te_key, comp_name in (("sdxl_te1", "te1"), ("sdxl_te2", "te2")):
             base = te_fps.get(te_key)
             if base:

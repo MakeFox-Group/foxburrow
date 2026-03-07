@@ -41,6 +41,7 @@ class GenerateRequest(BaseModel):
     loras: list[dict] | None = None  # [{"name": "xxx", "weight": 1.0}, ...]
     regional_prompting: bool = False
     priority: int = Field(default=100, ge=1, le=100)
+    clip_embeddings: list[dict] | None = None  # Pre-computed CLIP cache entries (6 items)
 
 
 class GenerateHiresRequest(BaseModel):
@@ -63,6 +64,7 @@ class GenerateHiresRequest(BaseModel):
     vae_tile_width: int = 0    # VAE encode/decode tile width in pixels (0 = auto ≤ 1024)
     vae_tile_height: int = 0   # VAE encode/decode tile height in pixels (0 = auto ≤ 1024)
     priority: int = Field(default=100, ge=1, le=100)
+    clip_embeddings: list[dict] | None = None  # Pre-computed CLIP cache entries (6 items)
 
 
 # ====================================================================
@@ -147,6 +149,46 @@ def _parse_request_loras(prompt: str, negative_prompt: str,
                 all_loras.append(spec)
 
     return cleaned_prompt, cleaned_neg, all_loras
+
+
+def _parse_clip_cache_entries(entries: list[dict]):
+    """Parse clip_embeddings from request into ClipCacheEntry list."""
+    import base64
+    from scheduling.worker_protocol import ClipCacheEntry
+    result = []
+    for e in entries:
+        result.append(ClipCacheEntry(
+            encoder_type=e["encoder_type"],
+            polarity=e["polarity"],
+            data=base64.b64decode(e["data"]),
+            dtype=e["dtype"],
+            dim0=e["dim0"],
+            dim1=e.get("dim1"),
+        ))
+    return result
+
+
+def _apply_clip_cache(req, job) -> None:
+    """If the request has valid clip_embeddings, strip tokenize/text_encode
+    from the job pipeline and store the parsed entries on the job."""
+    from scheduling.job import StageType
+    if not req.clip_embeddings or getattr(req, 'regional_prompting', False):
+        return
+    if len(req.clip_embeddings) != 6:
+        return
+    try:
+        cached_clip = _parse_clip_cache_entries(req.clip_embeddings)
+        # Preserve TE components before stripping so TRT protection still works
+        te_stage = next((s for s in job.pipeline
+                         if s.type == StageType.GPU_TEXT_ENCODE), None)
+        if te_stage is not None:
+            job.stripped_te_components = te_stage.required_components
+        job.pipeline = [s for s in job.pipeline
+                        if s.type not in (StageType.CPU_TOKENIZE,
+                                          StageType.GPU_TEXT_ENCODE)]
+        job.cached_clip_entries = cached_clip
+    except Exception as ex:
+        log.warning(f"Invalid clip_embeddings, ignoring cache: {ex}")
 
 
 def _validate_dimensions(width: int, height: int, max_dim: int = 2048,
@@ -1345,6 +1387,8 @@ async def enqueue_generate(req: GenerateRequest):
         job.orig_width = orig_w
         job.orig_height = orig_h
 
+        _apply_clip_cache(req, job)
+
         _register_job(job)
         queue.enqueue(job)
         return {"job_id": job.job_id}
@@ -1451,6 +1495,8 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
         job.vae_tile_height = req.vae_tile_height
         job.orig_width = orig_w
         job.orig_height = orig_h
+
+        _apply_clip_cache(req, job)
 
         _register_job(job)
         queue.enqueue(job)
@@ -1592,19 +1638,21 @@ async def enqueue_tag(request: Request):
 async def enqueue_enhance(request: Request):
     """Enhance (img2img hires): upscale input image, VAE encode, hires denoise, VAE decode.
 
-    Body: PNG/JPEG image bytes
-    Query params:
-      prompt          (required)
-      negative_prompt (default: "")
-      model           (required or default configured)
-      hires_width     (required) — target output width
-      hires_height    (required) — target output height
-      hires_steps     (default: 15)
-      denoising_strength (default: 0.33)
-      cfg_scale       (default: 7.0)
-      seed            (default: random)
-      unet_tile_width, unet_tile_height (default: 0 = auto)
-      vae_tile_width, vae_tile_height   (default: 0 = auto)
+    Multipart form data:
+      image  (required) — PNG/JPEG image bytes
+      params (required) — JSON string with fields:
+        prompt          (required)
+        negative_prompt (default: "")
+        model           (required or default configured)
+        hires_width     (required) — target output width
+        hires_height    (required) — target output height
+        hires_steps     (default: 15)
+        denoising_strength (default: 0.33)
+        cfg_scale       (default: 7.0)
+        seed            (default: random)
+        unet_tile_width, unet_tile_height (default: 0 = auto)
+        vae_tile_width, vae_tile_height   (default: 0 = auto)
+        clip_embeddings (optional) — pre-computed CLIP cache entries
     """
     from scheduling.job import InferenceJob, JobType, SdxlJobInput, SdxlHiresInput
 
@@ -1615,24 +1663,35 @@ async def enqueue_enhance(request: Request):
     if not state.gpu_pool.has_capability("upscale"):
         return _error(404, "No GPUs configured for upscale on this worker.")
 
-    body = await request.body()
+    # Parse multipart form data
+    form = await request.form()
+    image_file = form.get("image")
+    params_str = form.get("params")
+
+    if image_file is None or params_str is None:
+        return _error(400, 'Multipart form must include "image" and "params" parts.')
+
+    image_bytes = await image_file.read()
     try:
-        input_image = Image.open(io.BytesIO(body)).convert("RGB")
+        input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception as ex:
         return _error(400, f"Could not decode image: {ex}")
 
-    qp = request.query_params
+    try:
+        p = json.loads(params_str)
+    except (json.JSONDecodeError, TypeError) as ex:
+        return _error(400, f"Invalid params JSON: {ex}")
 
-    prompt = qp.get("prompt", "").strip()
+    prompt = p.get("prompt", "").strip()
     if not prompt:
-        return _error(400, '"prompt" query param is required.')
-    negative_prompt = qp.get("negative_prompt", "")
+        return _error(400, '"prompt" is required.')
+    negative_prompt = p.get("negative_prompt", "")
 
     try:
-        hires_width  = int(qp["hires_width"])
-        hires_height = int(qp["hires_height"])
-    except (KeyError, ValueError):
-        return _error(400, '"hires_width" and "hires_height" query params are required integers.')
+        hires_width  = int(p["hires_width"])
+        hires_height = int(p["hires_height"])
+    except (KeyError, ValueError, TypeError):
+        return _error(400, '"hires_width" and "hires_height" are required integers.')
 
     # Enhance only needs multiples of 8 (VAE latent alignment), not 64
     err = _validate_dimensions(hires_width, hires_height, max_dim=4096, multiple=8)
@@ -1643,17 +1702,17 @@ async def enqueue_enhance(request: Request):
     gen_hires_w, gen_hires_h = _snap_dims(hires_width, hires_height, multiple=8)
 
     try:
-        hires_steps        = int(qp.get("hires_steps", "15"))
-        denoising_strength = float(qp.get("denoising_strength", "0.33"))
-        cfg_scale          = float(qp.get("cfg_scale", "7.0"))
-        seed_param         = int(qp.get("seed", "0"))
-        unet_tile_w        = int(qp.get("unet_tile_width",  "0"))
-        unet_tile_h        = int(qp.get("unet_tile_height", "0"))
-        vae_tile_w         = int(qp.get("vae_tile_width",   "0"))
-        vae_tile_h         = int(qp.get("vae_tile_height",  "0"))
-        job_priority       = max(1, min(100, int(qp.get("priority", "100"))))
+        hires_steps        = int(p.get("hires_steps", 15))
+        denoising_strength = float(p.get("denoising_strength", 0.33))
+        cfg_scale          = float(p.get("cfg_scale", 7.0))
+        seed_param         = int(p.get("seed", 0))
+        unet_tile_w        = int(p.get("unet_tile_width",  0))
+        unet_tile_h        = int(p.get("unet_tile_height", 0))
+        vae_tile_w         = int(p.get("vae_tile_width",   0))
+        vae_tile_h         = int(p.get("vae_tile_height",  0))
+        job_priority       = max(1, min(100, int(p.get("priority", 100))))
     except (ValueError, TypeError) as ex:
-        return _error(400, f"Invalid query parameter: {ex}")
+        return _error(400, f"Invalid parameter: {ex}")
 
     if not (1 <= hires_steps <= 150):
         return _error(400, "hires_steps must be between 1 and 150.")
@@ -1664,10 +1723,13 @@ async def enqueue_enhance(request: Request):
 
     seed = seed_param if seed_param != 0 else random.randint(1, 2**31 - 1)
 
-    model_name = qp.get("model")
+    model_name = p.get("model")
     model_dir, err = _resolve_model(model_name)
     if err:
         return _error(400, err)
+
+    regional_prompting = bool(p.get("regional_prompting", False))
+    clip_embeddings = p.get("clip_embeddings")
 
     admitted = False
     try:
@@ -1717,7 +1779,7 @@ async def enqueue_enhance(request: Request):
                 seed=seed,
                 model_dir=model_dir,
                 loras=all_loras,
-                regional_prompting=qp.get("regional_prompting", "false").lower() == "true",
+                regional_prompting=regional_prompting,
             ),
             hires_input=SdxlHiresInput(
                 hires_width=gen_hires_w,
@@ -1735,6 +1797,22 @@ async def enqueue_enhance(request: Request):
         job.vae_tile_height  = vae_tile_h
         job.orig_width = orig_hires_w
         job.orig_height = orig_hires_h
+
+        # Apply CLIP cache if provided
+        if clip_embeddings and not regional_prompting and len(clip_embeddings) == 6:
+            try:
+                from scheduling.job import StageType
+                cached_clip = _parse_clip_cache_entries(clip_embeddings)
+                te_stage = next((s for s in job.pipeline
+                                 if s.type == StageType.GPU_TEXT_ENCODE), None)
+                if te_stage is not None:
+                    job.stripped_te_components = te_stage.required_components
+                job.pipeline = [s for s in job.pipeline
+                                if s.type not in (StageType.CPU_TOKENIZE,
+                                                  StageType.GPU_TEXT_ENCODE)]
+                job.cached_clip_entries = cached_clip
+            except Exception as ex:
+                log.warning(f"Invalid clip_embeddings in enhance, ignoring cache: {ex}")
 
         _register_job(job)
         queue.enqueue(job)

@@ -22,11 +22,13 @@ from scheduling.job import (
     InferenceJob, JobResult, StageType,
 )
 from scheduling.worker_protocol import (
+    ClipCacheReady,
     DrainCmd,
     DrainComplete,
     ExecuteJobCmd,
     GetStatusCmd,
     JobComplete,
+    LatentCacheReady,
     LogMessage,
     OnloadCmd,
     OnloadComplete,
@@ -461,6 +463,8 @@ class GpuWorkerProxy:
             vae_tile_height=job.vae_tile_height,
             orig_width=getattr(job, "orig_width", None),
             orig_height=getattr(job, "orig_height", None),
+            cached_clip_entries=getattr(job, "cached_clip_entries", None),
+            stripped_te_components=getattr(job, "stripped_te_components", None),
         )
 
     # ── TRT drain control ─────────────────────────────────────────
@@ -691,6 +695,12 @@ class GpuWorkerProxy:
                 elif isinstance(msg, ProgressUpdate):
                     self._handle_progress(msg)
 
+                elif isinstance(msg, ClipCacheReady):
+                    self._broadcast_clip_cache(msg)
+
+                elif isinstance(msg, LatentCacheReady):
+                    self._broadcast_latent_cache(msg)
+
                 elif isinstance(msg, DrainComplete):
                     if self._drain_future and not self._drain_future.done():
                         self._drain_future.set_result(True)
@@ -779,13 +789,6 @@ class GpuWorkerProxy:
             job.completed_at = datetime.utcnow()
             self._release_admission(job)
             job.set_result(result)
-            # Broadcast caches before complete — makefoxsrv's "complete" handler
-            # removes the job from _burrowActiveTasks, so cache messages must
-            # arrive while the job mapping is still alive.
-            if msg.clip_cache is not None:
-                self._broadcast_clip_cache(msg.clip_cache)
-            if msg.latent_cache is not None:
-                self._broadcast_latent_cache(msg.latent_cache)
             self._broadcast_complete(job, success=True)
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
@@ -871,12 +874,12 @@ class GpuWorkerProxy:
         except Exception as ex:
             log.log_exception(ex, f"GpuWorkerProxy: Failed to store result for {job}")
 
-    def _broadcast_clip_cache(self, cache_data: dict) -> None:
+    def _broadcast_clip_cache(self, msg: ClipCacheReady) -> None:
         """Send CLIP embeddings to makefoxsrv for database caching."""
         try:
             import base64
             entries = []
-            for e in cache_data["entries"]:
+            for e in msg.entries:
                 entries.append({
                     "encoder_type": e.encoder_type,
                     "polarity": e.polarity,
@@ -887,22 +890,22 @@ class GpuWorkerProxy:
                 })
             from api.websocket import streamer
             streamer.fire_event("clip_embeddings", {
-                "job_id": cache_data["job_id"],
+                "job_id": msg.job_id,
                 "entries": entries,
             })
         except Exception as ex:
             log.warning(f"  Failed to broadcast clip_embeddings: {ex}")
 
-    def _broadcast_latent_cache(self, cache_data: dict) -> None:
+    def _broadcast_latent_cache(self, msg: LatentCacheReady) -> None:
         """Send denoised latents to makefoxsrv for database caching."""
         try:
             import base64
             from api.websocket import streamer
             streamer.fire_event("latent_cache", {
-                "job_id": cache_data["job_id"],
-                "data": base64.b64encode(cache_data["data"]).decode("ascii"),
-                "dtype": cache_data["dtype"],
-                "shape": cache_data["shape"],
+                "job_id": msg.job_id,
+                "data": base64.b64encode(msg.data).decode("ascii"),
+                "dtype": msg.dtype,
+                "shape": msg.shape,
             })
         except Exception as ex:
             log.warning(f"  Failed to broadcast latent_cache: {ex}")

@@ -63,6 +63,12 @@ class ExecuteJobCmd:
     orig_width: int | None = None
     orig_height: int | None = None
 
+    # Pre-computed CLIP embeddings (cache hit — skip text_encode)
+    cached_clip_entries: list[ClipCacheEntry] | None = None
+
+    # TE components stripped from pipeline on cache hit (for TRT protection)
+    stripped_te_components: list[ModelComponentId] | None = None
+
 
 @dataclass
 class DrainCmd:
@@ -162,13 +168,22 @@ class JobComplete:
     model_load_time_s: float = 0.0
     stage_times: list[dict] = field(default_factory=list)  # Per-stage timing breakdown
 
-    # CLIP embedding cache data (serialized tensors for DB storage)
-    clip_cache: dict | None = None
-    # {"prompt_hash": bytes(32), "model": str, "entries": list[ClipCacheEntry]}
 
-    # Latent cache data (serialized tensor for DB storage)
-    latent_cache: dict | None = None
-    # {"job_id": str, "data": bytes, "dtype": str, "shape": list[int]}
+
+@dataclass
+class ClipCacheReady:
+    """CLIP embeddings ready for caching — sent immediately after text_encode."""
+    job_id: str
+    entries: list[ClipCacheEntry]
+
+
+@dataclass
+class LatentCacheReady:
+    """Denoised latents ready for caching — sent immediately after GPU_DENOISE."""
+    job_id: str
+    data: bytes
+    dtype: str
+    shape: list[int]
 
 
 @dataclass

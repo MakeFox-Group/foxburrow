@@ -17,6 +17,7 @@ timm>=1.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.0
+python-multipart>=0.0.7
 
 # GPU monitoring (provides pynvml)
 nvidia-ml-py>=12.535

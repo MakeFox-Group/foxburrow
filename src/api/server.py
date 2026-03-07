@@ -70,6 +70,14 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
         return await call_next(request)
 
+    @app.middleware("http")
+    async def exception_logging_middleware(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as ex:
+            log.log_exception(ex, f"Unhandled exception: {request.method} {request.url.path}")
+            return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
     from api.routes import router
     app.include_router(router, prefix="/api")
 
