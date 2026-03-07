@@ -123,8 +123,12 @@ def _vram_aware_vae_tile(img_w: int, img_h: int, gpu: "GpuInstance",
             return (_auto_vae_tile(img_w, img_h, tw)[0],
                     _auto_vae_tile(img_w, img_h, th)[1])
 
-    # Fallback: minimum tile size
-    return _auto_vae_tile(img_w, img_h, VAE_TILE_MIN)
+    # Fallback: no profiling data confirmed any smaller tile fits.
+    # Use VAE_TILE_MAX (not MIN) — if the full image confirmed too large,
+    # a moderate tile very likely fits; MIN would over-tile needlessly.
+    log.debug(f"  SDXL: _vram_aware_vae_tile {img_w}x{img_h}: no profiling data "
+              f"confirmed fit — falling back to VAE_TILE_MAX={VAE_TILE_MAX}")
+    return _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
 
 
 def _optimal_tile_for_axis(dim: int, min_tile: int, max_tile: int) -> int | None:

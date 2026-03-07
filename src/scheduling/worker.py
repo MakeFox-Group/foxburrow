@@ -89,16 +89,19 @@ def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, 
 
     if stage_type == StageType.GPU_HIRES_TRANSFORM:
         if job.hires_input and job.hires_input.hires_width > 0:
-            return job.hires_input.hires_width, job.hires_input.hires_height
+            w, h = job.hires_input.hires_width, job.hires_input.hires_height
+        # Hires transform includes VAE internally — cap like other VAE stages
+        return min(w, VAE_TILE_MAX), min(h, VAE_TILE_MAX)
 
     if job.input_image is not None and stage_type in (
             StageType.GPU_UPSCALE, StageType.GPU_BGREMOVE):
         return job.input_image.width, job.input_image.height
 
-    # VAE encode/decode: handlers use VRAM-aware adaptive tiling.
-    # Always cap to tile size for working memory estimation — the handler
-    # will tile if the full image doesn't fit, so we shouldn't predict
-    # the full-image working memory (which forces UNet eviction on 12GB GPUs).
+    # VAE encode/decode and hires transform: handlers use VRAM-aware
+    # adaptive tiling.  Cap to tile size for working memory estimation —
+    # the handler will tile if the full image doesn't fit, so we shouldn't
+    # predict the full-image working memory (which forces UNet eviction
+    # on 12GB GPUs).
     if stage_type in (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
         w = min(w, VAE_TILE_MAX)
         h = min(h, VAE_TILE_MAX)
