@@ -739,6 +739,21 @@ def _execute_job(
                 finally:
                     job._clip_cache_tensors = None  # Release GPU tensor references
 
+            # Serialize latent tensor for caching after denoise stage
+            if (stage.type == StageType.GPU_DENOISE
+                    and job.latents is not None):
+                try:
+                    t = job.latents.contiguous().half().cpu()
+                    job._latent_cache_result = {
+                        "job_id": cmd.job_id,
+                        "data": t.numpy().tobytes(),
+                        "dtype": "fp16",
+                        "shape": list(t.shape),
+                    }
+                except Exception as ex:
+                    log.warning(f"  Latent cache serialization failed: {ex}")
+                    job._latent_cache_result = None
+
             # Record stage completion for profiling
             if error is None:
                 _stage_w = job.sdxl_input.width if job.sdxl_input else 0
@@ -771,6 +786,8 @@ def _execute_job(
         # skipped due to break-on-error (OOM, CUDA fatal, etc.)
         if hasattr(job, '_clip_cache_tensors'):
             job._clip_cache_tensors = None
+        if hasattr(job, '_latent_cache_result'):
+            job._latent_cache_result = None
 
     # ── Build result ──────────────────────────────────────────────
     output_latents = None
@@ -790,6 +807,7 @@ def _execute_job(
         model_load_time_s=total_load_time,
         stage_times=stage_times,
         clip_cache=getattr(job, '_clip_cache_result', None),
+        latent_cache=getattr(job, '_latent_cache_result', None),
     )
 
 

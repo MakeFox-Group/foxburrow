@@ -782,6 +782,8 @@ class GpuWorkerProxy:
             self._broadcast_complete(job, success=True)
             if msg.clip_cache is not None:
                 self._broadcast_clip_cache(msg.clip_cache)
+            if msg.latent_cache is not None:
+                self._broadcast_latent_cache(msg.latent_cache)
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
     def _handle_progress(self, msg: ProgressUpdate) -> None:
@@ -888,6 +890,20 @@ class GpuWorkerProxy:
             })
         except Exception as ex:
             log.warning(f"  Failed to broadcast clip_embeddings: {ex}")
+
+    def _broadcast_latent_cache(self, cache_data: dict) -> None:
+        """Send denoised latents to makefoxsrv for database caching."""
+        try:
+            import base64
+            from api.websocket import streamer
+            streamer.fire_event("latent_cache", {
+                "job_id": cache_data["job_id"],
+                "data": base64.b64encode(cache_data["data"]).decode("ascii"),
+                "dtype": cache_data["dtype"],
+                "shape": cache_data["shape"],
+            })
+        except Exception as ex:
+            log.warning(f"  Failed to broadcast latent_cache: {ex}")
 
     def _broadcast_complete(self, job: InferenceJob, success: bool,
                             error: str | None = None) -> None:

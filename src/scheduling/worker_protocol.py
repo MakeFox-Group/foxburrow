@@ -166,6 +166,10 @@ class JobComplete:
     clip_cache: dict | None = None
     # {"prompt_hash": bytes(32), "model": str, "entries": list[ClipCacheEntry]}
 
+    # Latent cache data (serialized tensor for DB storage)
+    latent_cache: dict | None = None
+    # {"job_id": str, "data": bytes, "dtype": str, "shape": list[int]}
+
 
 @dataclass
 class StatusSnapshot:
