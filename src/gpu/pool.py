@@ -391,12 +391,15 @@ class GpuInstance:
             self._cache.move_to_end(fingerprint)
 
     def evict_other_sources(self, keep_source: str) -> int:
-        """Evict all cached models whose source differs from keep_source.
+        """Evict SDXL-category cached models whose source differs from keep_source.
 
         One GPU = one safetensor model.  When a new checkpoint is loaded,
-        evict everything from the old one so TEs/VAE have room alongside
-        the UNet.  Models are moved to CPU cache for fast reload if the
-        same checkpoint is requested again later.
+        evict the old checkpoint's components (UNet, TEs, VAE, TRT engines)
+        so the new checkpoint fits.  Utility models (upscale, bgremove,
+        tagger) are left alone — they're checkpoint-agnostic.
+
+        Models are moved to CPU cache for fast reload if the same
+        checkpoint is requested again later.
 
         Returns the number of models evicted.
         """
@@ -408,7 +411,14 @@ class GpuInstance:
         active_fps = self.get_active_fingerprints()
         with self._cache_lock:
             for fp, m in self._cache.items():
-                if m.source and m.source != keep_source and fp not in active_fps:
+                # Only evict SDXL-category models (checkpoint-specific)
+                if not m.category.startswith("sdxl"):
+                    continue
+                if not self._is_evictable(fp, None):
+                    continue
+                if fp in active_fps:
+                    continue
+                if m.source and m.source != keep_source:
                     to_evict.append(fp)
 
         evicted = 0

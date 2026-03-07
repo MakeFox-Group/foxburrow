@@ -99,7 +99,8 @@ def _score_simple_task(
     if not model_loaded:
         vram = gpu.get_vram_stats()
         free = vram.get("free", 0) if vram else 0
-        deficit = max(0, needed - free)
+        effective_free = free + gpu.get_evictable_vram()
+        deficit = max(0, needed - effective_free)
         if deficit > 0:
             score -= (deficit // (100 * 1024 * 1024)) * 30
 
@@ -172,7 +173,8 @@ def _score_sdxl_checkpoint(
     if missing_vram > 0:
         vram = gpu.get_vram_stats()
         free = vram.get("free", 0) if vram else 0
-        deficit = max(0, missing_vram - free)
+        effective_free = free + gpu.get_evictable_vram()
+        deficit = max(0, missing_vram - effective_free)
         if deficit > 0:
             score -= (deficit // (100 * 1024 * 1024)) * 30
 
