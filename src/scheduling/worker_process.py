@@ -741,7 +741,8 @@ def _execute_job(
 
             # Serialize latent tensor for caching after denoise stage
             if (stage.type == StageType.GPU_DENOISE
-                    and job.latents is not None):
+                    and job.latents is not None
+                    and error is None):
                 try:
                     t = job.latents.contiguous().half().cpu()
                     job._latent_cache_result = {
@@ -786,8 +787,6 @@ def _execute_job(
         # skipped due to break-on-error (OOM, CUDA fatal, etc.)
         if hasattr(job, '_clip_cache_tensors'):
             job._clip_cache_tensors = None
-        if hasattr(job, '_latent_cache_result'):
-            job._latent_cache_result = None
 
     # ── Build result ──────────────────────────────────────────────
     output_latents = None
