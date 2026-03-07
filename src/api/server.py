@@ -38,6 +38,42 @@ def _check_secret(headers, query_params) -> bool:
     return False
 
 
+class _ExceptionLoggingMiddleware:
+    """ASGI middleware that logs unhandled exceptions to output.jsonl.
+
+    Wraps the entire ASGI app so exceptions from any layer (routes, middleware,
+    form parsing) are captured.  Only sends a 500 response if headers haven't
+    been sent yet — safe with streaming responses.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+        original_send = send
+
+        async def send_wrapper(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await original_send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as ex:
+            request = Request(scope)
+            log.log_exception(ex, f"Unhandled exception: {request.method} {request.url.path}")
+            if not response_started:
+                response = JSONResponse(
+                    status_code=500, content={"error": "Internal server error"})
+                await response(scope, receive, original_send)
+
+
 def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None) -> FastAPI:
 
     @asynccontextmanager
@@ -70,13 +106,11 @@ def create_app(on_startup: Callable[[], Coroutine[Any, Any, None]] | None = None
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
         return await call_next(request)
 
-    @app.middleware("http")
-    async def exception_logging_middleware(request: Request, call_next):
-        try:
-            return await call_next(request)
-        except Exception as ex:
-            log.log_exception(ex, f"Unhandled exception: {request.method} {request.url.path}")
-            return JSONResponse(status_code=500, content={"error": "Internal server error"})
+    # Pure ASGI exception-logging middleware — outermost layer.
+    # Uses raw ASGI instead of BaseHTTPMiddleware to guarantee exception
+    # propagation regardless of Starlette version and to handle streaming
+    # responses safely (won't send a new response if headers already sent).
+    app.add_middleware(_ExceptionLoggingMiddleware)
 
     from api.routes import router
     app.include_router(router, prefix="/api")
