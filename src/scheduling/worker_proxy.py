@@ -779,11 +779,14 @@ class GpuWorkerProxy:
             job.completed_at = datetime.utcnow()
             self._release_admission(job)
             job.set_result(result)
-            self._broadcast_complete(job, success=True)
+            # Broadcast caches before complete — makefoxsrv's "complete" handler
+            # removes the job from _burrowActiveTasks, so cache messages must
+            # arrive while the job mapping is still alive.
             if msg.clip_cache is not None:
                 self._broadcast_clip_cache(msg.clip_cache)
             if msg.latent_cache is not None:
                 self._broadcast_latent_cache(msg.latent_cache)
+            self._broadcast_complete(job, success=True)
             log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: {job} completed")
 
     def _handle_progress(self, msg: ProgressUpdate) -> None:
