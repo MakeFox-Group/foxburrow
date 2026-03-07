@@ -884,8 +884,7 @@ class GpuWorkerProxy:
                 })
             from api.websocket import streamer
             streamer.fire_event("clip_embeddings", {
-                "prompt_hash": base64.b64encode(cache_data["prompt_hash"]).decode("ascii"),
-                "model": cache_data["model"],
+                "job_id": cache_data["job_id"],
                 "entries": entries,
             })
         except Exception as ex:

@@ -701,15 +701,6 @@ def _execute_job(
                     and hasattr(job, '_clip_cache_tensors')
                     and job._clip_cache_tensors is not None):
                 try:
-                    import hashlib
-
-                    inp = job.sdxl_input
-                    model_name = _get_model_name_from_job(job)
-                    if not model_name:
-                        raise ValueError("No model name — skipping CLIP cache")
-                    hash_input = f"{inp.prompt}\0{inp.negative_prompt}\0{model_name}"
-                    prompt_hash = hashlib.sha256(hash_input.encode("utf-8")).digest()
-
                     p_h1, n_h1, p_h2, n_h2, p_pooled, n_pooled = job._clip_cache_tensors
 
                     def _ser(tensor, enc_type, polarity):
@@ -722,8 +713,7 @@ def _execute_job(
                         )
 
                     job._clip_cache_result = {
-                        "prompt_hash": prompt_hash,
-                        "model": model_name,
+                        "job_id": cmd.job_id,
                         "entries": [
                             _ser(p_h1, "clip_l", "positive"),
                             _ser(n_h1, "clip_l", "negative"),
