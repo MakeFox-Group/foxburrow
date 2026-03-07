@@ -476,9 +476,8 @@ class GpuInstance:
         with self._cpu_cache_lock:
             if fingerprint not in self._cpu_cache:
                 return None
-            entry = self._cpu_cache.pop(fingerprint)
-            vram = entry.actual_vram if entry.actual_vram > 0 else entry.estimated_vram
-            self._cpu_cache_bytes -= vram
+            entry, stored_bytes = self._cpu_cache.pop(fingerprint)
+            self._cpu_cache_bytes -= stored_bytes
         return entry
 
     def _cpu_cache_store(self, model_entry: CachedModel) -> None:
@@ -500,27 +499,26 @@ class GpuInstance:
         with self._cpu_cache_lock:
             # If this fingerprint is already in CPU cache, remove old entry first
             if model_entry.fingerprint in self._cpu_cache:
-                old = self._cpu_cache.pop(model_entry.fingerprint)
-                old_vram = old.actual_vram if old.actual_vram > 0 else old.estimated_vram
-                self._cpu_cache_bytes -= old_vram
+                _, old_bytes = self._cpu_cache.pop(model_entry.fingerprint)
+                self._cpu_cache_bytes -= old_bytes
 
             # Evict oldest entries until we have room
             while (self._cpu_cache_bytes + vram > self._cpu_cache_limit
                    and self._cpu_cache):
-                _, evicted = self._cpu_cache.popitem(last=False)
-                ev_vram = evicted.actual_vram if evicted.actual_vram > 0 else evicted.estimated_vram
-                self._cpu_cache_bytes -= ev_vram
+                _, (evicted, ev_bytes) = self._cpu_cache.popitem(last=False)
+                self._cpu_cache_bytes -= ev_bytes
                 log.debug(f"  GPU [{self.uuid}]: CPU cache evicted {evicted.category} "
-                         f"({evicted.source}, ~{ev_vram // (1024*1024)}MB)")
+                         f"({evicted.source}, ~{ev_bytes // (1024*1024)}MB)")
                 del evicted
 
-            self._cpu_cache[model_entry.fingerprint] = model_entry
+            self._cpu_cache[model_entry.fingerprint] = (model_entry, vram)
             self._cpu_cache.move_to_end(model_entry.fingerprint)
             self._cpu_cache_bytes += vram
+            _total = self._cpu_cache_bytes
 
         log.debug(f"  GPU [{self.uuid}]: CPU cache stored {model_entry.category} "
                  f"({model_entry.source}, ~{vram // (1024*1024)}MB, "
-                 f"total {self._cpu_cache_bytes // (1024*1024)}MB / "
+                 f"total {_total // (1024*1024)}MB / "
                  f"{self._cpu_cache_limit // (1024*1024)}MB)")
 
     def get_cpu_cache_info(self) -> dict:
@@ -531,9 +529,8 @@ class GpuInstance:
                 "bytes": self._cpu_cache_bytes,
                 "limit": self._cpu_cache_limit,
                 "models": [
-                    {"category": m.category, "source": m.source,
-                     "bytes": m.actual_vram if m.actual_vram > 0 else m.estimated_vram}
-                    for m in self._cpu_cache.values()
+                    {"category": m.category, "source": m.source, "bytes": stored_bytes}
+                    for m, stored_bytes in self._cpu_cache.values()
                 ],
             }
 
