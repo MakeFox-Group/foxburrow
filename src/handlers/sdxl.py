@@ -55,6 +55,7 @@ def _get_model_name(job: InferenceJob) -> str | None:
 VAE_SCALE_FACTOR = 0.13025
 VAE_TILE_THRESHOLD = 1025    # force tiled mode when any dimension exceeds 1024 (pixels)
 VAE_TILE_MAX = 768           # max tile size per axis when tiling (pixels)
+VAE_TILE_MIN = 256           # minimum tile size (below this, quality degrades too much)
 LATENT_TILE_OVERLAP = 16     # latent overlap for VAE encode/decode tiles
 
 def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
@@ -67,6 +68,63 @@ def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
         n = math.ceil(dim / max_tile)
         return math.ceil(math.ceil(dim / n) / 8) * 8  # round up to multiple of 8
     return _axis(img_w), _axis(img_h)
+
+
+def _vram_aware_vae_tile(img_w: int, img_h: int, gpu: "GpuInstance",
+                         component_type: str = "sdxl_vae") -> tuple[int, int] | None:
+    """Compute the largest non-square tile that fits in available VRAM.
+
+    Uses the workspace profiler to look up actual working memory at
+    candidate tile sizes.  Returns None if the full image fits without
+    tiling.
+
+    Strategy: try the full image first.  If it doesn't fit, shrink the
+    larger axis by halving it (rounded to 8px), keeping the smaller axis
+    full-width.  Example: 1024x1024 → try 1024x512 → 512x512 → etc.
+    This maximizes tile area (fewer tiles, less overlap) while fitting
+    in VRAM.  Tiles don't need to be square — a 1024x512 tile for a
+    1024x1024 image only needs 2 tiles with one overlap boundary.
+    """
+    from gpu import nvml
+    from gpu.workspace_profiler import get_working_memory, get_gpu_model_name
+
+    gpu_model = get_gpu_model_name(gpu.device)
+    _, _, free_bytes = nvml.get_memory_info(gpu.nvml_handle)
+
+    # VAE model itself is already loaded (or will be), so free VRAM is
+    # what's available for working memory.  Add a safety margin.
+    available = int(free_bytes * 0.90)  # 10% safety margin
+
+    # Check if full image fits without tiling
+    full_wm = get_working_memory(component_type, gpu_model, img_w, img_h)
+    if full_wm is not None and full_wm <= available:
+        return None  # no tiling needed
+
+    # If no profiling data exists, fall back to conservative tiling
+    if full_wm is None:
+        return _auto_vae_tile(img_w, img_h, VAE_TILE_MAX)
+
+    # Shrink by halving the larger axis first, then alternate.
+    # Each step roughly halves the working memory.
+    tw, th = img_w, img_h
+    while tw >= VAE_TILE_MIN and th >= VAE_TILE_MIN:
+        # Shrink the larger dimension
+        if tw >= th:
+            tw = ((tw // 2) // 8) * 8
+        else:
+            th = ((th // 2) // 8) * 8
+
+        if tw < VAE_TILE_MIN or th < VAE_TILE_MIN:
+            break
+
+        wm = get_working_memory(component_type, gpu_model, tw, th)
+        if wm is not None and wm <= available:
+            # Compute actual tile sizes that evenly divide the image
+            return (_auto_vae_tile(img_w, img_h, tw)[0],
+                    _auto_vae_tile(img_w, img_h, th)[1])
+
+    # Fallback: minimum tile size
+    return _auto_vae_tile(img_w, img_h, VAE_TILE_MIN)
 
 
 def _optimal_tile_for_axis(dim: int, min_tile: int, max_tile: int) -> int | None:
@@ -1391,6 +1449,15 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
         # No explicit override and no full-image TRT — check if tiling needed
         if img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
             tile_w, tile_h = _pick_vae_tile_size(img_w, img_h, gpu, job)
+        else:
+            # Below threshold, but check if VRAM can handle untiled.
+            # On 12GB GPUs, untiled VAE at 1024x1024 needs ~4GB working
+            # memory which forces evicting the UNet — tile to avoid that.
+            vram_tile = _vram_aware_vae_tile(img_w, img_h, gpu, "sdxl_vae")
+            if vram_tile is not None:
+                tile_w, tile_h = vram_tile
+                log.debug(f"  SDXL: VRAM-aware tiling: {img_w}x{img_h} → "
+                          f"tile {tile_w}x{tile_h} (insufficient free VRAM for untiled)")
 
     lat_tile_w = tile_w // 8
     lat_tile_h = tile_h // 8
@@ -1509,7 +1576,15 @@ def vae_encode(job: InferenceJob, gpu: GpuInstance) -> None:
         tile_w, tile_h = _pick_vae_tile_size(img_w, img_h, gpu, job, component_type="vae_enc")
         trt_enc = _get_trt_vae_enc_runner(gpu, job, tile_w, tile_h)
     else:
-        tile_w, tile_h = img_w, img_h
+        # Below threshold — check if VRAM can handle untiled
+        vram_tile = _vram_aware_vae_tile(img_w, img_h, gpu, "sdxl_vae_enc")
+        if vram_tile is not None:
+            tile_w, tile_h = vram_tile
+            trt_enc = _get_trt_vae_enc_runner(gpu, job, tile_w, tile_h)
+            log.debug(f"  SDXL: VRAM-aware encode tiling: {img_w}x{img_h} → "
+                      f"tile {tile_w}x{tile_h} (insufficient free VRAM for untiled)")
+        else:
+            tile_w, tile_h = img_w, img_h
 
     # Only load PyTorch VAE if TRT is not available
     vae = None
@@ -1596,7 +1671,15 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
         log.debug(f"  HiresTransform: Tiled {hires_img_w}x{hires_img_h} → "
                   f"tile {tile_w}x{tile_h}, backend={'TRT' if trt_vae else 'PyTorch'}")
     else:
-        tile_w, tile_h = hires_img_w, hires_img_h
+        # Below threshold — check if VRAM can handle untiled
+        vram_tile = _vram_aware_vae_tile(hires_img_w, hires_img_h, gpu, "sdxl_vae")
+        if vram_tile is not None:
+            tile_w, tile_h = vram_tile
+            trt_vae = _get_trt_vae_runner(gpu, job, tile_w, tile_h)
+            log.debug(f"  HiresTransform: VRAM-aware tiling: {hires_img_w}x{hires_img_h} → "
+                      f"tile {tile_w}x{tile_h}")
+        else:
+            tile_w, tile_h = hires_img_w, hires_img_h
 
     # Scale latents with correct dtype
     if trt_vae is not None:
@@ -1646,6 +1729,14 @@ def hires_transform(job: InferenceJob, gpu: GpuInstance) -> None:
             enc_tile_w, enc_tile_h = _pick_vae_tile_size(target_w, target_h, gpu, job,
                                                           component_type="vae_enc")
             trt_enc = _get_trt_vae_enc_runner(gpu, job, enc_tile_w, enc_tile_h)
+        elif enc_tile_w == 0 and enc_tile_h == 0:
+            # Below threshold, no user override — check VRAM
+            vram_tile = _vram_aware_vae_tile(target_w, target_h, gpu, "sdxl_vae_enc")
+            if vram_tile is not None:
+                enc_tile_w, enc_tile_h = vram_tile
+                trt_enc = _get_trt_vae_enc_runner(gpu, job, enc_tile_w, enc_tile_h)
+                log.debug(f"  HiresTransform: VRAM-aware encode tiling: "
+                          f"{target_w}x{target_h} → tile {enc_tile_w}x{enc_tile_h}")
 
     # Only load PyTorch VAE for encode if TRT is not available and not already loaded
     enc_vae = None if trt_enc is not None else vae

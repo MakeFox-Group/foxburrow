@@ -46,11 +46,6 @@ from scheduling.worker_protocol import (
 )
 
 
-# CUDA context + driver + allocator fragmentation overhead.
-# Subtracted from total GPU memory for idle-GPU budget checks.
-# Conservative: avoids dispatching to a GPU that has no room after overhead.
-_VRAM_OVERHEAD_BYTES = 500 * 1024 * 1024  # 500 MB
-
 # Global measured model VRAM — aggregated from all workers' StatusSnapshots.
 # Once ANY worker loads a model and measures its VRAM, this value is available
 # for budget calculations across all workers.  fingerprint -> actual bytes.
@@ -405,51 +400,13 @@ class GpuWorkerProxy:
         return True
 
     def check_vram_budget(self, job: InferenceJob) -> bool:
-        """Check if this GPU has enough VRAM for the heaviest stage of a job.
+        """Check if this GPU can run the job.
 
-        This is the PRIMARY OOM prevention gate.  The scheduler MUST verify
-        VRAM budget before dispatching — workers should never hit OOM because
-        the scheduler guaranteed the work fits.
-
-        Since the entire pipeline runs on one GPU, we check the single
-        heaviest stage (max model cost + working memory) against available VRAM.
-        The GPU is always idle when this is called (one job at a time).
+        One GPU = one safetensor model.  Any SDXL model fits on any GPU
+        since the worker can evict cached models and the handlers use
+        adaptive tiling for VAE.  This only rejects jobs whose required
+        capabilities aren't supported.
         """
-        status = self._gpu_proxy._status
-        if status is None:
-            return True  # No status yet, be optimistic
-
-        # Find the heaviest stage in the pipeline
-        max_needed = 0
-        for stage in job.pipeline:
-            if stage.is_cpu_only:
-                continue
-
-            # Model cost for this stage
-            model_cost = 0
-            for c in stage.required_components:
-                if self._gpu_proxy.is_component_loaded(c.fingerprint):
-                    continue
-                measured = _global_measured_vram.get(c.fingerprint)
-                if measured is not None:
-                    model_cost += measured
-                else:
-                    model_cost += c.estimated_vram_bytes
-
-            # Working memory cost
-            from scheduling.worker import _get_min_free_vram
-            working_cost = _get_min_free_vram(stage.type, job, self._gpu_model_name)
-            stage_total = model_cost + working_cost
-            if stage_total > max_needed:
-                max_needed = stage_total
-
-        # GPU is idle when dispatching (one job at a time).
-        # Worker can evict everything, so budget = total - overhead.
-        vram = status.vram_stats
-        total_memory = vram.get("total", 0)
-        usable = total_memory - _VRAM_OVERHEAD_BYTES
-        if usable > 0 and max_needed > usable:
-            return False
         return True
 
     def dispatch(self, job: InferenceJob) -> None:

@@ -535,16 +535,24 @@ def _execute_job(
                 vram_before = torch.cuda.memory_allocated(device)
                 _ensure_models_for_stage(gpu, stage, job, gpu_model_name, preloader)
 
-                # Ensure free VRAM for working memory
+                # Ensure free VRAM for working memory.
+                # VAE decode/encode stages are excluded — they use VRAM-aware
+                # adaptive tiling that picks the largest tile size that fits in
+                # available VRAM.  Pre-evicting models for VAE working memory
+                # forces the UNet out on 12GB GPUs (untiled 1024x1024 needs ~4GB),
+                # causing it to be reloaded for every subsequent job.
                 from scheduling.worker import _get_min_free_vram
-                active_fps = {c.fingerprint for c in stage.required_components}
-                active_fps.update(getattr(stage, '_trt_active_fps', set()))
-                min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
-                if min_free > 0:
-                    if not gpu.ensure_free_vram(min_free, protect=active_fps):
-                        raise torch.cuda.OutOfMemoryError(
-                            f"Cannot free {min_free // (1024*1024)}MB working memory "
-                            f"for {stage.type.value} — predicted OOM, re-routing")
+                _vae_stages = (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE,
+                               StageType.GPU_HIRES_TRANSFORM)
+                if stage.type not in _vae_stages:
+                    active_fps = {c.fingerprint for c in stage.required_components}
+                    active_fps.update(getattr(stage, '_trt_active_fps', set()))
+                    min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
+                    if min_free > 0:
+                        if not gpu.ensure_free_vram(min_free, protect=active_fps):
+                            raise torch.cuda.OutOfMemoryError(
+                                f"Cannot free {min_free // (1024*1024)}MB working memory "
+                                f"for {stage.type.value} — predicted OOM, re-routing")
 
                 vram_delta = torch.cuda.memory_allocated(device) - vram_before
 

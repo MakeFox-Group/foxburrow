@@ -95,15 +95,13 @@ def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, 
             StageType.GPU_UPSCALE, StageType.GPU_BGREMOVE):
         return job.input_image.width, job.input_image.height
 
-    # VAE encode/decode: tiled when any dimension >= threshold.
-    # Working memory is per-tile, so cap to max tile size.
+    # VAE encode/decode: handlers use VRAM-aware adaptive tiling.
+    # Always cap to tile size for working memory estimation — the handler
+    # will tile if the full image doesn't fit, so we shouldn't predict
+    # the full-image working memory (which forces UNet eviction on 12GB GPUs).
     if stage_type in (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE):
-        img_w, img_h = w, h
-        if stage_type == StageType.GPU_VAE_ENCODE and job.input_image is not None:
-            img_w, img_h = job.input_image.width, job.input_image.height
-        if img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
-            w = min(w, VAE_TILE_MAX)
-            h = min(h, VAE_TILE_MAX)
+        w = min(w, VAE_TILE_MAX)
+        h = min(h, VAE_TILE_MAX)
 
     return w, h
 
