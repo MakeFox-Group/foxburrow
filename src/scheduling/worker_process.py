@@ -487,6 +487,7 @@ def _execute_job(
     gpu, cmd: ExecuteJobCmd, gpu_model_name: str, tracer, loop, preloader: ModelPreloader,
 ) -> JobComplete:
     """Execute an entire job pipeline sequentially on one GPU."""
+    import log
     import torch
     from gpu import torch_ext
     from scheduling.job import (
