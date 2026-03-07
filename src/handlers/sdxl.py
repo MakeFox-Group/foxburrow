@@ -57,12 +57,6 @@ VAE_TILE_THRESHOLD = 1024    # force tiled mode when any image dimension >= this
 VAE_TILE_MAX = 768           # max tile size per axis when tiling (pixels)
 LATENT_TILE_OVERLAP = 16     # latent overlap for VAE encode/decode tiles
 
-# MultiDiffusion (tiled UNet) constants
-UNET_TILE_MAX = 1024          # default max UNet tile size (pixels) when auto-calculating
-UNET_TILE_OVERLAP = 48        # latent overlap (= 384px) for smooth blending
-UNET_TILE_THRESHOLD = 256     # auto-enable tiling when latent dim > this (> 2048px)
-
-
 def _auto_vae_tile(img_w: int, img_h: int, max_tile: int) -> tuple[int, int]:
     """Return (tile_w, tile_h) in pixels that evenly distribute the image
     into tiles <= max_tile. Each axis is computed independently, so tiles
@@ -215,17 +209,6 @@ def _pick_vae_tile_size(img_w: int, img_h: int, gpu: "GpuInstance",
     log.debug(f"  SDXL: _pick_vae_tile_size {img_w}x{img_h} → "
               f"{result[0]}x{result[1]} (PyTorch fallback, no TRT engine available)")
     return result
-
-
-def _auto_unet_tile(lat_w: int, lat_h: int, max_tile_px: int) -> tuple[int, int]:
-    """Return (tile_lat_w, tile_lat_h) in latent units, each ≤ max_tile_px // 8."""
-    def _axis(dim: int) -> int:
-        max_lat = max_tile_px // 8
-        if dim <= max_lat:
-            return max_lat
-        n = math.ceil(dim / max_lat)
-        return math.ceil(dim / n)
-    return _axis(lat_w), _axis(lat_h)
 
 
 # Tokenizer instances (loaded once, CPU-only)
@@ -866,72 +849,6 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     )
 
 
-def _gaussian_weights(h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """2D Gaussian weight mask [1,1,h,w] for MultiDiffusion tile blending.
-    Peaks at center, near-zero at edges — ensures seamless tile boundaries."""
-    sigma = 0.5
-    y = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
-    x = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
-    gy = torch.exp(-y ** 2 / (2 * sigma ** 2))
-    gx = torch.exp(-x ** 2 / (2 * sigma ** 2))
-    return (gy.unsqueeze(1) * gx.unsqueeze(0)).unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
-
-
-def _unet_tiled(
-    unet, latent_input: torch.Tensor, t,
-    prompt_embeds: torch.Tensor, neg_prompt_embeds: torch.Tensor,
-    pooled_prompt_embeds: torch.Tensor, neg_pooled_prompt_embeds: torch.Tensor,
-    add_time_ids: torch.Tensor, cfg_scale: float,
-    tile_w: int, tile_h: int, tile_overlap: int,
-) -> torch.Tensor:
-    """MultiDiffusion: tile the UNet forward pass and blend noise predictions.
-
-    Runs the UNet on overlapping tile_w×tile_h latent tiles, accumulates noise
-    predictions weighted by a 2D Gaussian, then normalises.
-    The full-resolution add_time_ids are passed to every tile so SDXL's size
-    conditioning always sees the intended output dimensions.
-    """
-    device = latent_input.device
-    lat_h, lat_w = latent_input.shape[2], latent_input.shape[3]
-    stride_x = tile_w - tile_overlap
-    stride_y = tile_h - tile_overlap
-    tiles_y = max(1, math.ceil((lat_h - tile_overlap) / stride_y))
-    tiles_x = max(1, math.ceil((lat_w - tile_overlap) / stride_x))
-
-    noise_sum  = torch.zeros_like(latent_input)
-    weight_sum = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=latent_input.dtype)
-
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            y0 = min(ty * stride_y, lat_h - tile_h)
-            x0 = min(tx * stride_x, lat_w - tile_w)
-            y0, x0 = max(0, y0), max(0, x0)
-            y1 = min(y0 + tile_h, lat_h)
-            x1 = min(x0 + tile_w, lat_w)
-
-            tile = latent_input[:, :, y0:y1, x0:x1]
-
-            with torch.no_grad():
-                # Batch [uncond, cond] for CFG in a single UNet pass
-                tile_in = torch.cat([tile, tile])
-                out = unet(
-                    tile_in, t,
-                    encoder_hidden_states=torch.cat([neg_prompt_embeds, prompt_embeds]),
-                    added_cond_kwargs={
-                        "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
-                        "time_ids": torch.cat([add_time_ids, add_time_ids]),
-                    },
-                ).sample
-                e_uncond, e_cond = out.chunk(2)
-
-            noise_pred = e_uncond + cfg_scale * (e_cond - e_uncond)
-            w = _gaussian_weights(y1 - y0, x1 - x0, device, latent_input.dtype)
-            noise_sum [:, :, y0:y1, x0:x1] += noise_pred * w
-            weight_sum[:, :, y0:y1, x0:x1] += w
-
-    return noise_sum / weight_sum
-
-
 _progress_callback = None
 
 
@@ -1183,24 +1100,6 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     pooled_prompt_embeds = enc.pooled_prompt_embeds.to(device=device, dtype=torch.float16)
     neg_pooled_prompt_embeds = enc.neg_pooled_prompt_embeds.to(device=device, dtype=torch.float16)
 
-    # MultiDiffusion: tile the UNet when latent exceeds threshold
-    # unet_tile_width/height from job (pixels) → latent units; 0 = auto (≤ UNET_TILE_MAX)
-    if job.unet_tile_width > 0 and job.unet_tile_height > 0:
-        unet_tile_w = job.unet_tile_width  // 8
-        unet_tile_h = job.unet_tile_height // 8
-    else:
-        unet_tile_w, unet_tile_h = _auto_unet_tile(latent_w, latent_h, UNET_TILE_MAX)
-    use_tiled = latent_h > UNET_TILE_THRESHOLD or latent_w > UNET_TILE_THRESHOLD
-    if use_tiled:
-        _stride_x = unet_tile_w - UNET_TILE_OVERLAP
-        _stride_y = unet_tile_h - UNET_TILE_OVERLAP
-        _tiles_y = max(1, math.ceil((latent_h - UNET_TILE_OVERLAP) / _stride_y))
-        _tiles_x = max(1, math.ceil((latent_w - UNET_TILE_OVERLAP) / _stride_x))
-        log.debug(f"  SDXL: MultiDiffusion enabled — "
-                 f"{_tiles_x}x{_tiles_y} tiles "
-                 f"({unet_tile_w*8}x{unet_tile_h*8}px, "
-                 f"{UNET_TILE_OVERLAP*8}px overlap)")
-
     # Pre-compute static CFG tensors (these don't change between steps)
     batched_embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
     batched_pooled = torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds])
@@ -1217,21 +1116,13 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
         latent_input = scheduler.scale_model_input(latents, t)
 
-        if trt_runner is not None and not use_tiled:
+        if trt_runner is not None:
             # TRT path — direct tensor I/O, no Python overhead, GIL-free
             latent_in = torch.cat([latent_input, latent_input])
             out = trt_runner.run(latent_in, t.unsqueeze(0), batched_embeds,
                                  batched_pooled, batched_time_ids)
             noise_pred_uncond, noise_pred_cond = out.chunk(2)
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
-        elif use_tiled:
-            noise_pred = _unet_tiled(
-                unet, latent_input, t,
-                prompt_embeds, neg_prompt_embeds,
-                pooled_prompt_embeds, neg_pooled_prompt_embeds,
-                add_time_ids, inp.cfg_scale,
-                unet_tile_w, unet_tile_h, UNET_TILE_OVERLAP,
-            )
         else:
             with torch.no_grad():
                 # Batched CFG: run uncond + cond in a single UNet forward pass
@@ -1253,7 +1144,7 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         if _tracer:
             _tracer.denoise_step(
                 job.job_id, _model_name, i - start_step + 1,
-                active_step_count, int(t), _step_dur, use_tiled)
+                active_step_count, int(t), _step_dur, False)
 
         if _first_step_time is None:
             _first_step_time = _time.monotonic() - _loop_start
@@ -1275,85 +1166,6 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         log.debug(f"  SDXL: Denoise complete. latent_range=[{lat_min:.4f}, {lat_max:.4f}]")
 
     job.latents = latents
-
-
-def _unet_tiled_regional(
-    unet, latent_input: torch.Tensor, t,
-    neg_prompt_embeds: torch.Tensor,
-    pooled_prompt_embeds: torch.Tensor, neg_pooled_prompt_embeds: torch.Tensor,
-    add_time_ids: torch.Tensor, cfg_scale: float,
-    tile_w: int, tile_h: int, tile_overlap: int,
-    state,  # RegionalAttnState
-    full_masks: torch.Tensor,  # [N, 1, latent_h, latent_w]
-    pos_stacked: torch.Tensor,  # [N, 77*C, dim] — positive region embeds
-    neg_stacked: torch.Tensor | None = None,  # [N, 77*C, dim] — per-region neg embeds, or None
-) -> torch.Tensor:
-    """MultiDiffusion with regional prompting: tile the UNet and blend noise predictions.
-
-    For each tile, crops the region masks and updates the attention state.
-    If neg_stacked is provided, the uncond pass also uses regional attention.
-    """
-    device = latent_input.device
-    lat_h, lat_w = latent_input.shape[2], latent_input.shape[3]
-    stride_x = tile_w - tile_overlap
-    stride_y = tile_h - tile_overlap
-    tiles_y = max(1, math.ceil((lat_h - tile_overlap) / stride_y))
-    tiles_x = max(1, math.ceil((lat_w - tile_overlap) / stride_x))
-
-    noise_sum  = torch.zeros_like(latent_input)
-    weight_sum = torch.zeros(1, 1, lat_h, lat_w, device=device, dtype=latent_input.dtype)
-
-    # Set up batched CFG state once — processor handles per-element routing
-    state.region_embeds = pos_stacked
-    state.active = True
-    if neg_stacked is not None:
-        state.uncond_region_embeds = neg_stacked
-        state.uncond_text_embeds = None
-    else:
-        state.uncond_region_embeds = None
-        state.uncond_text_embeds = neg_prompt_embeds
-
-    uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
-
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            y0 = min(ty * stride_y, lat_h - tile_h)
-            x0 = min(tx * stride_x, lat_w - tile_w)
-            y0, x0 = max(0, y0), max(0, x0)
-            y1 = min(y0 + tile_h, lat_h)
-            x1 = min(x0 + tile_w, lat_w)
-
-            tile = latent_input[:, :, y0:y1, x0:x1]
-
-            # Crop region masks to this tile's bounds
-            tile_masks = full_masks[:, :, y0:y1, x0:x1]
-            # Renormalize tile masks
-            tile_mask_sum = tile_masks.sum(dim=0, keepdim=True).clamp(min=1e-8)
-            tile_masks = tile_masks / tile_mask_sum
-            state.set_tile_masks(tile_masks, tile_bounds=(y0, x0, y1, x1))
-
-            with torch.no_grad():
-                # Batched CFG: uncond + cond in a single UNet pass per tile
-                tile_in = torch.cat([tile, tile])
-                out = unet(
-                    tile_in, t,
-                    encoder_hidden_states=torch.cat([uncond_enc, pos_stacked[0:1]]),
-                    added_cond_kwargs={
-                        "text_embeds": torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds]),
-                        "time_ids": torch.cat([add_time_ids, add_time_ids]),
-                    },
-                ).sample
-                noise_pred_uncond, noise_pred_cond = out.chunk(2)
-
-            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            w = _gaussian_weights(y1 - y0, x1 - x0, device, latent_input.dtype)
-            noise_sum [:, :, y0:y1, x0:x1] += noise_pred * w
-            weight_sum[:, :, y0:y1, x0:x1] += w
-
-    state.active = False
-    state.uncond_region_embeds = None
-    state.uncond_text_embeds = None
-    return noise_sum / weight_sum
 
 
 def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
@@ -1482,23 +1294,6 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
     job.denoise_step = 0
     job.denoise_total_steps = active_step_count
 
-    # MultiDiffusion tiling setup
-    if job.unet_tile_width > 0 and job.unet_tile_height > 0:
-        unet_tile_w = job.unet_tile_width  // 8
-        unet_tile_h = job.unet_tile_height // 8
-    else:
-        unet_tile_w, unet_tile_h = _auto_unet_tile(latent_w, latent_h, UNET_TILE_MAX)
-    use_tiled = latent_h > UNET_TILE_THRESHOLD or latent_w > UNET_TILE_THRESHOLD
-    if use_tiled:
-        _stride_x = unet_tile_w - UNET_TILE_OVERLAP
-        _stride_y = unet_tile_h - UNET_TILE_OVERLAP
-        _tiles_y = max(1, math.ceil((latent_h - UNET_TILE_OVERLAP) / _stride_y))
-        _tiles_x = max(1, math.ceil((latent_w - UNET_TILE_OVERLAP) / _stride_x))
-        log.debug(f"  SDXL: Regional MultiDiffusion enabled — "
-                 f"{_tiles_x}x{_tiles_y} tiles "
-                 f"({unet_tile_w*8}x{unet_tile_h*8}px, "
-                 f"{UNET_TILE_OVERLAP*8}px overlap)")
-
     # Pre-compute static CFG tensors for batched regional denoise
     uncond_enc = neg_stacked[0:1] if neg_stacked is not None else neg_prompt_embeds
     batched_regional_embeds = torch.cat([uncond_enc, placeholder_embeds])
@@ -1513,44 +1308,32 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
             latent_input = scheduler.scale_model_input(latents, t)
 
-            if use_tiled:
-                noise_pred = _unet_tiled_regional(
-                    unet, latent_input, t,
-                    neg_prompt_embeds,
-                    pooled_prompt_embeds, neg_pooled_prompt_embeds,
-                    add_time_ids, inp.cfg_scale,
-                    unet_tile_w, unet_tile_h, UNET_TILE_OVERLAP,
-                    state, region_masks,
-                    pos_stacked=all_embeds,
-                    neg_stacked=neg_stacked,
-                )
+            # Batched CFG: uncond + cond in a single UNet forward pass.
+            # The RegionalAttnProcessor splits the batch internally —
+            # cond gets regional attention, uncond gets regional (per-region
+            # negs) or standard SDPA (shared neg).
+            state.region_embeds = all_embeds
+            state.active = True
+            if neg_stacked is not None:
+                state.uncond_region_embeds = neg_stacked
+                state.uncond_text_embeds = None
             else:
-                with torch.no_grad():
-                    # Batched CFG: uncond + cond in a single UNet forward pass.
-                    # The RegionalAttnProcessor splits the batch internally —
-                    # cond gets regional attention, uncond gets regional (per-region
-                    # negs) or standard SDPA (shared neg).
-                    state.region_embeds = all_embeds
-                    state.active = True
-                    if neg_stacked is not None:
-                        state.uncond_region_embeds = neg_stacked
-                        state.uncond_text_embeds = None
-                    else:
-                        state.uncond_region_embeds = None
-                        state.uncond_text_embeds = neg_prompt_embeds
+                state.uncond_region_embeds = None
+                state.uncond_text_embeds = neg_prompt_embeds
 
-                    latent_in = torch.cat([latent_input, latent_input])
-                    out = unet(
-                        latent_in, t,
-                        encoder_hidden_states=batched_regional_embeds,
-                        added_cond_kwargs={
-                            "text_embeds": batched_regional_pooled,
-                            "time_ids": batched_regional_time_ids,
-                        },
-                    ).sample
-                    noise_pred_uncond, noise_pred_cond = out.chunk(2)
+            with torch.no_grad():
+                latent_in = torch.cat([latent_input, latent_input])
+                out = unet(
+                    latent_in, t,
+                    encoder_hidden_states=batched_regional_embeds,
+                    added_cond_kwargs={
+                        "text_embeds": batched_regional_pooled,
+                        "time_ids": batched_regional_time_ids,
+                    },
+                ).sample
+                noise_pred_uncond, noise_pred_cond = out.chunk(2)
 
-                noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
             latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
     finally:

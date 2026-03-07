@@ -211,8 +211,8 @@ class InferenceJob:
         self.assigned_gpu_uuid: str | None = None
 
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
-        self.unet_tile_width: int = 0   # UNet / MultiDiffusion tile width (pixels)
-        self.unet_tile_height: int = 0  # UNet / MultiDiffusion tile height (pixels)
+        self.unet_tile_width: int = 0   # Reserved (unused)
+        self.unet_tile_height: int = 0  # Reserved (unused)
         self.vae_tile_width: int = 0    # VAE encode/decode tile width (pixels)
         self.vae_tile_height: int = 0   # VAE encode/decode tile height (pixels)
 

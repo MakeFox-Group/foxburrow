@@ -55,8 +55,8 @@ class GenerateHiresRequest(BaseModel):
     base_width: int | None = None
     base_height: int | None = None
     model: str | None = None
-    unet_tile_width: int = 0   # UNet / MultiDiffusion tile width in pixels (0 = auto ≤ 1024)
-    unet_tile_height: int = 0  # UNet / MultiDiffusion tile height in pixels (0 = auto ≤ 1024)
+    unet_tile_width: int = 0   # Reserved (unused)
+    unet_tile_height: int = 0  # Reserved (unused)
     loras: list[dict] | None = None  # [{"name": "xxx", "weight": 1.0}, ...]
     regional_prompting: bool = False
     vae_tile_width: int = 0    # VAE encode/decode tile width in pixels (0 = auto ≤ 1024)

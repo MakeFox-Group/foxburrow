@@ -77,12 +77,11 @@ _VRAM_HEADROOM = 1.20
 def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, int]:
     """Return (width, height) for the profiler lookup.
 
-    For tiled stages (VAE encode/decode, UNet denoise), returns the effective
-    tile size rather than the full image size — VRAM usage is bounded by the
-    tile, not the total image.
+    For tiled VAE stages (encode/decode), returns the effective tile size
+    rather than the full image size — VRAM usage is bounded by the tile,
+    not the total image.
     """
-    from handlers.sdxl import (VAE_TILE_THRESHOLD, VAE_TILE_MAX,
-                                UNET_TILE_THRESHOLD, UNET_TILE_MAX)
+    from handlers.sdxl import VAE_TILE_THRESHOLD, VAE_TILE_MAX
 
     w, h = 768, 768  # safe default
     if job.sdxl_input:
@@ -105,13 +104,6 @@ def _get_job_resolution(stage_type: StageType, job: InferenceJob) -> tuple[int, 
         if img_w >= VAE_TILE_THRESHOLD or img_h >= VAE_TILE_THRESHOLD:
             w = min(w, VAE_TILE_MAX)
             h = min(h, VAE_TILE_MAX)
-
-    # UNet denoise: tiled (MultiDiffusion) when latent dim > threshold.
-    if stage_type == StageType.GPU_DENOISE:
-        lat_h, lat_w = h // 8, w // 8
-        if lat_h > UNET_TILE_THRESHOLD or lat_w > UNET_TILE_THRESHOLD:
-            w = min(w, UNET_TILE_MAX)
-            h = min(h, UNET_TILE_MAX)
 
     return w, h
 
