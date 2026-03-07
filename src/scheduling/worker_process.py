@@ -258,7 +258,10 @@ def gpu_worker_main(
             self.total_memory = total_memory
 
     nvml_info = _NvmlInfo(nvml_handle, gpu_total_memory)
-    gpu = GpuInstance(gpu_config, nvml_info, torch_device_id=0)
+    cpu_cache_gb = server_config_dict.get("cpu_cache_gb", 64.0)
+    cpu_cache_bytes = int(cpu_cache_gb * 1024 * 1024 * 1024)
+    gpu = GpuInstance(gpu_config, nvml_info, torch_device_id=0,
+                      cpu_cache_bytes=cpu_cache_bytes)
 
     # Initialize app_state in this process
     from state import app_state
@@ -897,9 +900,12 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str,
             protect_fps.update(new_trt_fps)
             continue
 
-        # Check preloader for CPU-cached model
+        # Check CPU cache (evicted models kept on CPU RAM)
+        cpu_cached = gpu.get_cpu_cached_model(component.fingerprint)
+
+        # Check preloader for CPU-cached model (background thread)
         preloaded_model = None
-        if preloader is not None:
+        if cpu_cached is None and preloader is not None:
             preloaded_model = preloader.get(component.fingerprint)
 
         # Ensure VRAM before loading
@@ -911,8 +917,19 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str,
         tag_ctx = (torch.cuda.tag_allocations(torch_ext.ALLOC_TAG_MODEL_WEIGHTS)
                    if torch_ext.HAS_ALLOC_TAGS else contextlib.nullcontext())
 
-        if preloaded_model is not None:
-            # Fast path: CPU → GPU transfer
+        if cpu_cached is not None:
+            # Fastest path: CPU cache → GPU transfer
+            before = torch.cuda.memory_allocated(device)
+            with tag_ctx:
+                cpu_cached.model.to(device)
+            after = torch.cuda.memory_allocated(device)
+            actual_vram = after - before
+            model = cpu_cached.model
+
+            log.debug(f"  Loaded {component.category} from CPU cache: "
+                      f"{actual_vram // (1024*1024)}MB actual")
+        elif preloaded_model is not None:
+            # Fast path: preloader CPU → GPU transfer
             before = torch.cuda.memory_allocated(device)
             with tag_ctx:
                 preloaded_model.to(device)
@@ -931,7 +948,7 @@ def _load_sdxl_components(gpu, stage, model_dir, job, gpu_model_name: str,
             after = torch.cuda.memory_allocated(device)
             actual_vram = after - before
 
-            log.debug(f"  Loaded {component.category}: {actual_vram // (1024*1024)}MB actual "
+            log.debug(f"  Loaded {component.category} from disk: {actual_vram // (1024*1024)}MB actual "
                       f"(estimated {component.estimated_vram_bytes // (1024*1024)}MB)")
 
         # Feed actual VRAM back to registry

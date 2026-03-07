@@ -880,6 +880,7 @@ def main() -> None:
                     "upscale_model_path": upscale_path,
                     "bgremove_model_path": bgremove_handler_path,
                     "tagger_model_path": tagger_handler_path,
+                    "cpu_cache_gb": config.scheduler.cpu_cache_gb,
                 },
                 cmd_q,
                 result_q,

@@ -216,7 +216,11 @@ class CachedModel:
 class GpuInstance:
     """Represents a single GPU with model cache and VRAM tracking."""
 
-    def __init__(self, config: GpuConfig, nvml_device: nvml.NvmlDeviceInfo, torch_device_id: int):
+    # Default CPU cache: 64 GB per worker
+    DEFAULT_CPU_CACHE_BYTES = 64 * 1024 * 1024 * 1024
+
+    def __init__(self, config: GpuConfig, nvml_device: nvml.NvmlDeviceInfo, torch_device_id: int,
+                 cpu_cache_bytes: int = 0):
         self.uuid = config.uuid
         self.name = config.name
         self.capabilities = config.capabilities
@@ -232,6 +236,15 @@ class GpuInstance:
         # Model cache: fingerprint -> CachedModel (LRU ordered)
         self._cache: OrderedDict[str, CachedModel] = OrderedDict()
         self._cache_lock = threading.Lock()
+
+        # CPU model cache: holds evicted models on CPU RAM for fast reload.
+        # When a model is evicted from GPU VRAM, it's moved to CPU and stored
+        # here.  Loading from CPU cache (~0.1-0.5s for .to(device)) is much
+        # faster than loading from disk (~2-8s for from_pretrained + .to()).
+        self._cpu_cache: OrderedDict[str, CachedModel] = OrderedDict()
+        self._cpu_cache_lock = threading.Lock()
+        self._cpu_cache_bytes: int = 0  # current total estimated bytes in CPU cache
+        self._cpu_cache_limit: int = cpu_cache_bytes if cpu_cache_bytes > 0 else self.DEFAULT_CPU_CACHE_BYTES
 
         # Active model fingerprints — simple set (one job at a time)
         self._active_fps: set[str] = set()
@@ -452,6 +465,78 @@ class GpuInstance:
         with self._active_fp_lock:
             return set(self._active_fps)
 
+    # ---- CPU model cache ----
+
+    def get_cpu_cached_model(self, fingerprint: str) -> CachedModel | None:
+        """Retrieve a model from the CPU cache, removing it.
+
+        Returns the CachedModel entry (model on CPU) if found, else None.
+        The caller is responsible for moving the model to GPU.
+        """
+        with self._cpu_cache_lock:
+            if fingerprint not in self._cpu_cache:
+                return None
+            entry = self._cpu_cache.pop(fingerprint)
+            vram = entry.actual_vram if entry.actual_vram > 0 else entry.estimated_vram
+            self._cpu_cache_bytes -= vram
+        return entry
+
+    def _cpu_cache_store(self, model_entry: CachedModel) -> None:
+        """Store an evicted model in the CPU cache.
+
+        Enforces the memory limit by evicting the oldest entries first.
+        TRT runners and models without a .to() method are skipped.
+        """
+        # TRT runners can't be CPU-cached
+        if model_entry.category.endswith("_trt"):
+            return
+        if not hasattr(model_entry.model, "to"):
+            return
+
+        vram = model_entry.actual_vram if model_entry.actual_vram > 0 else model_entry.estimated_vram
+        if vram <= 0:
+            return
+
+        with self._cpu_cache_lock:
+            # If this fingerprint is already in CPU cache, remove old entry first
+            if model_entry.fingerprint in self._cpu_cache:
+                old = self._cpu_cache.pop(model_entry.fingerprint)
+                old_vram = old.actual_vram if old.actual_vram > 0 else old.estimated_vram
+                self._cpu_cache_bytes -= old_vram
+
+            # Evict oldest entries until we have room
+            while (self._cpu_cache_bytes + vram > self._cpu_cache_limit
+                   and self._cpu_cache):
+                _, evicted = self._cpu_cache.popitem(last=False)
+                ev_vram = evicted.actual_vram if evicted.actual_vram > 0 else evicted.estimated_vram
+                self._cpu_cache_bytes -= ev_vram
+                log.debug(f"  GPU [{self.uuid}]: CPU cache evicted {evicted.category} "
+                         f"({evicted.source}, ~{ev_vram // (1024*1024)}MB)")
+                del evicted
+
+            self._cpu_cache[model_entry.fingerprint] = model_entry
+            self._cpu_cache.move_to_end(model_entry.fingerprint)
+            self._cpu_cache_bytes += vram
+
+        log.debug(f"  GPU [{self.uuid}]: CPU cache stored {model_entry.category} "
+                 f"({model_entry.source}, ~{vram // (1024*1024)}MB, "
+                 f"total {self._cpu_cache_bytes // (1024*1024)}MB / "
+                 f"{self._cpu_cache_limit // (1024*1024)}MB)")
+
+    def get_cpu_cache_info(self) -> dict:
+        """Return CPU cache statistics."""
+        with self._cpu_cache_lock:
+            return {
+                "count": len(self._cpu_cache),
+                "bytes": self._cpu_cache_bytes,
+                "limit": self._cpu_cache_limit,
+                "models": [
+                    {"category": m.category, "source": m.source,
+                     "bytes": m.actual_vram if m.actual_vram > 0 else m.estimated_vram}
+                    for m in self._cpu_cache.values()
+                ],
+            }
+
     def _is_evictable(self, fp: str, protect: set[str] | None) -> bool:
         """Check if a cached model can be evicted."""
         if protect and fp in protect:
@@ -559,6 +644,9 @@ class GpuInstance:
 
         # Free TRT shared memory if this was the last runner of its type
         self._maybe_release_trt_shared_memory(model_entry.category)
+
+        # Store evicted model in CPU cache for fast reload
+        self._cpu_cache_store(model_entry)
 
         return model_entry
 

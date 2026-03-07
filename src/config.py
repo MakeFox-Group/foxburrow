@@ -32,6 +32,7 @@ class SchedulerConfig:
     starvation_hard_s: float = 90.0      # Phase 2 ends → hard override
     load_rate_mb_s: float = 500.0        # Model load rate for time-to-ready (MB/s)
     status_push_interval_s: float = 2.0  # WebSocket status push interval
+    cpu_cache_gb: float = 64.0           # Per-worker CPU model cache size (GB)
 
 
 @dataclass
@@ -93,6 +94,7 @@ class FoxBurrowConfig:
             scheduler.starvation_hard_s = s.getfloat("starvation_hard_s", scheduler.starvation_hard_s)
             scheduler.load_rate_mb_s = s.getfloat("load_rate_mb_s", scheduler.load_rate_mb_s)
             scheduler.status_push_interval_s = s.getfloat("status_push_interval_s", scheduler.status_push_interval_s)
+            scheduler.cpu_cache_gb = s.getfloat("cpu_cache_gb", scheduler.cpu_cache_gb)
 
         # Parse [threads] section
         threads = ThreadsConfig()
