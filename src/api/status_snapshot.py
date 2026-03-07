@@ -81,6 +81,25 @@ def compute_status_snapshot() -> dict[str, Any]:
                             and not w._draining and not w._building)
         max_concurrent = num_idle_gpus + 2
 
+    # Model affinity: which SDXL checkpoint sources are loaded on which GPUs
+    # makefoxsrv uses this for intelligent routing — send same-model jobs to
+    # the foxburrow instance that already has the model loaded.
+    model_affinity: dict[str, dict[str, int]] = {}
+    for w in workers:
+        if w.gpu.is_failed:
+            continue
+        for m_info in w.gpu.get_cached_models_info():
+            if m_info.get("category") == "sdxl_unet":
+                source = m_info.get("source", "")
+                if not source:
+                    continue
+                if source not in model_affinity:
+                    model_affinity[source] = {"idle": 0, "busy": 0}
+                if w.gpu.is_busy:
+                    model_affinity[source]["busy"] += 1
+                else:
+                    model_affinity[source]["idle"] += 1
+
     return {
         "gpus": gpus,
         "readiness": readiness,
@@ -88,4 +107,5 @@ def compute_status_snapshot() -> dict[str, Any]:
         "max_concurrent": max_concurrent,
         "admission": admission_snapshot,
         "queue_depth": app_state.queue.count if app_state.queue else 0,
+        "model_affinity": model_affinity,
     }

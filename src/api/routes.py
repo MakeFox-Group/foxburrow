@@ -16,7 +16,7 @@ import torch
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import log
 
@@ -40,6 +40,7 @@ class GenerateRequest(BaseModel):
     vae_tile_height: int = 0   # VAE decode tile height in pixels (0 = auto ≤ 1024)
     loras: list[dict] | None = None  # [{"name": "xxx", "weight": 1.0}, ...]
     regional_prompting: bool = False
+    priority: int = Field(default=100, ge=1, le=100)
 
 
 class GenerateHiresRequest(BaseModel):
@@ -61,6 +62,7 @@ class GenerateHiresRequest(BaseModel):
     regional_prompting: bool = False
     vae_tile_width: int = 0    # VAE encode/decode tile width in pixels (0 = auto ≤ 1024)
     vae_tile_height: int = 0   # VAE encode/decode tile height in pixels (0 = auto ≤ 1024)
+    priority: int = Field(default=100, ge=1, le=100)
 
 
 # ====================================================================
@@ -575,6 +577,7 @@ async def generate(req: GenerateRequest):
             loras=all_loras,
             regional_prompting=req.regional_prompting,
         ),
+        priority=req.priority,
     )
     job.vae_tile_width  = req.vae_tile_width
     job.vae_tile_height = req.vae_tile_height
@@ -674,6 +677,7 @@ async def generate_hires(req: GenerateHiresRequest):
             hires_steps=req.hires_steps,
             denoising_strength=req.hires_denoising_strength,
         ),
+        priority=req.priority,
     )
     job.unet_tile_width  = req.unet_tile_width
     job.unet_tile_height = req.unet_tile_height
@@ -745,6 +749,7 @@ async def generate_latents(req: GenerateRequest):
             loras=all_loras,
             regional_prompting=req.regional_prompting,
         ),
+        priority=req.priority,
     )
 
     queue.enqueue(job)
@@ -1333,6 +1338,7 @@ async def enqueue_generate(req: GenerateRequest):
                 loras=all_loras,
                 regional_prompting=req.regional_prompting,
             ),
+            priority=req.priority,
         )
         job.vae_tile_width = req.vae_tile_width
         job.vae_tile_height = req.vae_tile_height
@@ -1437,6 +1443,7 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
                 hires_steps=req.hires_steps,
                 denoising_strength=req.hires_denoising_strength,
             ),
+            priority=req.priority,
         )
         job.unet_tile_width = req.unet_tile_width
         job.unet_tile_height = req.unet_tile_height
@@ -1644,6 +1651,7 @@ async def enqueue_enhance(request: Request):
         unet_tile_h        = int(qp.get("unet_tile_height", "0"))
         vae_tile_w         = int(qp.get("vae_tile_width",   "0"))
         vae_tile_h         = int(qp.get("vae_tile_height",  "0"))
+        job_priority       = max(1, min(100, int(qp.get("priority", "100"))))
     except (ValueError, TypeError) as ex:
         return _error(400, f"Invalid query parameter: {ex}")
 
@@ -1718,6 +1726,7 @@ async def enqueue_enhance(request: Request):
                 denoising_strength=denoising_strength,
             ),
             input_image=input_image,
+            priority=job_priority,
         )
         job.is_hires_pass = True  # denoise uses hires path from the start
         job.unet_tile_width  = unet_tile_w

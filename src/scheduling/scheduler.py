@@ -248,21 +248,32 @@ class GpuScheduler:
         idle_since = _time.monotonic() - worker._last_dispatch_time
         score += min(int(idle_since * 2), 30)
 
-        # ── Starvation prevention ─────────────────────────────────
-        # 3-phase ramp: linear → quadratic → hard override
+        # ── Priority scoring ────────────────────────────────────────
+        # Lower priority value = more important (1=ADMIN, 2=PREMIUM, 3=BASIC, 100=default)
+        # Scale: ADMIN(1)=4950, PREMIUM(2)=4900, BASIC(3)=4850
+        # This is large enough to override model affinity (~1800 max) so
+        # ADMIN jobs get served even if they need a model swap.
+        if job.priority < 100:
+            score += (100 - job.priority) * 50
+
+        # ── Starvation prevention ──────────────────────────────────
+        # Target: complete in <30s.  Emergency: 2 minutes.
+        #   0-30s:   model affinity + priority dominate (batching window)
+        #   30-120s: linear ramp — urgency grows, starts overriding affinity
+        #   120s+:   hard override — service this job NOW regardless of model
         age = (datetime.utcnow() - job.created_at).total_seconds()
-        linear_s = self._config.starvation_linear_s
-        hard_s = self._config.starvation_hard_s
-        base_mult = 25
-        if age <= linear_s:
-            starvation = int(base_mult * age)
+        target_s = 30.0
+        hard_s = self._config.starvation_hard_s  # default 120s
+        if age <= target_s:
+            pass  # no starvation bonus — let affinity and priority work
         elif age <= hard_s:
-            linear_base = base_mult * linear_s
-            excess = age - linear_s
-            starvation = int(linear_base + base_mult * excess + 0.5 * excess * excess)
+            # Linear ramp from 0 to ~4500 over 90s (30→120)
+            # At 60s: ~1500 (starts overriding model affinity ~500+300)
+            # At 90s: ~3000 (overrides everything except hard deadline)
+            fraction = (age - target_s) / (hard_s - target_s)
+            score += int(fraction * 4500)
         else:
-            starvation = 50000
-        score += starvation
+            score += 50000  # hard override
 
         return score
 

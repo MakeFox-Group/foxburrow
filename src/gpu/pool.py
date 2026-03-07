@@ -241,7 +241,7 @@ class GpuInstance:
         # When a model is evicted from GPU VRAM, it's moved to CPU and stored
         # here.  Loading from CPU cache (~0.1-0.5s for .to(device)) is much
         # faster than loading from disk (~2-8s for from_pretrained + .to()).
-        self._cpu_cache: OrderedDict[str, CachedModel] = OrderedDict()
+        self._cpu_cache: OrderedDict[str, tuple[CachedModel, int]] = OrderedDict()
         self._cpu_cache_lock = threading.Lock()
         self._cpu_cache_bytes: int = 0  # current total estimated bytes in CPU cache
         self._cpu_cache_limit: int = cpu_cache_bytes if cpu_cache_bytes > 0 else self.DEFAULT_CPU_CACHE_BYTES
@@ -521,6 +521,11 @@ class GpuInstance:
                  f"total {_total // (1024*1024)}MB / "
                  f"{self._cpu_cache_limit // (1024*1024)}MB)")
 
+    def _is_in_cpu_cache(self, fingerprint: str) -> bool:
+        """Check if a model fingerprint exists in the CPU cache (without removing it)."""
+        with self._cpu_cache_lock:
+            return fingerprint in self._cpu_cache
+
     def get_cpu_cache_info(self) -> dict:
         """Return CPU cache statistics."""
         with self._cpu_cache_lock:
@@ -633,17 +638,29 @@ class GpuInstance:
         idle_s = now - model_entry.last_used if model_entry.last_used > 0 else 0
         if model_entry.evict_callback:
             model_entry.evict_callback()
-        self._safe_to_cpu(model_entry)
+
+        # Check if this model is already in the CPU cache — if so, skip the
+        # expensive GPU→CPU transfer and just free the GPU memory.  The CPU
+        # cache already has a usable copy from a previous eviction.
+        already_cached = self._is_in_cpu_cache(model_entry.fingerprint)
+        if already_cached:
+            # Just release the GPU model — CPU cache already has it
+            model_entry.model = None
+        else:
+            self._safe_to_cpu(model_entry)
+
         torch.cuda.empty_cache()
         log.debug(f"  GPU [{self.uuid}]: Evicted {model_entry.category} "
                  f"(~{vram_mb}MB, {model_entry.use_count} uses, "
-                 f"idle {idle_s:.0f}s, score={best_score:.0f})")
+                 f"idle {idle_s:.0f}s, score={best_score:.0f})"
+                 f"{' (already in CPU cache)' if already_cached else ''}")
 
         # Free TRT shared memory if this was the last runner of its type
         self._maybe_release_trt_shared_memory(model_entry.category)
 
-        # Store evicted model in CPU cache for fast reload
-        self._cpu_cache_store(model_entry)
+        # Store evicted model in CPU cache for fast reload (skip if already cached)
+        if not already_cached:
+            self._cpu_cache_store(model_entry)
 
         return model_entry
 

@@ -28,8 +28,8 @@ class ServerConfig:
 
 @dataclass
 class SchedulerConfig:
-    starvation_linear_s: float = 30.0    # Phase 1 duration (linear ramp)
-    starvation_hard_s: float = 90.0      # Phase 2 ends → hard override
+    starvation_linear_s: float = 120.0   # Unused (kept for config compat)
+    starvation_hard_s: float = 120.0     # Hard deadline: job MUST be serviced after this many seconds
     load_rate_mb_s: float = 500.0        # Model load rate for time-to-ready (MB/s)
     status_push_interval_s: float = 2.0  # WebSocket status push interval
     cpu_cache_gb: float = 64.0           # Per-worker CPU model cache size (GB)
