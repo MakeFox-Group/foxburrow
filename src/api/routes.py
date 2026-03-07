@@ -1665,13 +1665,17 @@ async def enqueue_enhance(request: Request):
 
     # Parse multipart form data
     form = await request.form()
-    image_file = form.get("image")
-    params_str = form.get("params")
+    try:
+        image_file = form.get("image")
+        params_str = form.get("params")
 
-    if image_file is None or params_str is None:
-        return _error(400, 'Multipart form must include "image" and "params" parts.')
+        if image_file is None or params_str is None:
+            return _error(400, 'Multipart form must include "image" and "params" parts.')
 
-    image_bytes = await image_file.read()
+        image_bytes = await image_file.read()
+    finally:
+        await form.close()
+
     try:
         input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception as ex:
