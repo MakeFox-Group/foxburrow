@@ -1845,12 +1845,21 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
         mask_feathered = scipy.ndimage.gaussian_filter(mask, sigma=24.0)
         mask_feathered = np.clip(mask_feathered, 0.0, 1.0)
 
+        # Blend keep region by denoising strength:
+        #   mask=1 (border) → always use denoised result
+        #   mask=0 (center) → blend: original*(1-strength) + denoised*strength
+        # This way strength=0 preserves center perfectly, strength=0.6 partially
+        # overwrites it, and strength=1.0 fully denoises everything.
+        strength = job.img2img_input.denoising_strength if job.img2img_input else 0.0
+        effective_mask = mask_feathered + (1.0 - mask_feathered) * strength
+        effective_mask = np.clip(effective_mask, 0.0, 1.0)
+
         result_arr = np.array(image).astype(np.float32)
         canvas_arr = np.array(canvas_img).astype(np.float32)
-        mask_3d = mask_feathered[:, :, np.newaxis]
+        mask_3d = effective_mask[:, :, np.newaxis]
         composite = canvas_arr * (1.0 - mask_3d) + result_arr * mask_3d
         image = Image.fromarray(np.clip(composite, 0, 255).astype(np.uint8))
-        log.debug(f"  SDXL: Pixel-space composite applied (outpaint keep region)")
+        log.debug(f"  SDXL: Pixel-space composite applied (strength={strength:.2f})")
 
     return image
 
