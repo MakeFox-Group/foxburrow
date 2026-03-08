@@ -1540,10 +1540,16 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     # connections (head→neck, tail→body). The pixel-space composite in
     # vae_decode() restores original center pixels afterward.
     if dd_map is not None and is_img2img:
+        _check_cancelled()
         refine_strength = 0.2
         refine_base_steps = len(timesteps)  # same step budget as main pass
         refine_active = max(round(refine_base_steps * refine_strength), 3)
-        refine_total = max(round(refine_active / max(refine_strength, 0.001)), refine_active)
+        # Cap refine_total to main pass step count so both schedulers share
+        # the same noise schedule (sigma curve). Without this, short jobs
+        # (<15 steps) get a finer-grained refine schedule than the main pass.
+        refine_total = min(
+            max(round(refine_active / max(refine_strength, 0.001)), refine_active),
+            max(refine_base_steps, refine_active))
 
         refine_seed = scheduler_seed ^ 0xDEADBEEF
         scheduler_r, _step_gen_r = _create_scheduler(
@@ -1596,6 +1602,14 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
             latents = scheduler_r.step(noise_pred_r, t_r, latents,
                                         **step_kwargs_r).prev_sample
+
+            _step_dur_r = _time.monotonic() - _step_start
+            if _tracer:
+                _tracer.denoise_step(
+                    job.job_id, _model_name,
+                    active_step_count + (ri - start_r) + 1,
+                    active_step_count + refine_step_count,
+                    int(t_r), _step_dur_r, False)
 
         _refine_elapsed = _time.monotonic() - _refine_start
         log.debug(f"  SDXL: Outpaint refinement pass took {_refine_elapsed:.3f}s "
