@@ -627,7 +627,12 @@ def _execute_job(
                 _request_preload(preloader, next_gpu_stage, job, gpu)
 
             # ── Check cancellation after model load ─────────────
-            _check_cancelled()
+            try:
+                _check_cancelled()
+            except JobCancelledError:
+                log.info(f"  GPU worker: Job {cmd.job_id} cancelled")
+                error = "Cancelled"
+                break
 
             # ── Execute stage ─────────────────────────────────────
             set_current_tracer(tracer)
@@ -685,7 +690,9 @@ def _execute_job(
                 break
 
             except JobCancelledError:
-                raise  # Let the command loop handle cancellation
+                log.info(f"  GPU worker: Job {cmd.job_id} cancelled")
+                error = "Cancelled"
+                break
 
             except Exception as ex:
                 if _is_cuda_fatal_local(ex):
