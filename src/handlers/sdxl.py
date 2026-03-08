@@ -1025,8 +1025,12 @@ def _get_prediction_type(model_dir: str) -> str:
 def _create_scheduler(
     model_dir: str, steps: int, device: torch.device,
     sampler_name: str = "Euler A", scheduler_name: str | None = None,
+    seed: int | None = None,
 ):
     """Create a diffusers scheduler with the correct prediction_type.
+
+    Returns (scheduler, step_accepts_generator) — the bool indicates whether
+    the scheduler's step() method accepts a ``generator`` kwarg.
 
     For v-prediction models:
       - prediction_type="v_prediction"
@@ -1036,11 +1040,18 @@ def _create_scheduler(
     For epsilon models (default):
       - prediction_type="epsilon"
       - timestep_spacing="linspace"
+
+    Karras and SGMUniform scheduler modifiers are handled per-class:
+      - Classes that accept use_karras_sigmas / timestep_spacing natively
+        get them in __init__.
+      - For classes that lack native support, sigmas or timesteps are
+        computed manually and injected after set_timesteps().
     """
     prediction_type = _get_prediction_type(model_dir)
     is_vpred = prediction_type == "v_prediction"
 
-    kwargs = {
+    # Base kwargs shared by all schedulers
+    base_kwargs = {
         "beta_start": 0.00085,
         "beta_end": 0.012,
         "beta_schedule": "scaled_linear",
@@ -1049,16 +1060,15 @@ def _create_scheduler(
     }
 
     if is_vpred:
-        kwargs["rescale_betas_zero_snr"] = True
+        base_kwargs["rescale_betas_zero_snr"] = True
 
-    # Default spacing by prediction type
-    kwargs["timestep_spacing"] = "trailing" if is_vpred else "linspace"
+    # Default timestep spacing by prediction type
+    default_spacing = "trailing" if is_vpred else "linspace"
 
-    # Scheduler modifier — SGMUniform applied before class selection (universal)
-    if scheduler_name == "SGMUniform":
-        kwargs["timestep_spacing"] = "trailing"
+    # ── Sampler → class + class-specific kwargs ─────────────────────
+    cls = None
+    extra_kwargs = {}
 
-    # Sampler → class
     if sampler_name == "Euler A":
         cls = EulerAncestralDiscreteScheduler
     elif sampler_name == "Euler":
@@ -1067,9 +1077,11 @@ def _create_scheduler(
         cls = DPMSolverMultistepScheduler
     elif sampler_name == "DPM++ 2M SDE":
         cls = DPMSolverMultistepScheduler
-        kwargs["algorithm_type"] = "sde-dpmsolver++"
+        extra_kwargs["algorithm_type"] = "sde-dpmsolver++"
     elif sampler_name == "DPM++ SDE":
         cls = DPMSolverSDEScheduler
+        if seed is not None:
+            extra_kwargs["noise_sampler_seed"] = seed
     elif sampler_name == "DPM++ 2S a":
         cls = DPMSolverSinglestepScheduler
     elif sampler_name == "UniPC":
@@ -1082,25 +1094,92 @@ def _create_scheduler(
         log.warning(f"  SDXL: Unknown sampler '{sampler_name}', falling back to Euler A")
         cls = EulerAncestralDiscreteScheduler
 
-    # Karras sigmas — applied after class selection
+    # Check what the class actually accepts
+    init_params = set(inspect.signature(cls.__init__).parameters.keys())
+    step_params = set(inspect.signature(cls.step).parameters.keys())
+    step_accepts_generator = "generator" in step_params
+
+    # ── timestep_spacing ────────────────────────────────────────────
+    wants_trailing = scheduler_name == "SGMUniform" or is_vpred
+    spacing = "trailing" if wants_trailing else default_spacing
+    needs_custom_timesteps = False
+
+    if "timestep_spacing" in init_params:
+        extra_kwargs["timestep_spacing"] = spacing
+    elif wants_trailing:
+        # Class doesn't support timestep_spacing — inject trailing
+        # timesteps manually via set_timesteps(timesteps=...)
+        needs_custom_timesteps = True
+
+    # ── Karras sigmas ───────────────────────────────────────────────
+    needs_manual_karras = False
+
     if scheduler_name == "Karras":
-        kwargs["use_karras_sigmas"] = True
+        if "use_karras_sigmas" in init_params:
+            extra_kwargs["use_karras_sigmas"] = True
+        else:
+            # Class doesn't support use_karras_sigmas — compute and
+            # inject karras sigmas manually after set_timesteps()
+            needs_manual_karras = True
+
+    # ── Build and configure ─────────────────────────────────────────
+    kwargs = {**base_kwargs, **extra_kwargs}
+    # Final filter: drop any kwargs not in __init__ (safety net)
+    kwargs = {k: v for k, v in kwargs.items() if k in init_params}
 
     if is_vpred:
         log.debug(f"  SDXL: {sampler_name} scheduler (v-prediction, zero-SNR)")
 
-    # Filter kwargs to only those accepted by the chosen class's __init__,
-    # since not all schedulers accept every kwarg (e.g. DPMSolverSinglestep
-    # lacks timestep_spacing, EulerAncestral lacks use_karras_sigmas).
-    accepted = set(inspect.signature(cls.__init__).parameters.keys())
-    filtered = {k: v for k, v in kwargs.items() if k in accepted}
-    dropped = set(kwargs) - set(filtered)
-    if dropped:
-        log.debug(f"  SDXL: Dropped unsupported kwargs for {cls.__name__}: {dropped}")
+    scheduler = cls(**kwargs)
 
-    scheduler = cls(**filtered)
-    scheduler.set_timesteps(steps, device=device)
-    return scheduler
+    # set_timesteps — custom trailing timesteps or normal
+    if needs_custom_timesteps:
+        trailing_ts = torch.linspace(999, 0, steps + 1)[:-1].long().tolist()
+        set_ts_params = set(inspect.signature(cls.set_timesteps).parameters.keys())
+        if "timesteps" in set_ts_params:
+            scheduler.set_timesteps(
+                num_inference_steps=None, device=device, timesteps=trailing_ts)
+        else:
+            # Fallback: normal set_timesteps, then override
+            scheduler.set_timesteps(steps, device=device)
+            scheduler.timesteps = torch.tensor(
+                trailing_ts, dtype=torch.long, device=device)
+    else:
+        scheduler.set_timesteps(steps, device=device)
+
+    # Manual karras sigma injection for classes that lack native support
+    if needs_manual_karras:
+        base_sigmas = scheduler.sigmas.cpu().numpy()
+        sigma_min = float(base_sigmas[-2])  # last non-zero
+        sigma_max = float(base_sigmas[0])
+        rho = 7.0
+        ramp = np.linspace(0, 1, steps)
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        karras = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+
+        # Compute timesteps from karras sigmas
+        alphas_cumprod = scheduler.alphas_cumprod.cpu().numpy()
+        log_sigmas = np.log(((1 - alphas_cumprod) / alphas_cumprod) ** 0.5)
+
+        def _sigma_to_t(sigma):
+            log_sigma = np.log(max(sigma, 1e-10))
+            dists = log_sigma - log_sigmas
+            low_idx = max(int(np.cumsum(dists >= 0).argmax()) - 1, 0)
+            high_idx = min(low_idx + 1, len(log_sigmas) - 1)
+            low, high = log_sigmas[low_idx], log_sigmas[high_idx]
+            w = np.clip((low - log_sigma) / (low - high + 1e-10), 0, 1)
+            return (1 - w) * low_idx + w * high_idx
+
+        timesteps = np.array([_sigma_to_t(s) for s in karras])
+        sigmas_out = np.append(karras, [0.0])
+
+        scheduler.timesteps = torch.from_numpy(timesteps).to(
+            dtype=torch.float32, device=device)
+        scheduler.sigmas = torch.from_numpy(sigmas_out).to(
+            dtype=torch.float32, device=device)
+
+    return scheduler, step_accepts_generator
 
 
 def _apply_subseed_variation(
@@ -1209,7 +1288,9 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _tracer.denoise_setup(job.job_id, _model_name, _setup_elapsed, _has_lora, _lora_name)
 
     # Create scheduler with correct prediction_type for this model
-    scheduler = _create_scheduler(inp.model_dir, steps, device, inp.sampler, inp.scheduler)
+    scheduler, _step_gen = _create_scheduler(
+        inp.model_dir, steps, device, inp.sampler, inp.scheduler,
+        seed=scheduler_seed)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
@@ -1311,7 +1392,8 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                 noise_pred_uncond, noise_pred_cond = out.chunk(2)
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
-        latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
+        step_kwargs = {"generator": generator} if _step_gen else {}
+        latents = scheduler.step(noise_pred, t, latents, **step_kwargs).prev_sample
 
         _step_dur = _time.monotonic() - _step_start
         if _tracer:
@@ -1376,7 +1458,9 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         unet.disable_adapters()
 
     # Create scheduler with correct prediction_type for this model
-    scheduler = _create_scheduler(inp.model_dir, steps, device, inp.sampler, inp.scheduler)
+    scheduler, _step_gen = _create_scheduler(
+        inp.model_dir, steps, device, inp.sampler, inp.scheduler,
+        seed=scheduler_seed)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
@@ -1511,7 +1595,8 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
             noise_pred = noise_pred_uncond + inp.cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
-            latents = scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
+            step_kwargs = {"generator": generator} if _step_gen else {}
+        latents = scheduler.step(noise_pred, t, latents, **step_kwargs).prev_sample
     finally:
         # Restore original attention processors and clear batched CFG state
         state.active = False
