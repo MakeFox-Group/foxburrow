@@ -531,6 +531,7 @@ def _execute_job(
     from scheduling.job import (
         InferenceJob, JobCancelledError, JobType, StageType, WorkStage,
     )
+    from handlers.sdxl import _check_cancelled
     from profiling.tracer import set_current_tracer
 
     device = torch.device("cuda:0")
@@ -626,7 +627,6 @@ def _execute_job(
                 _request_preload(preloader, next_gpu_stage, job, gpu)
 
             # ── Check cancellation after model load ─────────────
-            from handlers.sdxl import _check_cancelled
             _check_cancelled()
 
             # ── Execute stage ─────────────────────────────────────

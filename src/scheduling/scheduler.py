@@ -86,11 +86,20 @@ class GpuScheduler:
                 job.completed_at = datetime.utcnow()
                 # Release admission slot before setting result
                 from state import app_state
-                if app_state.admission is not None:
-                    app_state.admission.release(job.type)
-                job.set_result(JobResult(
-                    success=False,
-                    error="Out of memory on all available GPUs"))
+                if not job._admission_released:
+                    job._admission_released = True
+                    if app_state.admission is not None:
+                        app_state.admission.release(job.type)
+                error_msg = "Out of memory on all available GPUs"
+                job.set_result(JobResult(success=False, error=error_msg))
+                # Broadcast failure via WebSocket so makefoxsrv gets notified
+                try:
+                    from api.websocket import streamer
+                    import asyncio
+                    asyncio.ensure_future(
+                        streamer.broadcast_complete(job, success=False, error=error_msg))
+                except Exception:
+                    pass
 
         if not jobs:
             return

@@ -2034,6 +2034,7 @@ async def job_cancel(job_id: str):
 
     # If still queued (not yet dispatched to a GPU), resolve directly
     if job.assigned_gpu_uuid is None:
+        state.queue.remove(job)
         job.completed_at = datetime.utcnow()
         if not job._admission_released:
             job._admission_released = True
