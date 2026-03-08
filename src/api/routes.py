@@ -35,11 +35,15 @@ class GenerateRequest(BaseModel):
     steps: int = 25
     cfg_scale: float = 7.0
     seed: int = 0
+    subseed: int = 0
+    subseed_strength: float = Field(default=0.0, ge=0.0, le=1.0)
     model: str | None = None
     vae_tile_width: int = 0    # VAE decode tile width in pixels (0 = auto ≤ 1024)
     vae_tile_height: int = 0   # VAE decode tile height in pixels (0 = auto ≤ 1024)
     loras: list[dict] | None = None  # [{"name": "xxx", "weight": 1.0}, ...]
     regional_prompting: bool = False
+    sampler: str = "Euler A"
+    scheduler: str | None = None
     priority: int = Field(default=100, ge=1, le=100)
     clip_embeddings: list[dict] | None = None  # Pre-computed CLIP cache entries (6 items)
 
@@ -52,6 +56,8 @@ class GenerateHiresRequest(BaseModel):
     steps: int = 25
     cfg_scale: float = 7.0
     seed: int = 0
+    subseed: int = 0
+    subseed_strength: float = Field(default=0.0, ge=0.0, le=1.0)
     hires_steps: int = 15
     hires_denoising_strength: float = 0.33
     base_width: int | None = None
@@ -61,6 +67,8 @@ class GenerateHiresRequest(BaseModel):
     unet_tile_height: int = 0  # Reserved (unused)
     loras: list[dict] | None = None  # [{"name": "xxx", "weight": 1.0}, ...]
     regional_prompting: bool = False
+    sampler: str = "Euler A"
+    scheduler: str | None = None
     vae_tile_width: int = 0    # VAE encode/decode tile width in pixels (0 = auto ≤ 1024)
     vae_tile_height: int = 0   # VAE encode/decode tile height in pixels (0 = auto ≤ 1024)
     priority: int = Field(default=100, ge=1, le=100)
@@ -615,9 +623,13 @@ async def generate(req: GenerateRequest):
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
+            subseed=req.subseed,
+            subseed_strength=req.subseed_strength,
             model_dir=model_dir,
             loras=all_loras,
             regional_prompting=req.regional_prompting,
+            sampler=req.sampler,
+            scheduler=req.scheduler,
         ),
         priority=req.priority,
     )
@@ -709,9 +721,13 @@ async def generate_hires(req: GenerateHiresRequest):
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
+            subseed=req.subseed,
+            subseed_strength=req.subseed_strength,
             model_dir=model_dir,
             loras=all_loras,
             regional_prompting=req.regional_prompting,
+            sampler=req.sampler,
+            scheduler=req.scheduler,
         ),
         hires_input=SdxlHiresInput(
             hires_width=gen_w,
@@ -787,9 +803,13 @@ async def generate_latents(req: GenerateRequest):
             steps=req.steps,
             cfg_scale=req.cfg_scale,
             seed=seed,
+            subseed=req.subseed,
+            subseed_strength=req.subseed_strength,
             model_dir=model_dir,
             loras=all_loras,
             regional_prompting=req.regional_prompting,
+            sampler=req.sampler,
+            scheduler=req.scheduler,
         ),
         priority=req.priority,
     )
@@ -1093,12 +1113,16 @@ async def hires_latents(request: Request):
         denoising_strength = float(qp.get("denoising_strength", "0.33"))
         cfg_scale          = float(qp.get("cfg_scale", "4.0"))
         seed_param         = int(qp.get("seed", "0"))
+        subseed_param      = int(qp.get("subseed", "0"))
+        subseed_str        = max(0.0, min(1.0, float(qp.get("subseed_strength", "0.0"))))
         unet_tile_w        = int(qp.get("unet_tile_width",  "0"))
         unet_tile_h        = int(qp.get("unet_tile_height", "0"))
         vae_tile_w         = int(qp.get("vae_tile_width",   "0"))
         vae_tile_h         = int(qp.get("vae_tile_height",  "0"))
     except (ValueError, TypeError) as ex:
         return _error(400, f"Invalid query parameter: {ex}")
+    sampler_param   = qp.get("sampler", "Euler A")
+    scheduler_param = qp.get("scheduler")
     if not (1 <= hires_steps <= 150):
         return _error(400, "hires_steps must be between 1 and 150.")
     if not (0.0 <= denoising_strength <= 1.0):
@@ -1158,8 +1182,12 @@ async def hires_latents(request: Request):
             steps=0,
             cfg_scale=cfg_scale,
             seed=seed,
+            subseed=subseed_param,
+            subseed_strength=subseed_str,
             model_dir=model_dir,
             loras=all_loras,
+            sampler=sampler_param,
+            scheduler=scheduler_param,
         ),
         hires_input=SdxlHiresInput(
             hires_width=gen_hires_w,
@@ -1376,9 +1404,13 @@ async def enqueue_generate(req: GenerateRequest):
                 steps=req.steps,
                 cfg_scale=req.cfg_scale,
                 seed=seed,
+                subseed=req.subseed,
+                subseed_strength=req.subseed_strength,
                 model_dir=model_dir,
                 loras=all_loras,
                 regional_prompting=req.regional_prompting,
+                sampler=req.sampler,
+                scheduler=req.scheduler,
             ),
             priority=req.priority,
         )
@@ -1477,9 +1509,13 @@ async def enqueue_generate_hires(req: GenerateHiresRequest):
                 steps=req.steps,
                 cfg_scale=req.cfg_scale,
                 seed=seed,
+                subseed=req.subseed,
+                subseed_strength=req.subseed_strength,
                 model_dir=model_dir,
                 loras=all_loras,
                 regional_prompting=req.regional_prompting,
+                sampler=req.sampler,
+                scheduler=req.scheduler,
             ),
             hires_input=SdxlHiresInput(
                 hires_width=gen_w,
@@ -1639,7 +1675,7 @@ async def enqueue_enhance(request: Request):
     """Enhance (img2img hires): upscale input image, VAE encode, hires denoise, VAE decode.
 
     Multipart form data:
-      image  (required) — PNG/JPEG image bytes
+      image  (required unless cached_latents provided) — PNG/JPEG image bytes
       params (required) — JSON string with fields:
         prompt          (required)
         negative_prompt (default: "")
@@ -1652,7 +1688,8 @@ async def enqueue_enhance(request: Request):
         seed            (default: random)
         unet_tile_width, unet_tile_height (default: 0 = auto)
         vae_tile_width, vae_tile_height   (default: 0 = auto)
-        clip_embeddings (optional) — pre-computed CLIP cache entries
+        clip_embeddings  (optional) — pre-computed CLIP cache entries
+        cached_latents   (optional) — {data: base64, dtype: str, shape: [4 ints]}
     """
     from scheduling.job import InferenceJob, JobType, SdxlJobInput, SdxlHiresInput
 
@@ -1660,26 +1697,28 @@ async def enqueue_enhance(request: Request):
 
     if not state.gpu_pool.has_capability("sdxl"):
         return _error(404, "No GPUs configured for sdxl on this worker.")
-    if not state.gpu_pool.has_capability("upscale"):
-        return _error(404, "No GPUs configured for upscale on this worker.")
 
     # Parse multipart form data
     form = await request.form()
     try:
         image_file = form.get("image")
         params_str = form.get("params")
+        latent_file = form.get("latent_data")
 
-        if image_file is None or params_str is None:
-            return _error(400, 'Multipart form must include "image" and "params" parts.')
+        if params_str is None:
+            return _error(400, 'Multipart form must include "params" part.')
 
-        image_bytes = await image_file.read()
+        image_bytes = (await image_file.read()) if image_file is not None else None
+        latent_bytes = (await latent_file.read()) if latent_file is not None else None
     finally:
         await form.close()
 
-    try:
-        input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception as ex:
-        return _error(400, f"Could not decode image: {ex}")
+    input_image = None
+    if image_bytes is not None:
+        try:
+            input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception as ex:
+            return _error(400, f"Could not decode image: {ex}")
 
     try:
         p = json.loads(params_str)
@@ -1710,6 +1749,8 @@ async def enqueue_enhance(request: Request):
         denoising_strength = float(p.get("denoising_strength", 0.33))
         cfg_scale          = float(p.get("cfg_scale", 7.0))
         seed_param         = int(p.get("seed", 0))
+        subseed_param      = int(p.get("subseed", 0))
+        subseed_strength   = max(0.0, min(1.0, float(p.get("subseed_strength", 0.0))))
         unet_tile_w        = int(p.get("unet_tile_width",  0))
         unet_tile_h        = int(p.get("unet_tile_height", 0))
         vae_tile_w         = int(p.get("vae_tile_width",   0))
@@ -1717,6 +1758,8 @@ async def enqueue_enhance(request: Request):
         job_priority       = max(1, min(100, int(p.get("priority", 100))))
     except (ValueError, TypeError) as ex:
         return _error(400, f"Invalid parameter: {ex}")
+    sampler_param   = p.get("sampler", "Euler A")
+    scheduler_param = p.get("scheduler")
 
     if not (1 <= hires_steps <= 150):
         return _error(400, "hires_steps must be between 1 and 150.")
@@ -1734,6 +1777,48 @@ async def enqueue_enhance(request: Request):
 
     regional_prompting = bool(p.get("regional_prompting", False))
     clip_embeddings = p.get("clip_embeddings")
+    cached_latents_meta = p.get("cached_latents")
+
+    # Try to parse cached latents for latent-space upscale path
+    # Latent data comes as a separate binary multipart part (latent_data),
+    # metadata (dtype, shape) comes in the JSON params (cached_latents).
+    use_latent_pipeline = False
+    latent_tensor = None
+    if cached_latents_meta and latent_bytes and not regional_prompting:
+        try:
+            _DTYPE_MAP = {"float16": np.float16, "fp16": np.float16,
+                          "float32": np.float32, "fp32": np.float32}
+
+            lat_shape = cached_latents_meta["shape"]
+            if (not isinstance(lat_shape, list) or len(lat_shape) != 4
+                    or lat_shape[0] != 1 or lat_shape[1] != 4
+                    or any(not isinstance(d, int) or d <= 0 for d in lat_shape)):
+                raise ValueError(f"shape must be [1, 4, h, w], got {lat_shape!r}")
+
+            lat_dtype_str = cached_latents_meta.get("dtype", "float16")
+            np_dtype = _DTYPE_MAP.get(lat_dtype_str)
+            if np_dtype is None:
+                raise ValueError(f"Unsupported latent dtype: {lat_dtype_str!r}")
+
+            expected_bytes = int(np.prod(lat_shape)) * np.dtype(np_dtype).itemsize
+            if expected_bytes > 64 * 1024 * 1024:  # 64MB cap
+                raise ValueError(f"cached_latents too large: {expected_bytes} bytes")
+
+            if len(latent_bytes) != expected_bytes:
+                raise ValueError(f"latent_data length {len(latent_bytes)} != expected {expected_bytes}")
+
+            lat_arr = np.frombuffer(latent_bytes, dtype=np_dtype).reshape(lat_shape)
+            latent_tensor = torch.from_numpy(lat_arr.copy())  # CPU tensor
+            use_latent_pipeline = True
+        except Exception as ex:
+            log.warning(f"Invalid cached_latents, falling back to image pipeline: {ex}")
+
+    # Image pipeline requires upscale capability; latent pipeline does not
+    if not use_latent_pipeline:
+        if not state.gpu_pool.has_capability("upscale"):
+            return _error(404, "No GPUs configured for upscale on this worker.")
+        if input_image is None:
+            return _error(400, 'Image is required when cached_latents are not provided.')
 
     admitted = False
     try:
@@ -1742,58 +1827,104 @@ async def enqueue_enhance(request: Request):
             return rejected
         admitted = True
 
-        # Base dimensions = original input image size
-        base_w = input_image.width
-        base_h = input_image.height
-
-        # Only upscale if the input image is smaller than the target in either dimension
-        needs_upscale = base_w < gen_hires_w or base_h < gen_hires_h
-
-        if not needs_upscale:
-            # Image is already large enough — just resize to target dimensions
-            if base_w != gen_hires_w or base_h != gen_hires_h:
-                input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
-                log.debug(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
-                         f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
-
         # Parse LoRA tags from prompt
         cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
             prompt, negative_prompt, None)
 
         model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
-        log.debug(f"Enqueue enhance: input={base_w}x{base_h} target={orig_hires_w}x{orig_hires_h} "
-                 f"upscale={'yes' if needs_upscale else 'no'} "
-                 f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
-                 f"cfg={cfg_scale} seed={seed} model={model_short}"
-                 + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
-
         factory = state.pipeline_factory
         queue = state.queue
 
-        job = InferenceJob(
-            job_type=JobType.ENHANCE,
-            pipeline=factory.create_enhance_pipeline(model_dir, needs_upscale=needs_upscale),
-            sdxl_input=SdxlJobInput(
-                prompt=cleaned_prompt,
-                negative_prompt=cleaned_neg,
-                width=base_w,
-                height=base_h,
-                steps=0,  # not used for enhance — hires_steps drives denoise
-                cfg_scale=cfg_scale,
-                seed=seed,
-                model_dir=model_dir,
-                loras=all_loras,
-                regional_prompting=regional_prompting,
-            ),
-            hires_input=SdxlHiresInput(
-                hires_width=gen_hires_w,
-                hires_height=gen_hires_h,
-                hires_steps=hires_steps,
-                denoising_strength=denoising_strength,
-            ),
-            input_image=input_image,
-            priority=job_priority,
-        )
+        if use_latent_pipeline:
+            # Latent-space upscale path: skip RealESRGAN and VAE encode
+            lat_h, lat_w = latent_tensor.shape[2], latent_tensor.shape[3]
+            base_w = lat_w * 8
+            base_h = lat_h * 8
+
+            log.debug(f"Enqueue enhance (latent path): latents={lat_h}x{lat_w} "
+                     f"target={orig_hires_w}x{orig_hires_h} "
+                     f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
+                     f"cfg={cfg_scale} seed={seed} model={model_short}"
+                     + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+
+            job = InferenceJob(
+                job_type=JobType.ENHANCE,
+                pipeline=factory.create_enhance_latent_pipeline(model_dir),
+                sdxl_input=SdxlJobInput(
+                    prompt=cleaned_prompt,
+                    negative_prompt=cleaned_neg,
+                    width=base_w,
+                    height=base_h,
+                    steps=0,
+                    cfg_scale=cfg_scale,
+                    seed=seed,
+                    subseed=subseed_param,
+                    subseed_strength=subseed_strength,
+                    model_dir=model_dir,
+                    loras=all_loras,
+                    regional_prompting=regional_prompting,
+                    sampler=sampler_param,
+                    scheduler=scheduler_param,
+                ),
+                hires_input=SdxlHiresInput(
+                    hires_width=gen_hires_w,
+                    hires_height=gen_hires_h,
+                    hires_steps=hires_steps,
+                    denoising_strength=denoising_strength,
+                ),
+                input_image=input_image,  # may be None, not used by latent path
+                priority=job_priority,
+            )
+            job.latents = latent_tensor
+        else:
+            # Image-based upscale path (existing behavior)
+            base_w = input_image.width
+            base_h = input_image.height
+
+            needs_upscale = base_w < gen_hires_w or base_h < gen_hires_h
+
+            if not needs_upscale:
+                if base_w != gen_hires_w or base_h != gen_hires_h:
+                    input_image = input_image.resize((gen_hires_w, gen_hires_h), Image.LANCZOS)
+                    log.debug(f"Enhance: input already large enough, resized {base_w}x{base_h} → "
+                             f"{gen_hires_w}x{gen_hires_h} (no upscale needed)")
+
+            log.debug(f"Enqueue enhance (image path): input={base_w}x{base_h} "
+                     f"target={orig_hires_w}x{orig_hires_h} "
+                     f"upscale={'yes' if needs_upscale else 'no'} "
+                     f"hires_steps={hires_steps} strength={denoising_strength:.2f} "
+                     f"cfg={cfg_scale} seed={seed} model={model_short}"
+                     + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+
+            job = InferenceJob(
+                job_type=JobType.ENHANCE,
+                pipeline=factory.create_enhance_pipeline(model_dir, needs_upscale=needs_upscale),
+                sdxl_input=SdxlJobInput(
+                    prompt=cleaned_prompt,
+                    negative_prompt=cleaned_neg,
+                    width=base_w,
+                    height=base_h,
+                    steps=0,
+                    cfg_scale=cfg_scale,
+                    seed=seed,
+                    subseed=subseed_param,
+                    subseed_strength=subseed_strength,
+                    model_dir=model_dir,
+                    loras=all_loras,
+                    regional_prompting=regional_prompting,
+                    sampler=sampler_param,
+                    scheduler=scheduler_param,
+                ),
+                hires_input=SdxlHiresInput(
+                    hires_width=gen_hires_w,
+                    hires_height=gen_hires_h,
+                    hires_steps=hires_steps,
+                    denoising_strength=denoising_strength,
+                ),
+                input_image=input_image,
+                priority=job_priority,
+            )
+
         job.is_hires_pass = True  # denoise uses hires path from the start
         job.unet_tile_width  = unet_tile_w
         job.unet_tile_height = unet_tile_h
@@ -1886,6 +2017,52 @@ async def job_status(job_id: str):
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "error": error,
     }
+
+
+@router.post("/job/{job_id}/cancel")
+async def job_cancel(job_id: str):
+    from scheduling.job import JobResult
+    from datetime import datetime
+
+    state = _get_state()
+    job = state.jobs.get(job_id)
+    if job is None:
+        return _error(404, f"Job {job_id} not found.")
+
+    if job.completion.done():
+        return {"job_id": job_id, "status": "already_completed"}
+
+    # Mark cancelled
+    job._cancelled = True
+
+    # If still queued (not yet dispatched to a GPU), resolve the future directly
+    if job.assigned_gpu_uuid is None:
+        job.completed_at = datetime.utcnow()
+        if state.admission is not None:
+            state.admission.release(job.type)
+        job.set_result(JobResult(success=False, error="Cancelled"))
+        from api.websocket import streamer
+        await streamer.broadcast_complete(job, success=False, error="Cancelled")
+        log.info(f"Cancelled queued job {job_id}")
+        return {"job_id": job_id, "status": "cancelled"}
+
+    # Job is running on a GPU — signal the worker to cancel
+    for worker in state.scheduler.workers:
+        if worker._active_job is job:
+            worker.cancel_active_job()
+            log.info(f"Cancelled running job {job_id} on GPU [{worker.gpu.uuid}]")
+            return {"job_id": job_id, "status": "cancelling"}
+
+    # Job has a GPU assigned but wasn't found active — might be between stages
+    log.warning(f"Cancel requested for job {job_id} but worker not found, "
+                f"marking cancelled")
+    job.completed_at = datetime.utcnow()
+    if state.admission is not None:
+        state.admission.release(job.type)
+    job.set_result(JobResult(success=False, error="Cancelled"))
+    from api.websocket import streamer
+    await streamer.broadcast_complete(job, success=False, error="Cancelled")
+    return {"job_id": job_id, "status": "cancelled"}
 
 
 @router.get("/job/{job_id}/result")

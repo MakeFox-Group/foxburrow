@@ -860,6 +860,7 @@ def main() -> None:
     for i, gpu_inst in enumerate(app_state.gpu_pool.gpus):
         cmd_q = mp.Queue()
         result_q = mp.Queue()
+        cancel_evt = mp.Event()
 
         proc = mp.Process(
             target=_worker_process_entry,
@@ -884,6 +885,7 @@ def main() -> None:
                 },
                 cmd_q,
                 result_q,
+                cancel_evt,
             ),
             name=f"gpu-worker-{i}",
             daemon=True,
@@ -897,6 +899,7 @@ def main() -> None:
             gpu_config=config.gpus[_find_gpu_config_index(config.gpus, gpu_inst.uuid)],
             gpu_total_memory=gpu_inst.total_memory,
             gpu_index=i,
+            cancel_event=cancel_evt,
         )
         # Set NVML handle on proxy's GpuProxy for VRAM queries
         proxy.gpu.nvml_handle = gpu_inst.nvml_handle

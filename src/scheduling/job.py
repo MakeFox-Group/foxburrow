@@ -17,6 +17,11 @@ import torch
 from PIL import Image
 
 
+class JobCancelledError(Exception):
+    """Raised when a job is cancelled during execution."""
+    pass
+
+
 class JobType(Enum):
     SDXL_GENERATE = "SdxlGenerate"
     SDXL_GENERATE_LATENTS = "SdxlGenerateLatents"
@@ -39,6 +44,7 @@ class StageType(Enum):
     GPU_VAE_ENCODE = "GpuVaeEncode"
     GPU_HIRES_TRANSFORM = "GpuHiresTransform"
     GPU_UPSCALE = "GpuUpscale"
+    GPU_LATENT_UPSCALE = "GpuLatentUpscale"
     GPU_BGREMOVE = "GpuBGRemove"
 
 
@@ -83,9 +89,13 @@ class SdxlJobInput:
     steps: int = 25
     cfg_scale: float = 7.0
     seed: int = 0
+    subseed: int = 0              # variation subseed (0 = no variation)
+    subseed_strength: float = 0.0 # lerp weight toward subseed noise
     model_dir: str = ""
     loras: list = field(default_factory=list)  # list[LoraSpec] parsed from prompt
     regional_prompting: bool = False
+    sampler: str = "Euler A"
+    scheduler: str | None = None
 
 
 @dataclass
@@ -209,6 +219,9 @@ class InferenceJob:
 
         # GPU assignment — which GPU this job is dispatched to (whole pipeline)
         self.assigned_gpu_uuid: str | None = None
+
+        # Cancellation
+        self._cancelled: bool = False
 
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
         self.unet_tile_width: int = 0   # Reserved (unused)

@@ -273,11 +273,13 @@ class GpuWorkerProxy:
         gpu_config: GpuConfig,
         gpu_total_memory: int,
         gpu_index: int,
+        cancel_event: mp.Event | None = None,
     ):
         self._process = process
         self._cmd_queue = cmd_queue
         self._result_queue = result_queue
         self._gpu_index = gpu_index
+        self._cancel_event = cancel_event
 
         # Create the lightweight GPU proxy object
         self._gpu_proxy = GpuProxy(
@@ -404,6 +406,20 @@ class GpuWorkerProxy:
         capabilities aren't supported.
         """
         return True
+
+    def cancel_active_job(self) -> bool:
+        """Signal the worker process to cancel the currently running job.
+
+        Returns True if a job was active and the cancel signal was sent.
+        """
+        if self._active_job is None:
+            return False
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+            log.debug(f"  GpuWorkerProxy[{self._gpu_proxy.uuid}]: "
+                      f"Cancel signal sent for {self._active_job}")
+            return True
+        return False
 
     def dispatch(self, job: InferenceJob) -> None:
         """Dispatch an entire job to the worker process."""

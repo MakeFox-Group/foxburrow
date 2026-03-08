@@ -141,6 +141,7 @@ def gpu_worker_main(
     server_config_dict: dict,
     cmd_queue: mp.Queue,
     result_queue: mp.Queue,
+    cancel_event: mp.Event | None = None,
 ) -> None:
     """Entry point for each GPU worker process.
 
@@ -335,10 +336,16 @@ def gpu_worker_main(
 
     _set_progress_cb(_send_progress)
 
+    # Set cancel event for handler-level cancellation checks
+    if cancel_event is not None:
+        from handlers.sdxl import set_cancel_event as _set_cancel_evt
+        _set_cancel_evt(cancel_event)
+
     # Create model preloader (background CPU loading thread)
     preloader = ModelPreloader()
 
     # ── Command loop (single-threaded, one job at a time) ─────────
+    from scheduling.job import JobCancelledError
     import queue as _queue_mod
     while True:
         try:
@@ -355,12 +362,22 @@ def gpu_worker_main(
 
         try:
             if isinstance(cmd, ExecuteJobCmd):
+                # Clear cancel event before starting a new job
+                if cancel_event is not None:
+                    cancel_event.clear()
                 # Execute entire job pipeline on main thread (single-threaded)
                 try:
                     job_result = _execute_job(
                         gpu, cmd, gpu_model_name, tracer, _worker_loop, preloader,
                         result_queue)
                     result_queue.put(job_result)
+                except JobCancelledError:
+                    log.info(f"  GPU worker [{gpu_uuid}]: Job {cmd.job_id} cancelled")
+                    result_queue.put(JobComplete(
+                        job_id=cmd.job_id,
+                        success=False,
+                        error="Cancelled",
+                    ))
                 except Exception as ex:
                     fatal = _is_cuda_fatal_local(ex)
                     log.log_exception(ex, f"GPU worker [{gpu_uuid}]: Job failed (unhandled)")
@@ -375,6 +392,9 @@ def gpu_worker_main(
                             success=False,
                             error=f"{type(ex).__name__}: {ex}",
                         ))
+                finally:
+                    if cancel_event is not None:
+                        cancel_event.clear()
 
             elif isinstance(cmd, DrainCmd):
                 _drain(gpu)
@@ -499,7 +519,7 @@ def _execute_job(
     import torch
     from gpu import torch_ext
     from scheduling.job import (
-        InferenceJob, JobType, StageType, WorkStage,
+        InferenceJob, JobCancelledError, JobType, StageType, WorkStage,
     )
     from profiling.tracer import set_current_tracer
 
@@ -551,15 +571,24 @@ def _execute_job(
                 _ensure_models_for_stage(gpu, stage, job, gpu_model_name, preloader)
 
                 # Ensure free VRAM for working memory.
-                # VAE decode/encode stages are excluded — they use VRAM-aware
-                # adaptive tiling that picks the largest tile size that fits in
-                # available VRAM.  Pre-evicting models for VAE working memory
-                # forces the UNet out on 12GB GPUs (untiled 1024x1024 needs ~4GB),
-                # causing it to be reloaded for every subsequent job.
+                # Excluded stages:
+                # - VAE decode/encode: VRAM-aware adaptive tiling picks the
+                #   largest tile size that fits.  Pre-evicting models for VAE
+                #   working memory forces the UNet out on 12GB GPUs.
+                # - GPU_HIRES_TRANSFORM: contains VAE + denoise internally.
+                # - GPU_DENOISE during hires pass: same UNet denoise code that
+                #   runs inside GPU_HIRES_TRANSFORM (already exempt).  Profiler
+                #   only covers resolutions up to 2048x2048 — extrapolation at
+                #   hires resolutions produces wildly inaccurate predictions.
+                # - GPU_LATENT_UPSCALE: pure tensor math, trivial VRAM.
                 from scheduling.worker import _get_min_free_vram
-                _vae_stages = (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE,
-                               StageType.GPU_HIRES_TRANSFORM)
-                if stage.type not in _vae_stages:
+                _skip_vram_check = (StageType.GPU_VAE_DECODE, StageType.GPU_VAE_ENCODE,
+                                    StageType.GPU_HIRES_TRANSFORM, StageType.GPU_LATENT_UPSCALE)
+                is_hires_denoise = (stage.type == StageType.GPU_DENOISE
+                                    and job.is_hires_pass
+                                    and job.hires_input is not None
+                                    and job.hires_input.hires_width > 0)
+                if stage.type not in _skip_vram_check and not is_hires_denoise:
                     active_fps = {c.fingerprint for c in stage.required_components}
                     active_fps.update(getattr(stage, '_trt_active_fps', set()))
                     min_free = _get_min_free_vram(stage.type, job, gpu_model_name)
@@ -640,6 +669,9 @@ def _execute_job(
                 error = str(ex)
                 torch.cuda.empty_cache()
                 break
+
+            except JobCancelledError:
+                raise  # Let the command loop handle cancellation
 
             except Exception as ex:
                 if _is_cuda_fatal_local(ex):
@@ -1356,6 +1388,11 @@ def _dispatch_stage(job, stage, gpu):
         vae_encode(job, gpu)
         if job.hires_input is not None:
             job.is_hires_pass = True
+        return None
+
+    elif stage.type == StageType.GPU_LATENT_UPSCALE:
+        from handlers.latent_upscale import execute
+        execute(job, gpu)
         return None
 
     elif stage.type == StageType.GPU_UPSCALE:

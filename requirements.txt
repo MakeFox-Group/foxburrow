@@ -39,6 +39,9 @@ tensorrt-cu13>=10.15
 onnx>=1.16
 onnxscript>=0.1
 
+# SDE-based samplers (DPM++ SDE)
+torchsde>=0.2.6
+
 # Image / numeric
 Pillow>=10.0
 numpy>=1.24

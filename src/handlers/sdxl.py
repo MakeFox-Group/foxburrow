@@ -5,6 +5,7 @@ Ports all logic from the C# SdxlHandler using PyTorch + diffusers.
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import re
@@ -15,7 +16,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    DPMSolverSDEScheduler,
+    DPMSolverSinglestepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    HeunDiscreteScheduler,
+    UniPCMultistepScheduler,
+)
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
@@ -922,6 +933,7 @@ def _text_encode_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
 
 _progress_callback = None
+_cancel_event = None  # multiprocessing.Event set by main process to cancel running job
 
 
 def set_progress_callback(cb) -> None:
@@ -935,12 +947,27 @@ def set_progress_callback(cb) -> None:
     _progress_callback = cb
 
 
+def set_cancel_event(evt) -> None:
+    """Set the cancel event (multiprocessing.Event) for this worker process."""
+    global _cancel_event
+    _cancel_event = evt
+
+
+def _check_cancelled() -> None:
+    """Raise JobCancelledError if the cancel event is set."""
+    from scheduling.job import JobCancelledError
+    if _cancel_event is not None and _cancel_event.is_set():
+        raise JobCancelledError("Job cancelled")
+
+
 def _broadcast_ws_progress(job: InferenceJob) -> None:
-    """Broadcast denoise/stage progress.
+    """Broadcast denoise/stage progress and check for cancellation.
 
     In the worker subprocess, this sends ProgressUpdate via IPC.
     Falls back to direct WebSocket broadcast for in-process execution.
+    Raises JobCancelledError if the cancel event has been set.
     """
+    _check_cancelled()
     try:
         if _progress_callback is not None:
             _progress_callback(job)
@@ -997,8 +1024,9 @@ def _get_prediction_type(model_dir: str) -> str:
 
 def _create_scheduler(
     model_dir: str, steps: int, device: torch.device,
-) -> EulerAncestralDiscreteScheduler:
-    """Create an EulerAncestralDiscreteScheduler with the correct prediction_type.
+    sampler_name: str = "Euler A", scheduler_name: str | None = None,
+):
+    """Create a diffusers scheduler with the correct prediction_type.
 
     For v-prediction models:
       - prediction_type="v_prediction"
@@ -1010,6 +1038,7 @@ def _create_scheduler(
       - timestep_spacing="linspace"
     """
     prediction_type = _get_prediction_type(model_dir)
+    is_vpred = prediction_type == "v_prediction"
 
     kwargs = {
         "beta_start": 0.00085,
@@ -1019,16 +1048,85 @@ def _create_scheduler(
         "prediction_type": prediction_type,
     }
 
-    if prediction_type == "v_prediction":
+    if is_vpred:
         kwargs["rescale_betas_zero_snr"] = True
-        kwargs["timestep_spacing"] = "trailing"
-        log.debug(f"  SDXL: Using v-prediction scheduler (zero-SNR, trailing spacing)")
-    else:
-        kwargs["timestep_spacing"] = "linspace"
 
-    scheduler = EulerAncestralDiscreteScheduler(**kwargs)
+    # Default spacing by prediction type
+    kwargs["timestep_spacing"] = "trailing" if is_vpred else "linspace"
+
+    # Scheduler modifier — SGMUniform applied before class selection (universal)
+    if scheduler_name == "SGMUniform":
+        kwargs["timestep_spacing"] = "trailing"
+
+    # Sampler → class
+    if sampler_name == "Euler A":
+        cls = EulerAncestralDiscreteScheduler
+    elif sampler_name == "Euler":
+        cls = EulerDiscreteScheduler
+    elif sampler_name == "DPM++ 2M":
+        cls = DPMSolverMultistepScheduler
+    elif sampler_name == "DPM++ 2M SDE":
+        cls = DPMSolverMultistepScheduler
+        kwargs["algorithm_type"] = "sde-dpmsolver++"
+    elif sampler_name == "DPM++ SDE":
+        cls = DPMSolverSDEScheduler
+    elif sampler_name == "DPM++ 2S a":
+        cls = DPMSolverSinglestepScheduler
+    elif sampler_name == "UniPC":
+        cls = UniPCMultistepScheduler
+    elif sampler_name == "DDIM":
+        cls = DDIMScheduler
+    elif sampler_name == "Heun":
+        cls = HeunDiscreteScheduler
+    else:
+        log.warning(f"  SDXL: Unknown sampler '{sampler_name}', falling back to Euler A")
+        cls = EulerAncestralDiscreteScheduler
+
+    # Karras sigmas — applied after class selection
+    if scheduler_name == "Karras":
+        kwargs["use_karras_sigmas"] = True
+
+    if is_vpred:
+        log.debug(f"  SDXL: {sampler_name} scheduler (v-prediction, zero-SNR)")
+
+    # Filter kwargs to only those accepted by the chosen class's __init__,
+    # since not all schedulers accept every kwarg (e.g. DPMSolverSinglestep
+    # lacks timestep_spacing, EulerAncestral lacks use_karras_sigmas).
+    accepted = set(inspect.signature(cls.__init__).parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    dropped = set(kwargs) - set(filtered)
+    if dropped:
+        log.debug(f"  SDXL: Dropped unsupported kwargs for {cls.__name__}: {dropped}")
+
+    scheduler = cls(**filtered)
     scheduler.set_timesteps(steps, device=device)
     return scheduler
+
+
+def _apply_subseed_variation(
+    noise: torch.Tensor,
+    seed: int,
+    subseed: int,
+    subseed_strength: float,
+) -> torch.Tensor:
+    """Blend noise with a subseed-derived noise tensor for variation rerolls.
+
+    Generates a second noise tensor from the subseed using a CPU generator
+    (cross-GPU deterministic) and lerps between the original and subseed noise.
+    Normalizes the result to preserve unit variance — a naive lerp of two
+    independent N(0,1) tensors has variance (1-s)²+s² which drops to 0.5 at
+    s=0.5, causing the scheduler to receive less noise than expected.
+    """
+    if subseed == 0 or subseed_strength <= 0.0:
+        return noise
+    s = subseed_strength
+    sub_gen = torch.Generator(device="cpu").manual_seed(subseed)
+    sub_noise = torch.randn(noise.shape, generator=sub_gen, device="cpu",
+                            dtype=noise.dtype).to(noise.device)
+    blended = noise * (1.0 - s) + sub_noise * s
+    # Correct variance: lerp of two independent N(0,1) has var = (1-s)²+s²
+    correction = ((1.0 - s) ** 2 + s ** 2) ** 0.5
+    return blended / correction
 
 
 def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
@@ -1111,13 +1209,13 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _tracer.denoise_setup(job.job_id, _model_name, _setup_elapsed, _has_lora, _lora_name)
 
     # Create scheduler with correct prediction_type for this model
-    scheduler = _create_scheduler(inp.model_dir, steps, device)
+    scheduler = _create_scheduler(inp.model_dir, steps, device, inp.sampler, inp.scheduler)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
     latent_w = width // 8
 
-    generator = torch.Generator(device=device).manual_seed(scheduler_seed)
+    generator = torch.Generator(device="cpu").manual_seed(scheduler_seed)
 
     if is_hires:
         # Hires pass: start from upscaled latents with noise
@@ -1137,7 +1235,8 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         # Add noise at the start timestep
         upscaled_latents = upscaled_latents.to(device=device, dtype=torch.float16)
         noise = torch.randn(upscaled_latents.shape, generator=generator,
-                            device=device, dtype=upscaled_latents.dtype)
+                            device="cpu", dtype=upscaled_latents.dtype).to(device)
+        noise = _apply_subseed_variation(noise, scheduler_seed, inp.subseed, inp.subseed_strength)
         latents = scheduler.add_noise(upscaled_latents, noise,
                                       timesteps[start_step:start_step+1])
 
@@ -1146,10 +1245,12 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
                  f"of {len(timesteps)} total, startStep={start_step})")
     else:
         # Base pass: start from pure noise
-        latents = torch.randn(
+        noise = torch.randn(
             (1, 4, latent_h, latent_w),
-            generator=generator, device=device, dtype=torch.float16,
-        ) * scheduler.init_noise_sigma
+            generator=generator, device="cpu", dtype=torch.float16,
+        ).to(device)
+        noise = _apply_subseed_variation(noise, scheduler_seed, inp.subseed, inp.subseed_strength)
+        latents = noise * scheduler.init_noise_sigma
         start_step = 0
 
         log.debug(f"  SDXL: Denoising ({len(timesteps)} steps, "
@@ -1275,13 +1376,13 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         unet.disable_adapters()
 
     # Create scheduler with correct prediction_type for this model
-    scheduler = _create_scheduler(inp.model_dir, steps, device)
+    scheduler = _create_scheduler(inp.model_dir, steps, device, inp.sampler, inp.scheduler)
     timesteps = scheduler.timesteps
 
     latent_h = height // 8
     latent_w = width // 8
 
-    generator = torch.Generator(device=device).manual_seed(scheduler_seed)
+    generator = torch.Generator(device="cpu").manual_seed(scheduler_seed)
 
     if is_hires:
         upscaled_latents = job.latents
@@ -1298,7 +1399,8 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
 
         upscaled_latents = upscaled_latents.to(device=device, dtype=torch.float16)
         noise = torch.randn(upscaled_latents.shape, generator=generator,
-                            device=device, dtype=upscaled_latents.dtype)
+                            device="cpu", dtype=upscaled_latents.dtype).to(device)
+        noise = _apply_subseed_variation(noise, scheduler_seed, inp.subseed, inp.subseed_strength)
         latents = scheduler.add_noise(upscaled_latents, noise,
                                       timesteps[start_step:start_step+1])
 
@@ -1306,10 +1408,12 @@ def _denoise_regional(job: InferenceJob, gpu: GpuInstance) -> None:
         log.debug(f"  SDXL: Regional hires denoising (strength={strength:.2f}, {active_count} active steps "
                  f"of {len(timesteps)} total, startStep={start_step})")
     else:
-        latents = torch.randn(
+        noise = torch.randn(
             (1, 4, latent_h, latent_w),
-            generator=generator, device=device, dtype=torch.float16,
-        ) * scheduler.init_noise_sigma
+            generator=generator, device="cpu", dtype=torch.float16,
+        ).to(device)
+        noise = _apply_subseed_variation(noise, scheduler_seed, inp.subseed, inp.subseed_strength)
+        latents = noise * scheduler.init_noise_sigma
         start_step = 0
 
         log.debug(f"  SDXL: Regional denoising ({len(timesteps)} steps, "

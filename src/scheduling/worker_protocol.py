@@ -125,6 +125,12 @@ class TagImageCmd:
 
 
 @dataclass
+class CancelJobCmd:
+    """Cancel the currently running job in the worker process."""
+    job_id: str
+
+
+@dataclass
 class ShutdownCmd:
     """Gracefully shut down the worker process."""
     pass
