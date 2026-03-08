@@ -2032,37 +2032,31 @@ async def job_cancel(job_id: str):
     if job.completion.done():
         return {"job_id": job_id, "status": "already_completed"}
 
-    # Mark cancelled
-    job._cancelled = True
-
-    # If still queued (not yet dispatched to a GPU), resolve the future directly
+    # If still queued (not yet dispatched to a GPU), resolve directly
     if job.assigned_gpu_uuid is None:
         job.completed_at = datetime.utcnow()
-        if state.admission is not None:
-            state.admission.release(job.type)
+        if not job._admission_released:
+            job._admission_released = True
+            if state.admission is not None:
+                state.admission.release(job.type)
         job.set_result(JobResult(success=False, error="Cancelled"))
         from api.websocket import streamer
         await streamer.broadcast_complete(job, success=False, error="Cancelled")
         log.info(f"Cancelled queued job {job_id}")
         return {"job_id": job_id, "status": "cancelled"}
 
-    # Job is running on a GPU — signal the worker to cancel
+    # Job has a GPU assigned — find the worker and signal cancel_event.
+    # Use assigned_gpu_uuid (not _active_job) so we catch the dispatch-to-dequeue window.
     for worker in state.scheduler.workers:
-        if worker._active_job is job:
+        if worker.gpu.uuid == job.assigned_gpu_uuid:
             worker.cancel_active_job()
             log.info(f"Cancelled running job {job_id} on GPU [{worker.gpu.uuid}]")
             return {"job_id": job_id, "status": "cancelling"}
 
-    # Job has a GPU assigned but wasn't found active — might be between stages
-    log.warning(f"Cancel requested for job {job_id} but worker not found, "
-                f"marking cancelled")
-    job.completed_at = datetime.utcnow()
-    if state.admission is not None:
-        state.admission.release(job.type)
-    job.set_result(JobResult(success=False, error="Cancelled"))
-    from api.websocket import streamer
-    await streamer.broadcast_complete(job, success=False, error="Cancelled")
-    return {"job_id": job_id, "status": "cancelled"}
+    # Worker not found for this GPU UUID (shouldn't happen)
+    log.warning(f"Cancel requested for job {job_id} but worker for GPU "
+                f"{job.assigned_gpu_uuid} not found, signalling cancel")
+    return {"job_id": job_id, "status": "cancelling"}
 
 
 @router.get("/job/{job_id}/result")

@@ -938,7 +938,10 @@ class GpuWorkerProxy:
             pass
 
     def _release_admission(self, job: InferenceJob) -> None:
-        """Release the admission control slot."""
+        """Release the admission control slot (idempotent)."""
+        if job._admission_released:
+            return
+        job._admission_released = True
         from state import app_state
         if app_state.admission is not None:
             app_state.admission.release(job.type)

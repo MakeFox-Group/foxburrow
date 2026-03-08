@@ -220,8 +220,8 @@ class InferenceJob:
         # GPU assignment — which GPU this job is dispatched to (whole pipeline)
         self.assigned_gpu_uuid: str | None = None
 
-        # Cancellation
-        self._cancelled: bool = False
+        # Admission tracking — prevents double-release across cancel + completion paths
+        self._admission_released: bool = False
 
         # Tiling overrides (0 = auto: divide into tiles ≤ 1024px)
         self.unet_tile_width: int = 0   # Reserved (unused)

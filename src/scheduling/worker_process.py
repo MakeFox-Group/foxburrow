@@ -362,8 +362,18 @@ def gpu_worker_main(
 
         try:
             if isinstance(cmd, ExecuteJobCmd):
-                # Clear cancel event before starting a new job
+                # Check if cancel was signalled before we dequeued the command
                 if cancel_event is not None:
+                    if cancel_event.is_set():
+                        cancel_event.clear()
+                        log.info(f"  GPU worker [{gpu_uuid}]: "
+                                 f"Job {cmd.job_id} cancelled before start")
+                        result_queue.put(JobComplete(
+                            job_id=cmd.job_id,
+                            success=False,
+                            error="Cancelled",
+                        ))
+                        continue
                     cancel_event.clear()
                 # Execute entire job pipeline on main thread (single-threaded)
                 try:
@@ -614,6 +624,10 @@ def _execute_job(
             next_gpu_stage = _find_next_gpu_stage(pipeline, stage_idx)
             if next_gpu_stage is not None:
                 _request_preload(preloader, next_gpu_stage, job, gpu)
+
+            # ── Check cancellation after model load ─────────────
+            from handlers.sdxl import _check_cancelled
+            _check_cancelled()
 
             # ── Execute stage ─────────────────────────────────────
             set_current_tracer(tracer)
