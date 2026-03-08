@@ -74,6 +74,13 @@ RESOLUTION_GRID: list[tuple[int, int]] = [
     (1664, 1664),
     (1920, 1088),
     (2048, 2048),
+    # Larger resolutions for hires/enhance pipelines
+    (2048, 2560),
+    (2560, 2048),
+    (2560, 2560),
+    (2560, 3072),
+    (3072, 2560),
+    (3072, 3072),
 ]
 
 # Sort by ascending pixel count for OOM-safe ordering
@@ -547,10 +554,13 @@ def get_working_memory(
     if best_key is not None:
         return cache[best_key]
 
-    # Target is larger than anything profiled — extrapolate
+    # Target is larger than anything profiled — extrapolate linearly.
+    # No extra headroom here — the caller (_get_min_free_vram) already
+    # applies 1.10x headroom, so doubling up inflates predictions at
+    # large resolutions where the extrapolation ratio is already > 1.
     if largest_key is not None and largest_pixels > 0:
         ratio = target_pixels / largest_pixels
-        return int(cache[largest_key] * ratio * 1.2)
+        return int(cache[largest_key] * ratio)
 
     return None
 
