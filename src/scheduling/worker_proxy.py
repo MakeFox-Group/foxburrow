@@ -463,6 +463,8 @@ class GpuWorkerProxy:
             pipeline=job.pipeline,
             sdxl_input=job.sdxl_input,
             hires_input=job.hires_input,
+            img2img_input=job.img2img_input,
+            img2img_mask=job.img2img_mask,
             input_image=job.input_image,
             input_latents=input_latents,
             tokenize_result=job.tokenize_result,

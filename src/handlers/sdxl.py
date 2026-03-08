@@ -1229,10 +1229,19 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         raise RuntimeError("EncodeResult is required for denoising.")
 
     is_hires = job.is_hires_pass and job.hires_input is not None
+    is_img2img = job.is_img2img and job.img2img_input is not None and not is_hires
     hires = job.hires_input
+    i2i = job.img2img_input
 
-    width = hires.hires_width if is_hires else inp.width
-    height = hires.hires_height if is_hires else inp.height
+    if is_hires:
+        width = hires.hires_width
+        height = hires.hires_height
+    elif is_img2img:
+        width = inp.width
+        height = inp.height
+    else:
+        width = inp.width
+        height = inp.height
 
     if is_hires:
         # hires_steps = desired active denoising steps.
@@ -1240,6 +1249,19 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _active = hires.hires_steps
         _str = hires.denoising_strength
         steps = max(round(_active / max(_str, 0.001)), _active)
+    elif is_img2img:
+        _active = inp.steps
+        _str = i2i.denoising_strength
+        has_mask = job.img2img_mask is not None
+        if has_mask:
+            # Outpaint: use user's step count directly (start from step 0)
+            steps = _active
+        elif _str <= 0.0:
+            # strength=0, no mask: skip (handled below)
+            steps = _active
+        else:
+            # Same-size img2img: scale total steps so active ≈ steps * strength
+            steps = max(round(_active / max(_str, 0.001)), _active)
     else:
         steps = inp.steps
 
@@ -1298,6 +1320,11 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
 
     generator = torch.Generator(device="cpu").manual_seed(scheduler_seed)
 
+    # Differential Diffusion state for outpainting
+    dd_map = None        # [1,1,H,W] float16, 1=keep/replace, 0=generate/free
+    orig_latents = None  # clean VAE-encoded canvas latents
+    i2i_noise = None     # noise tensor (reused for consistent noising)
+
     if is_hires:
         # Hires pass: start from upscaled latents with noise
         upscaled_latents = job.latents
@@ -1324,6 +1351,87 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         active_count = len(timesteps) - start_step
         log.debug(f"  SDXL: Hires denoising (strength={strength:.2f}, {active_count} active steps "
                  f"of {len(timesteps)} total, startStep={start_step})")
+    elif is_img2img:
+        # IMG2IMG: start from VAE-encoded latents with noise
+        init_latents = job.latents
+        if init_latents is None:
+            raise RuntimeError("Latents are required for img2img denoising pass.")
+
+        strength = i2i.denoising_strength
+        has_mask = job.img2img_mask is not None
+
+        # strength=0 without mask: no denoising needed, return original latents
+        if strength <= 0.0 and not has_mask:
+            log.debug(f"  SDXL: IMG2IMG denoising skipped (strength=0.0, no mask)")
+            return
+
+        init_latents = init_latents.to(device=device, dtype=torch.float16)
+        noise = torch.randn(init_latents.shape, generator=generator,
+                            device="cpu", dtype=init_latents.dtype).to(device)
+        noise = _apply_subseed_variation(noise, scheduler_seed, inp.subseed, inp.subseed_strength)
+
+        if has_mask:
+            # === OUTPAINTING via Differential Diffusion ===
+            # Instead of blending latents continuously (which is broken due to VAE
+            # nonlinearity), we use time-varying BINARY thresholds on a gradient mask.
+            # Each pixel either fully gets the noised original or fully keeps its
+            # current denoised state. The gradation comes from WHEN each pixel
+            # transitions from "replaced" to "free", not from spatial blending.
+            import scipy.ndimage
+            mask_np = job.img2img_mask  # [H, W] float32, 1=generate, 0=keep
+
+            # Downscale mask to latent dimensions (÷8)
+            mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8), mode='L')
+            mask_pil = mask_pil.resize((latent_w, latent_h), Image.NEAREST)
+            mask_lat_np = np.array(mask_pil).astype(np.float32) / 255.0
+
+            # No mask dilation — preserve the original image's anatomy edges
+            # (neck, hindquarters etc.) as connection points for generated content.
+            # The pixel-space composite after VAE decode handles visual blending.
+
+            # Moderate blur for DD temporal gradient (σ=3 in latent space = ~24px).
+            # Narrower than before: preserves more edge anatomy while the pixel
+            # composite handles visual transition quality.
+            mask_lat_np = scipy.ndimage.gaussian_filter(mask_lat_np, sigma=3.0)
+            mask_lat_np = np.clip(mask_lat_np, 0.0, 1.0)
+
+            # Convert to DD convention: dd_map where 1=keep (replaced with noised
+            # original at each step), 0=generate (freely denoised).
+            # Scale keep region by (1-strength): strength=0 → fully keep,
+            # strength=0.7 → keep unfreezes early for 70% denoising.
+            # Cap at 0.9: even at strength=0, give the center 10% denoising
+            # so the model can subtly adjust for coherent outpainting.
+            # The pixel-space composite restores original pixels afterward.
+            keep_strength = min(max(1.0 - strength, 0.0), 0.9)
+            dd_map_np = (1.0 - mask_lat_np) * keep_strength
+            dd_map = torch.from_numpy(dd_map_np).to(device=device, dtype=torch.float16)
+            dd_map = dd_map.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
+            orig_latents = init_latents.clone()
+            i2i_noise = noise
+
+            # Start from step 0: borders get full generation
+            start_step = 0
+
+            # Noise entire canvas uniformly at timesteps[0]
+            latents = scheduler.add_noise(init_latents, noise, timesteps[0:1])
+
+            log.debug(f"  SDXL: IMG2IMG outpaint DD (strength={strength:.2f}, "
+                     f"{len(timesteps)} steps, keep_strength={keep_strength:.2f})")
+        else:
+            # Same-size img2img: straightforward partial denoise
+            init_timestep = min(_active, steps)
+            start_step = max(steps - init_timestep, 0)
+
+            if start_step >= len(timesteps):
+                log.debug(f"  SDXL: IMG2IMG denoising skipped (strength={strength:.2f}, no active steps)")
+                return
+
+            latents = scheduler.add_noise(init_latents, noise,
+                                          timesteps[start_step:start_step+1])
+            log.debug(f"  SDXL: IMG2IMG denoising (strength={strength:.2f}, "
+                     f"{len(timesteps) - start_step} active steps of {len(timesteps)} total, "
+                     f"startStep={start_step})")
     else:
         # Base pass: start from pure noise
         noise = torch.randn(
@@ -1368,6 +1476,21 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
         _broadcast_ws_progress(job)
         t = timesteps[i]
 
+        # Differential Diffusion: time-varying binary threshold blend.
+        # At each step, pixels with dd_map > progress are replaced with the
+        # noised original (preserving them). Pixels below threshold evolve
+        # freely. As progress increases, more pixels unfreeze from keep→border.
+        # This avoids continuous latent blending (which is broken due to VAE
+        # nonlinearity) and instead uses binary per-step decisions.
+        if dd_map is not None and orig_latents is not None:
+            total_active = len(timesteps) - start_step
+            progress = (i - start_step) / max(total_active, 1)
+            keep_mask = (dd_map > progress).to(torch.float16)
+
+            noised_orig = scheduler.add_noise(
+                orig_latents, i2i_noise, t.unsqueeze(0))
+            latents = noised_orig * keep_mask + latents * (1.0 - keep_mask)
+
         latent_input = scheduler.scale_model_input(latents, t)
 
         if trt_runner is not None:
@@ -1409,6 +1532,74 @@ def denoise(job: InferenceJob, gpu: GpuInstance) -> None:
     log.debug(f"  SDXL: Denoise loop took {_loop_elapsed:.3f}s "
               f"({active_step_count} steps, {_per_step:.3f}s/step, "
               f"first={_first_step_time:.3f}s)")
+
+    # === Pass 2: Coherence refinement (outpaint only) ===
+    # After DD outpainting, the borders have content but anatomy may not
+    # connect well to the center. Run a short img2img pass over the ENTIRE
+    # result (no mask) so the UNet sees everything and can adjust anatomy
+    # connections (head→neck, tail→body). The pixel-space composite in
+    # vae_decode() restores original center pixels afterward.
+    if dd_map is not None and is_img2img:
+        refine_strength = 0.2
+        refine_base_steps = len(timesteps)  # same step budget as main pass
+        refine_active = max(round(refine_base_steps * refine_strength), 3)
+        refine_total = max(round(refine_active / max(refine_strength, 0.001)), refine_active)
+
+        refine_seed = scheduler_seed ^ 0xDEADBEEF
+        scheduler_r, _step_gen_r = _create_scheduler(
+            inp.model_dir, refine_total, device, inp.sampler, inp.scheduler,
+            seed=refine_seed)
+        timesteps_r = scheduler_r.timesteps
+        start_r = max(refine_total - refine_active, 0)
+        if start_r >= len(timesteps_r):
+            start_r = len(timesteps_r) - 1
+
+        gen_r = torch.Generator(device="cpu").manual_seed(refine_seed)
+        noise_r = torch.randn(latents.shape, generator=gen_r,
+                               device="cpu", dtype=latents.dtype).to(device)
+        latents = scheduler_r.add_noise(latents, noise_r,
+                                         timesteps_r[start_r:start_r + 1])
+
+        refine_step_count = len(timesteps_r) - start_r
+        job.denoise_total_steps = active_step_count + refine_step_count
+        _refine_start = _time.monotonic()
+
+        step_kwargs_r = {"generator": gen_r} if _step_gen_r else {}
+        for ri in range(start_r, len(timesteps_r)):
+            _step_start = _time.monotonic()
+            job.denoise_step = active_step_count + (ri - start_r) + 1
+            _broadcast_ws_progress(job)
+            t_r = timesteps_r[ri]
+
+            latent_input_r = scheduler_r.scale_model_input(latents, t_r)
+
+            if trt_runner is not None:
+                latent_in_r = torch.cat([latent_input_r, latent_input_r])
+                out_r = trt_runner.run(latent_in_r, t_r.unsqueeze(0),
+                                        batched_embeds, batched_pooled,
+                                        batched_time_ids)
+                noise_pred_u_r, noise_pred_c_r = out_r.chunk(2)
+                noise_pred_r = noise_pred_u_r + inp.cfg_scale * (noise_pred_c_r - noise_pred_u_r)
+            else:
+                with torch.no_grad():
+                    latent_in_r = torch.cat([latent_input_r, latent_input_r])
+                    out_r = unet(
+                        latent_in_r, t_r,
+                        encoder_hidden_states=batched_embeds,
+                        added_cond_kwargs={
+                            "text_embeds": batched_pooled,
+                            "time_ids": batched_time_ids,
+                        },
+                    ).sample
+                    noise_pred_u_r, noise_pred_c_r = out_r.chunk(2)
+                noise_pred_r = noise_pred_u_r + inp.cfg_scale * (noise_pred_c_r - noise_pred_u_r)
+
+            latents = scheduler_r.step(noise_pred_r, t_r, latents,
+                                        **step_kwargs_r).prev_sample
+
+        _refine_elapsed = _time.monotonic() - _refine_start
+        log.debug(f"  SDXL: Outpaint refinement pass took {_refine_elapsed:.3f}s "
+                  f"({refine_step_count} steps, strength={refine_strength})")
 
     # Diagnostic: check latent health after denoising
     lat_min = latents.min().item()
@@ -1743,6 +1934,37 @@ def vae_decode(job: InferenceJob, gpu: GpuInstance) -> Image.Image:
 
     log.debug(f"  SDXL: VAE decode complete. Image={image.width}x{image.height} "
              f"mean_px={mean_pixel:.1f}")
+
+    # Pixel-space composite for outpainting: paste the original canvas pixels
+    # back into the keep region with a feathered mask. This avoids VAE roundtrip
+    # artifacts (subtle color/texture changes in the preserved region) and gives
+    # a pixel-perfect center with smooth transition to generated borders.
+    if (job.img2img_mask is not None
+            and hasattr(job, '_composite_canvas')
+            and job._composite_canvas is not None):
+        import scipy.ndimage
+        canvas_img = job._composite_canvas
+        mask = job.img2img_mask  # [H, W] float32, 1=generate, 0=keep
+
+        # Resize canvas and mask to match decoded image if needed
+        if canvas_img.size != image.size:
+            canvas_img = canvas_img.resize(image.size, Image.LANCZOS)
+        if mask.shape[1] != image.width or mask.shape[0] != image.height:
+            mask_pil = Image.fromarray((mask * 255).astype(np.uint8), mode='L')
+            mask_pil = mask_pil.resize(image.size, Image.NEAREST)
+            mask = np.array(mask_pil).astype(np.float32) / 255.0
+
+        # Feather mask in pixel space (wide, smooth transition)
+        mask_feathered = scipy.ndimage.gaussian_filter(mask, sigma=24.0)
+        mask_feathered = np.clip(mask_feathered, 0.0, 1.0)
+
+        result_arr = np.array(image).astype(np.float32)
+        canvas_arr = np.array(canvas_img).astype(np.float32)
+        mask_3d = mask_feathered[:, :, np.newaxis]
+        composite = canvas_arr * (1.0 - mask_3d) + result_arr * mask_3d
+        image = Image.fromarray(np.clip(composite, 0, 255).astype(np.uint8))
+        log.debug(f"  SDXL: Pixel-space composite applied (outpaint keep region)")
+
     return image
 
 

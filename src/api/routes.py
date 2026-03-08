@@ -1698,8 +1698,8 @@ async def enqueue_enhance(request: Request):
     if not state.gpu_pool.has_capability("sdxl"):
         return _error(404, "No GPUs configured for sdxl on this worker.")
 
-    # Parse multipart form data
-    form = await request.form()
+    # Parse multipart form data (raise limit from default 1MB to 32MB for large images)
+    form = await request.form(max_part_size=32 * 1024 * 1024)
     try:
         image_file = form.get("image")
         params_str = form.get("params")
@@ -1955,6 +1955,268 @@ async def enqueue_enhance(request: Request):
     except Exception:
         if admitted:
             _release_admission(JobType.ENHANCE)
+        raise
+
+
+def _create_outpaint_canvas(input_image: Image.Image, target_w: int, target_h: int):
+    """Create canvas + mask for outpainting when aspect ratios differ.
+
+    The canvas is filled by reflecting the input image's edges outward,
+    giving the UNet contextual content at the borders instead of flat gray.
+
+    Returns (canvas_image, mask_array) where mask is [H, W] float32
+    with 1.0 = generate (borders), 0.0 = keep (original image area).
+    """
+    iw, ih = input_image.size
+    target_aspect = target_w / target_h
+    input_aspect = iw / ih
+
+    if input_aspect > target_aspect:
+        # Input is wider — extend vertically
+        canvas_w = iw
+        canvas_h = round(iw / target_aspect)
+    else:
+        # Input is taller — extend horizontally
+        canvas_h = ih
+        canvas_w = round(ih * target_aspect)
+
+    # Snap to multiples of 8 (VAE latent alignment)
+    canvas_w = ((canvas_w + 7) // 8) * 8
+    canvas_h = ((canvas_h + 7) // 8) * 8
+
+    offset_x = (canvas_w - iw) // 2
+    offset_y = (canvas_h - ih) // 2
+
+    # Build canvas: edge-replicate the original's border pixels outward.
+    # This creates a smooth color transition that the VAE encodes without
+    # artifacts (unlike gray fill which creates a sharp boundary the VAE
+    # turns into visible latent seams).
+    img_arr = np.array(input_image)  # [ih, iw, 3]
+    pad_top = offset_y
+    pad_bottom = canvas_h - ih - offset_y
+    pad_left = offset_x
+    pad_right = canvas_w - iw - offset_x
+    canvas_arr = np.pad(img_arr,
+                        ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                        mode='edge')
+    canvas = Image.fromarray(canvas_arr)
+
+    # Mask: 1.0 = generate (borders), 0.0 = keep (original)
+    mask = np.ones((canvas_h, canvas_w), dtype=np.float32)
+    mask[offset_y:offset_y + ih, offset_x:offset_x + iw] = 0.0
+
+    return canvas, mask
+
+
+@router.post("/enqueue/img2img")
+async def enqueue_img2img(request: Request):
+    """IMG2IMG: VAE encode input image, partial denoise, VAE decode.
+
+    Multipart form data:
+      image  (required) — PNG/JPEG image bytes
+      params (required) — JSON string with fields:
+        prompt          (required)
+        negative_prompt (default: "")
+        model           (required)
+        width           (default: 0 = use input size)
+        height          (default: 0 = use input size)
+        steps           (default: 25)
+        denoising_strength (default: 0.75)
+        cfg_scale       (default: 7.0)
+        seed            (default: random)
+        sampler         (default: "Euler A")
+        scheduler       (optional)
+        regional_prompting (default: false)
+        priority        (default: 100)
+        clip_embeddings (optional) — pre-computed CLIP cache entries
+    """
+    from scheduling.job import InferenceJob, JobType, SdxlJobInput, SdxlImg2ImgInput
+
+    state = _get_state()
+
+    if not state.gpu_pool.has_capability("sdxl"):
+        return _error(404, "No GPUs configured for sdxl on this worker.")
+
+    # Parse multipart form data (raise limit from default 1MB to 32MB for large images)
+    form = await request.form(max_part_size=32 * 1024 * 1024)
+    try:
+        image_file = form.get("image")
+        params_str = form.get("params")
+
+        if params_str is None:
+            return _error(400, 'Multipart form must include "params" part.')
+        if image_file is None:
+            return _error(400, 'Multipart form must include "image" part.')
+
+        image_bytes = await image_file.read()
+    finally:
+        await form.close()
+
+    try:
+        input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as ex:
+        return _error(400, f"Could not decode image: {ex}")
+
+    try:
+        p = json.loads(params_str)
+    except (json.JSONDecodeError, TypeError) as ex:
+        return _error(400, f"Invalid params JSON: {ex}")
+
+    prompt = p.get("prompt", "").strip()
+    if not prompt:
+        return _error(400, '"prompt" is required.')
+    negative_prompt = p.get("negative_prompt", "")
+
+    try:
+        target_w        = int(p.get("width", 0))
+        target_h        = int(p.get("height", 0))
+        steps           = int(p.get("steps", 25))
+        denoising_str   = float(p.get("denoising_strength", 0.75))
+        cfg_scale       = float(p.get("cfg_scale", 7.0))
+        seed_param      = int(p.get("seed", 0))
+        subseed_param   = int(p.get("subseed", 0))
+        subseed_strength = max(0.0, min(1.0, float(p.get("subseed_strength", 0.0))))
+        vae_tile_w      = int(p.get("vae_tile_width", 0))
+        vae_tile_h      = int(p.get("vae_tile_height", 0))
+        job_priority    = max(1, min(100, int(p.get("priority", 100))))
+    except (ValueError, TypeError) as ex:
+        return _error(400, f"Invalid parameter: {ex}")
+    sampler_param   = p.get("sampler", "Euler A")
+    scheduler_param = p.get("scheduler")
+
+    if not (1 <= steps <= 150):
+        return _error(400, "steps must be between 1 and 150.")
+    if not (0.0 <= denoising_str <= 1.0):
+        return _error(400, "denoising_strength must be between 0.0 and 1.0.")
+    if not (1.0 <= cfg_scale <= 30.0):
+        return _error(400, "cfg_scale must be between 1.0 and 30.0.")
+
+    seed = seed_param if seed_param != 0 else random.randint(1, 2**31 - 1)
+
+    model_name = p.get("model")
+    model_dir, err = _resolve_model(model_name)
+    if err:
+        return _error(400, err)
+
+    regional_prompting = bool(p.get("regional_prompting", False))
+    clip_embeddings = p.get("clip_embeddings")
+
+    iw, ih = input_image.size
+
+    # If target dimensions not specified, use input image size
+    if target_w <= 0:
+        target_w = iw
+    if target_h <= 0:
+        target_h = ih
+
+    # Validate target dimensions
+    err = _validate_dimensions(target_w, target_h, max_dim=4096, multiple=8)
+    if err:
+        return _error(400, err)
+
+    orig_target_w, orig_target_h = target_w, target_h
+    target_w, target_h = _snap_dims(target_w, target_h, multiple=8)
+
+    # Determine canvas/mask strategy based on aspect ratio comparison
+    img2img_mask = None
+    target_aspect = target_w / target_h
+    input_aspect = iw / ih
+    aspect_diff = abs(target_aspect - input_aspect) / max(target_aspect, input_aspect)
+
+    if aspect_diff > 0.01:
+        # Aspect ratios differ — create outpaint canvas + mask
+        input_image, img2img_mask = _create_outpaint_canvas(input_image, target_w, target_h)
+        # Update dimensions to canvas size
+        canvas_w, canvas_h = input_image.size
+        gen_w, gen_h = canvas_w, canvas_h
+    elif iw != target_w or ih != target_h:
+        # Same aspect, different size — resize input to target
+        input_image = input_image.resize((target_w, target_h), Image.LANCZOS)
+        gen_w, gen_h = target_w, target_h
+    else:
+        # Same dimensions — snap to multiples of 8 for VAE alignment
+        snapped_w = ((iw + 7) // 8) * 8
+        snapped_h = ((ih + 7) // 8) * 8
+        if snapped_w != iw or snapped_h != ih:
+            input_image = input_image.resize((snapped_w, snapped_h), Image.LANCZOS)
+        gen_w, gen_h = snapped_w, snapped_h
+
+    admitted = False
+    try:
+        rejected = _check_admission(JobType.SDXL_IMG2IMG)
+        if rejected:
+            return rejected
+        admitted = True
+
+        # Parse LoRA tags from prompt
+        cleaned_prompt, cleaned_neg, all_loras = _parse_request_loras(
+            prompt, negative_prompt, None)
+
+        model_short = os.path.splitext(os.path.basename(model_dir))[0] if model_dir else "default"
+        factory = state.pipeline_factory
+        queue = state.queue
+
+        log.debug(f"Enqueue img2img: input={iw}x{ih} target={orig_target_w}x{orig_target_h} "
+                 f"gen={gen_w}x{gen_h} mask={'yes' if img2img_mask is not None else 'no'} "
+                 f"steps={steps} strength={denoising_str:.2f} "
+                 f"cfg={cfg_scale} seed={seed} model={model_short}"
+                 + (f" loras={[s.name for s in all_loras]}" if all_loras else ""))
+
+        job = InferenceJob(
+            job_type=JobType.SDXL_IMG2IMG,
+            pipeline=factory.create_sdxl_img2img_pipeline(model_dir),
+            sdxl_input=SdxlJobInput(
+                prompt=cleaned_prompt,
+                negative_prompt=cleaned_neg,
+                width=gen_w,
+                height=gen_h,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                seed=seed,
+                subseed=subseed_param,
+                subseed_strength=subseed_strength,
+                model_dir=model_dir,
+                loras=all_loras,
+                regional_prompting=regional_prompting,
+                sampler=sampler_param,
+                scheduler=scheduler_param,
+            ),
+            img2img_input=SdxlImg2ImgInput(
+                denoising_strength=denoising_str,
+                width=orig_target_w,
+                height=orig_target_h,
+            ),
+            input_image=input_image,
+            priority=job_priority,
+        )
+        job.img2img_mask = img2img_mask
+        job.vae_tile_width = vae_tile_w
+        job.vae_tile_height = vae_tile_h
+        job.orig_width = orig_target_w
+        job.orig_height = orig_target_h
+
+        # Apply CLIP cache if provided
+        if clip_embeddings and not regional_prompting and len(clip_embeddings) == 6:
+            try:
+                from scheduling.job import StageType
+                cached_clip = _parse_clip_cache_entries(clip_embeddings)
+                te_stage = next((s for s in job.pipeline
+                                 if s.type == StageType.GPU_TEXT_ENCODE), None)
+                if te_stage is not None:
+                    job.stripped_te_components = te_stage.required_components
+                job.pipeline = [s for s in job.pipeline
+                                if s.type not in (StageType.CPU_TOKENIZE,
+                                                  StageType.GPU_TEXT_ENCODE)]
+                job.cached_clip_entries = cached_clip
+            except Exception as ex:
+                log.warning(f"Invalid clip_embeddings in img2img, ignoring cache: {ex}")
+
+        _register_job(job)
+        queue.enqueue(job)
+        return {"job_id": job.job_id}
+    except Exception:
+        if admitted:
+            _release_admission(JobType.SDXL_IMG2IMG)
         raise
 
 

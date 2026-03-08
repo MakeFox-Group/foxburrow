@@ -12,11 +12,14 @@ from dataclasses import dataclass, field
 from PIL import Image
 import torch
 
+import numpy as np
+
 from scheduling.job import (
     StageType,
     WorkStage,
     SdxlJobInput,
     SdxlHiresInput,
+    SdxlImg2ImgInput,
     SdxlTokenizeResult,
     ModelComponentId,
 )
@@ -49,6 +52,10 @@ class ExecuteJobCmd:
     # Job state
     priority: int
     oom_retries: int
+
+    # IMG2IMG input data
+    img2img_input: SdxlImg2ImgInput | None = None
+    img2img_mask: np.ndarray | None = None  # [H, W] float32 mask (1=generate, 0=keep)
 
     # Hires pass flag (set by routes for SdxlHiresLatents / SdxlGenerateHires)
     is_hires_pass: bool = False

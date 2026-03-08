@@ -899,8 +899,11 @@ def _reconstruct_job(cmd: ExecuteJobCmd, loop) -> object:
     job.type = JobType(cmd.job_type_value)
     job.sdxl_input = cmd.sdxl_input
     job.hires_input = cmd.hires_input
+    job.img2img_input = cmd.img2img_input
+    job.img2img_mask = cmd.img2img_mask
     job.input_image = cmd.input_image
     job.is_hires_pass = cmd.is_hires_pass
+    job.is_img2img = False
     job.oom_retries = cmd.oom_retries
     job.current_stage_index = 0
     job.pipeline = cmd.pipeline
@@ -1405,10 +1408,15 @@ def _dispatch_stage(job, stage, gpu):
         return vae_decode(job, gpu)
 
     elif stage.type == StageType.GPU_VAE_ENCODE:
+        # Save canvas for post-decode pixel-space composite (outpainting)
+        if job.img2img_mask is not None and job.input_image is not None:
+            job._composite_canvas = job.input_image.copy()
         from handlers.sdxl import vae_encode
         vae_encode(job, gpu)
         if job.hires_input is not None:
             job.is_hires_pass = True
+        elif job.img2img_input is not None:
+            job.is_img2img = True
         return None
 
     elif stage.type == StageType.GPU_LATENT_UPSCALE:

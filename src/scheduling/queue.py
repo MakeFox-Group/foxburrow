@@ -98,6 +98,7 @@ class AdmissionControl:
         "SdxlGenerateHires":   "sdxl",
         "SdxlHiresLatents":    "sdxl",
         "Enhance":             "sdxl",
+        "SdxlImg2Img":         "sdxl",
         "Upscale":             "upscale",
         "BGRemove":            "bgremove",
     }

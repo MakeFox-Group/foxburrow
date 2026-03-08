@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from utils.regional import RegionalPromptResult
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -33,6 +34,7 @@ class JobType(Enum):
     BGREMOVE = "BGRemove"
     TAG = "Tag"
     ENHANCE = "Enhance"
+    SDXL_IMG2IMG = "SdxlImg2Img"
 
 
 class StageType(Enum):
@@ -107,6 +109,13 @@ class SdxlHiresInput:
 
 
 @dataclass
+class SdxlImg2ImgInput:
+    denoising_strength: float = 0.75
+    width: int = 0   # target output width (0 = use input image size)
+    height: int = 0  # target output height (0 = use input image size)
+
+
+@dataclass
 class SdxlTokenizeResult:
     prompt_tokens_1: list[list[int]] = field(default_factory=list)
     prompt_weights_1: list[list[float]] = field(default_factory=list)
@@ -158,6 +167,7 @@ class InferenceJob:
         pipeline: list[WorkStage],
         sdxl_input: SdxlJobInput | None = None,
         hires_input: SdxlHiresInput | None = None,
+        img2img_input: SdxlImg2ImgInput | None = None,
         input_image: Image.Image | None = None,
         priority: int = 100,
     ):
@@ -180,6 +190,7 @@ class InferenceJob:
         # Input data (immutable after creation)
         self.sdxl_input = sdxl_input
         self.hires_input = hires_input
+        self.img2img_input = img2img_input
         self.input_image = input_image
 
         # Progress tracking
@@ -202,6 +213,8 @@ class InferenceJob:
         self.encode_result: SdxlEncodeResult | None = None
         self.latents: torch.Tensor | None = None
         self.is_hires_pass: bool = False
+        self.is_img2img: bool = False
+        self.img2img_mask: np.ndarray | None = None  # [H, W] float32 mask (1=generate, 0=keep)
 
         # Regional prompting state
         self.regional_info: RegionalPromptResult | None = None

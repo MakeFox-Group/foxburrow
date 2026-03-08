@@ -43,6 +43,29 @@ class PipelineFactory:
                       required_capability="sdxl"),
         ]
 
+    def create_sdxl_img2img_pipeline(self, model_dir: str) -> list[WorkStage]:
+        """5-stage SDXL IMG2IMG: Tokenize → TextEncode → VaeEncode → Denoise → VaeDecode."""
+        te_comps = self._registry.get_sdxl_te_components(model_dir)
+        unet_comp = self._registry.get_sdxl_unet_component(model_dir)
+        vae_comp = self._registry.get_sdxl_vae_component(model_dir)
+        vae_enc_comp = self._registry.get_sdxl_vae_encoder_component(model_dir)
+
+        return [
+            WorkStage(type=StageType.CPU_TOKENIZE),
+            WorkStage(type=StageType.GPU_TEXT_ENCODE,
+                      required_components=te_comps,
+                      required_capability="sdxl"),
+            WorkStage(type=StageType.GPU_VAE_ENCODE,
+                      required_components=[vae_enc_comp],
+                      required_capability="sdxl"),
+            WorkStage(type=StageType.GPU_DENOISE,
+                      required_components=[unet_comp],
+                      required_capability="sdxl"),
+            WorkStage(type=StageType.GPU_VAE_DECODE,
+                      required_components=[vae_comp],
+                      required_capability="sdxl"),
+        ]
+
     def create_sdxl_hires_pipeline(self, model_dir: str) -> list[WorkStage]:
         """8-stage SDXL hires fix:
         Tokenize → TextEncode → Denoise(base) → VaeDecode → Upscale → VaeEncode
